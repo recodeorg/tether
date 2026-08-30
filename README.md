@@ -18,7 +18,7 @@ Tether is an experimental reactive backend framework for Go. It automatically sy
 Install the Go package:
 
 ```sh
-go get github.com/wisplite/tether
+go get github.com/recodeorg/tether
 ```
 
 ### 1. Define your models
