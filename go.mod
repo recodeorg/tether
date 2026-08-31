@@ -1,4 +1,4 @@
-module github.com/wisplite/tether
+module github.com/recodeorg/tether
 
 go 1.25.6
 
