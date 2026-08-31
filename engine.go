@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash"
-	"github.com/wisplite/tether/reactivity"
+	"github.com/recodeorg/tether/reactivity"
 	"gorm.io/gorm"
 )
 
