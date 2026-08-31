@@ -80,7 +80,7 @@ You can use the companion React library to automatically bind queries to your UI
 
 ```tsx
 import { useState } from "react"
-import { useMutation, useQuery } from "tether-react"
+import { useMutation, useQuery } from "@tetherdb/react"
 
 export const App = () => {
 	// useQuery automatically reflects the backend state in real-time!
@@ -115,7 +115,7 @@ export const App = () => {
 Or use the vanilla TypeScript client:
 
 ```ts
-import { TetherClient } from "tether-ts";
+import { TetherClient } from "@tetherdb/client";
 
 const client = new TetherClient();
 client.connect("ws://localhost:8080/tether");
