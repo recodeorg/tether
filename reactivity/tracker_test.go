@@ -384,7 +384,7 @@ func TestSubscribeWithoutTrackedClientDoesNotPanic(t *testing.T) {
 func TestConcurrentClientLifecycles(t *testing.T) {
 	tr := NewTracker()
 
-	const goroutines = 64
+	const goroutines = 1024
 	const clientsPerGoroutine = 32
 
 	var wg sync.WaitGroup
@@ -446,14 +446,14 @@ func TestConcurrentSharedClients(t *testing.T) {
 
 	tr := NewTracker()
 
-	const clientCount = 32
+	const clientCount = 1024
 	clients := make([]*Client, clientCount)
 	for i := range clients {
 		clients[i] = NewClient(nil)
 		tr.Track(clients[i])
 	}
 
-	const goroutines = 64
+	const goroutines = 1024
 	const opsPerGoroutine = 64
 
 	var panicCount atomic.Int64

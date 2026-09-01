@@ -51,6 +51,11 @@ func (t *Tracker) Untrack(c *Client) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	if _, exists := t.clients[c.ID]; !exists {
+		slog.Error("Tracker: Client not found", "clientID", c.ID)
+		return
+	}
+
 	for subID := range t.clientToSubs[c.ID] {
 		t.removeSubscription(subID)
 	}
@@ -107,6 +112,11 @@ func (t *Tracker) GetAuth(clientID string) *AuthCtx {
 func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey string, params map[string]interface{}) *Subscription {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	if _, exists := t.clients[clientID]; !exists {
+		slog.Error("Tracker: Client not found", "clientID", clientID)
+		return nil
+	}
 
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
