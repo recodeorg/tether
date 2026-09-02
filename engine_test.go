@@ -299,6 +299,22 @@ func TestExtractMutationTagsSkipsZeroValues(t *testing.T) {
 	}
 }
 
+func TestExtractMutationTagsFromMapUpdate(t *testing.T) {
+	e := newTestEngine(t)
+	tags := captureMutationTags(t, e.db)
+	msg := testMessage{Body: "old", RoomID: "lobby"}
+	if err := e.db.Create(&msg).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := e.db.Model(&testMessage{}).Where("id = ?", msg.ID).Updates(map[string]interface{}{"body": "patched"}).Error; err != nil {
+		t.Fatalf("Updates: %v", err)
+	}
+	wantPK := fmt.Sprintf("messages:%v", msg.ID)
+	if !slices.Contains(*tags, wantPK) {
+		t.Errorf("tags = %v, missing primary key tag %q", *tags, wantPK)
+	}
+}
+
 func TestExtractMutationTagsWithoutSchema(t *testing.T) {
 	e := newTestEngine(t)
 	if err := e.db.Exec("SELECT 1").Error; err != nil {

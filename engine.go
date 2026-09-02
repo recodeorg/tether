@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/cespare/xxhash"
 	"github.com/recodeorg/tether/reactivity"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type Engine struct {
@@ -124,30 +126,271 @@ func extractMutationTags(tx *gorm.DB) []string {
 		items = append(items, val)
 	}
 
+	seen := make(map[string]struct{})
+	add := func(tag string) {
+		if _, ok := seen[tag]; ok {
+			return
+		}
+		seen[tag] = struct{}{}
+		tags = append(tags, tag)
+	}
+
 	// Emit table mutated tag
-	tags = append(tags, fmt.Sprintf("table_%s:mutated", tableName))
+	add(fmt.Sprintf("table_%s:mutated", tableName))
 
 	for _, item := range items {
-		// 1. Extract Primary Keys (e.g., "messages:5")
-		for _, field := range tx.Statement.Schema.PrimaryFields {
-			if pkVal, isZero := field.ValueOf(tx.Statement.Context, item); !isZero {
-				tags = append(tags, fmt.Sprintf("%s:%v", tableName, pkVal))
-			}
-		}
+		appendRecordTags(tx, item, add)
+	}
 
-		// 2. Extract explicit tether Collection tags (e.g., "messages_channel_id:5")
-		for _, field := range tx.Statement.Schema.Fields {
-			if field.Tag.Get("tether") == "track" {
-				if trackVal, isZero := field.ValueOf(tx.Statement.Context, item); !isZero {
-					// We use field.DBName to ensure it matches what the developer
-					// writes in ctx.TrackCollection!
-					tags = append(tags, fmt.Sprintf("%s_%s:%v", tableName, field.DBName, trackVal))
-				}
+	// Updates(map) stores assignments in Dest, not the row. Pull PK / collection
+	// values from the map, the Model (e.g. Model(&msg).Updates(map)), and WHERE.
+	if val.Kind() == reflect.Map {
+		appendMapTags(tx, val, add)
+	}
+	if tx.Statement.Model != nil && tx.Statement.Model != tx.Statement.Dest {
+		if modelVal := reflect.Indirect(reflect.ValueOf(tx.Statement.Model)); modelVal.Kind() == reflect.Struct {
+			appendRecordTags(tx, modelVal, add)
+		}
+	}
+	appendWhereTags(tx, add)
+
+	return tags
+}
+
+func appendRecordTags(tx *gorm.DB, item reflect.Value, add func(string)) {
+	tableName := tx.Statement.Table
+	for _, field := range tx.Statement.Schema.PrimaryFields {
+		if pkVal, isZero := field.ValueOf(tx.Statement.Context, item); !isZero {
+			add(fmt.Sprintf("%s:%v", tableName, pkVal))
+		}
+	}
+	for _, field := range tx.Statement.Schema.Fields {
+		if field.Tag.Get("tether") == "track" {
+			if trackVal, isZero := field.ValueOf(tx.Statement.Context, item); !isZero {
+				// We use field.DBName to ensure it matches what the developer
+				// writes in ctx.TrackCollection!
+				add(fmt.Sprintf("%s_%s:%v", tableName, field.DBName, trackVal))
 			}
 		}
 	}
+}
 
-	return tags
+func appendMapTags(tx *gorm.DB, val reflect.Value, add func(string)) {
+	m, ok := mapStringInterface(val)
+	if !ok {
+		return
+	}
+	tableName := tx.Statement.Table
+	for _, field := range tx.Statement.Schema.PrimaryFields {
+		if v, exists := lookupMap(m, field.Name, field.DBName); exists && !isZeroValue(v) {
+			add(fmt.Sprintf("%s:%v", tableName, v))
+		}
+	}
+	for _, field := range tx.Statement.Schema.Fields {
+		if field.Tag.Get("tether") != "track" {
+			continue
+		}
+		if v, exists := lookupMap(m, field.Name, field.DBName); exists && !isZeroValue(v) {
+			add(fmt.Sprintf("%s_%s:%v", tableName, field.DBName, v))
+		}
+	}
+}
+
+func appendWhereTags(tx *gorm.DB, add func(string)) {
+	where, ok := tx.Statement.Clauses["WHERE"]
+	if !ok || where.Expression == nil {
+		return
+	}
+	walkWhereExpr(tx, where.Expression, add)
+}
+
+func walkWhereExpr(tx *gorm.DB, expr clause.Expression, add func(string)) {
+	switch e := expr.(type) {
+	case clause.Where:
+		for _, x := range e.Exprs {
+			walkWhereExpr(tx, x, add)
+		}
+	case clause.AndConditions:
+		for _, x := range e.Exprs {
+			walkWhereExpr(tx, x, add)
+		}
+	case clause.Eq:
+		appendColumnValueTag(tx, e.Column, e.Value, add)
+	case clause.IN:
+		for _, v := range flattenIN(e.Values) {
+			appendColumnValueTag(tx, e.Column, v, add)
+		}
+	case clause.Expr:
+		appendSQLExprTags(tx, e, add)
+	}
+}
+
+func appendColumnValueTag(tx *gorm.DB, column, value interface{}, add func(string)) {
+	if isZeroValue(value) {
+		return
+	}
+	tableName := tx.Statement.Table
+	name := clauseColumnName(column)
+	if name == clause.PrimaryKey {
+		add(fmt.Sprintf("%s:%v", tableName, value))
+		return
+	}
+	for _, field := range tx.Statement.Schema.PrimaryFields {
+		if columnMatchesField(name, field.Name, field.DBName) {
+			add(fmt.Sprintf("%s:%v", tableName, value))
+			return
+		}
+	}
+	for _, field := range tx.Statement.Schema.Fields {
+		if field.Tag.Get("tether") != "track" {
+			continue
+		}
+		if columnMatchesField(name, field.Name, field.DBName) {
+			add(fmt.Sprintf("%s_%s:%v", tableName, field.DBName, value))
+			return
+		}
+	}
+}
+
+func appendSQLExprTags(tx *gorm.DB, expr clause.Expr, add func(string)) {
+	if len(expr.Vars) == 0 {
+		return
+	}
+	sql := normalizeSQL(expr.SQL)
+	for _, field := range tx.Statement.Schema.PrimaryFields {
+		if sqlIsEquality(sql, field.Name, field.DBName) {
+			appendColumnValueTag(tx, field.DBName, expr.Vars[0], add)
+			return
+		}
+		if sqlIsIN(sql, field.Name, field.DBName) {
+			for _, v := range flattenIN(expr.Vars) {
+				appendColumnValueTag(tx, field.DBName, v, add)
+			}
+			return
+		}
+	}
+	for _, field := range tx.Statement.Schema.Fields {
+		if field.Tag.Get("tether") != "track" {
+			continue
+		}
+		if sqlIsEquality(sql, field.Name, field.DBName) {
+			appendColumnValueTag(tx, field.DBName, expr.Vars[0], add)
+			return
+		}
+	}
+}
+
+func mapStringInterface(val reflect.Value) (map[string]interface{}, bool) {
+	if val.Kind() != reflect.Map || val.Type().Key().Kind() != reflect.String {
+		return nil, false
+	}
+	if m, ok := val.Interface().(map[string]interface{}); ok {
+		return m, true
+	}
+	m := make(map[string]interface{}, val.Len())
+	iter := val.MapRange()
+	for iter.Next() {
+		m[iter.Key().String()] = iter.Value().Interface()
+	}
+	return m, true
+}
+
+func lookupMap(m map[string]interface{}, names ...string) (interface{}, bool) {
+	for _, name := range names {
+		if v, ok := m[name]; ok {
+			return v, true
+		}
+	}
+	return nil, false
+}
+
+func isZeroValue(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	return !rv.IsValid() || rv.IsZero()
+}
+
+func clauseColumnName(col interface{}) string {
+	switch c := col.(type) {
+	case string:
+		return c
+	case clause.Column:
+		return c.Name
+	default:
+		return fmt.Sprint(c)
+	}
+}
+
+func columnMatchesField(col, fieldName, dbName string) bool {
+	col = stripColumn(col)
+	return strings.EqualFold(col, dbName) || strings.EqualFold(col, fieldName)
+}
+
+func stripColumn(col string) string {
+	col = strings.Trim(col, "`\"[]")
+	if i := strings.LastIndex(col, "."); i >= 0 {
+		col = strings.Trim(col[i+1:], "`\"[]")
+	}
+	return col
+}
+
+func normalizeSQL(sql string) string {
+	sql = strings.ToLower(sql)
+	for _, q := range []string{"`", `"`, "[", "]"} {
+		sql = strings.ReplaceAll(sql, q, "")
+	}
+	return strings.Join(strings.Fields(sql), " ")
+}
+
+func sqlIsEquality(sql, fieldName, dbName string) bool {
+	for _, col := range sqlColumnNames(fieldName, dbName) {
+		if sql == col+" = ?" || sql == col+"=?" ||
+			strings.HasSuffix(sql, "."+col+" = ?") || strings.HasSuffix(sql, "."+col+"=?") {
+			return true
+		}
+	}
+	return false
+}
+
+func sqlIsIN(sql, fieldName, dbName string) bool {
+	for _, col := range sqlColumnNames(fieldName, dbName) {
+		if sql == col+" in ?" || sql == col+" in (?)" ||
+			strings.HasSuffix(sql, "."+col+" in ?") || strings.HasSuffix(sql, "."+col+" in (?)") {
+			return true
+		}
+	}
+	return false
+}
+
+func sqlColumnNames(fieldName, dbName string) []string {
+	names := []string{strings.ToLower(dbName), strings.ToLower(fieldName)}
+	var out []string
+	seen := make(map[string]struct{})
+	for _, name := range names {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out
+}
+
+func flattenIN(values []interface{}) []interface{} {
+	var out []interface{}
+	for _, v := range values {
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Slice && rv.Type() != reflect.TypeOf([]byte(nil)) {
+			for i := 0; i < rv.Len(); i++ {
+				out = append(out, rv.Index(i).Interface())
+			}
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 func (e *Engine) SetAuth(auth Auth) {
