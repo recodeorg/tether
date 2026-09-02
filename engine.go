@@ -93,28 +93,27 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	// Automatically track the dependencies for the query
 	db.Callback().Query().After("gorm:query").Register("tether:auto_track", func(tx *gorm.DB) {
 		tCtx, ok := tx.Statement.Context.Value(tetherCtxKey).(*QueryCtx)
-		if !ok || tx.Statement.Dest == nil {
+		if !ok || tx.Statement.Dest == nil || tx.Statement.Schema == nil {
 			return
 		}
 
 		tableName := tx.Statement.Table
-
 		val := reflect.Indirect(reflect.ValueOf(tx.Statement.Dest))
 
+		var items []reflect.Value
 		if val.Kind() == reflect.Slice {
 			for i := 0; i < val.Len(); i++ {
-				item := reflect.Indirect(val.Index(i))
-				idField := item.FieldByName("ID")
-				if idField.IsValid() {
-					tag := tableName + ":" + fmt.Sprint(idField.Interface())
-					tCtx.Dependencies = append(tCtx.Dependencies, tag)
-				}
+				items = append(items, reflect.Indirect(val.Index(i)))
 			}
 		} else if val.Kind() == reflect.Struct {
-			idField := val.FieldByName("ID")
-			if idField.IsValid() {
-				tag := tableName + ":" + fmt.Sprint(idField.Interface())
-				tCtx.Dependencies = append(tCtx.Dependencies, tag)
+			items = append(items, val)
+		}
+
+		for _, item := range items {
+			for _, field := range tx.Statement.Schema.PrimaryFields {
+				if pkVal, isZero := field.ValueOf(tx.Statement.Context, item); !isZero {
+					tCtx.Dependencies = append(tCtx.Dependencies, fmt.Sprintf("%s:%v", tableName, pkVal))
+				}
 			}
 		}
 	})
