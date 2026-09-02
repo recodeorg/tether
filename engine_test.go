@@ -1,20 +1,26 @@
 package tether
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/glebarez/sqlite"
+	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -1444,5 +1450,407 @@ func TestDefaultAuthVerifyToken(t *testing.T) {
 	}
 	if !expiresAt.IsZero() {
 		t.Errorf("defaultAuth expiresAt = %v, want zero", expiresAt)
+	}
+}
+
+func newConcurrentTestEngine(t *testing.T) *Engine {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "tether.db")
+	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	sqlDB.SetMaxOpenConns(32)
+	sqlDB.SetMaxIdleConns(32)
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	e := NewEngine(db, "sqlite")
+	e.CreateTable("messages", &testMessage{})
+	e.SetCheckOrigin(func(*http.Request) bool { return true })
+	return e
+}
+
+type e2eRole int
+
+const (
+	e2eMutator e2eRole = iota
+	e2eWatcher
+	e2eDropper
+)
+
+type e2eBarriers struct {
+	subscribed sync.WaitGroup
+	goMutate   chan struct{}
+}
+
+type e2eInbox struct {
+	mu        sync.Mutex
+	queryHits int
+	queryKey  string
+	lastData  []interface{}
+	acks      map[string]map[string]interface{}
+}
+
+func newE2EInbox() *e2eInbox {
+	return &e2eInbox{acks: make(map[string]map[string]interface{})}
+}
+
+func (in *e2eInbox) read(conn *websocket.Conn) {
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+		in.mu.Lock()
+		switch msg["type"] {
+		case "query":
+			in.queryHits++
+			if k, ok := msg["query_key"].(string); ok {
+				in.queryKey = k
+			}
+			data, _ := msg["data"].([]interface{})
+			in.lastData = data
+		case "mutation":
+			id, _ := msg["mutation_id"].(string)
+			in.acks[id] = msg
+		}
+		in.mu.Unlock()
+	}
+}
+
+func (in *e2eInbox) snapshot() (queryHits int, queryKey string, last []interface{}, acks map[string]map[string]interface{}) {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	last = append([]interface{}(nil), in.lastData...)
+	acks = make(map[string]map[string]interface{}, len(in.acks))
+	for k, v := range in.acks {
+		acks[k] = v
+	}
+	return in.queryHits, in.queryKey, last, acks
+}
+
+func waitPred(ctx context.Context, pred func() bool) bool {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if pred() {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return pred()
+		case <-ticker.C:
+		}
+	}
+}
+
+func e2eMessageBodies(data []interface{}) map[string]struct{} {
+	out := make(map[string]struct{}, len(data))
+	for _, item := range data {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		body, _ := m["Body"].(string)
+		if body == "" {
+			continue
+		}
+		out[body] = struct{}{}
+	}
+	return out
+}
+
+func e2eBodiesMatch(got, want map[string]struct{}) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for body := range want {
+		if _, ok := got[body]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func e2eBodyDiff(got, want map[string]struct{}) (missing, extra []string) {
+	for body := range want {
+		if _, ok := got[body]; !ok {
+			missing = append(missing, body)
+		}
+	}
+	for body := range got {
+		if _, ok := want[body]; !ok {
+			extra = append(extra, body)
+		}
+	}
+	slices.Sort(missing)
+	slices.Sort(extra)
+	return missing, extra
+}
+
+type e2eClientCfg struct {
+	id            int
+	role          e2eRole
+	room          string
+	queryKey      string
+	mutationsEach int
+	wantBodies    map[string]struct{}
+	bodyOf        func(mutatorID, n int) string
+}
+
+func runE2EClient(ctx context.Context, wsURL string, cfg e2eClientCfg, barriers *e2eBarriers) (err error) {
+	var readyOnce sync.Once
+	signalReady := func() { readyOnce.Do(func() { barriers.subscribed.Done() }) }
+	defer signalReady()
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("client %d: dial: %w", cfg.id, err)
+	}
+	defer conn.Close()
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
+
+	inbox := newE2EInbox()
+	go inbox.read(conn)
+
+	if err := conn.WriteJSON(map[string]interface{}{
+		"type":      "subscribe",
+		"location":  "getMessages",
+		"params":    map[string]interface{}{"room": cfg.room},
+		"query_key": cfg.queryKey,
+	}); err != nil {
+		return fmt.Errorf("client %d: subscribe: %w", cfg.id, err)
+	}
+
+	if !waitPred(ctx, func() bool {
+		hits, key, _, _ := inbox.snapshot()
+		return hits >= 1 && key == cfg.queryKey
+	}) {
+		hits, key, data, _ := inbox.snapshot()
+		return fmt.Errorf("client %d: did not receive initial query response (hits=%d query_key=%q data=%v)", cfg.id, hits, key, data)
+	}
+
+	signalReady()
+	select {
+	case <-barriers.goMutate:
+	case <-ctx.Done():
+		return fmt.Errorf("client %d: %w", cfg.id, ctx.Err())
+	}
+
+	if cfg.role == e2eDropper {
+		return nil
+	}
+
+	if cfg.role == e2eMutator {
+		wantIDs := make(map[string]string, cfg.mutationsEach)
+		for n := 0; n < cfg.mutationsEach; n++ {
+			mutID := fmt.Sprintf("m-%d-%d", cfg.id, n)
+			body := cfg.bodyOf(cfg.id, n)
+			wantIDs[mutID] = body
+			if err := conn.WriteJSON(map[string]interface{}{
+				"type":        "mutation",
+				"location":    "createMessage",
+				"params":      map[string]interface{}{"body": body, "room": cfg.room},
+				"mutation_id": mutID,
+			}); err != nil {
+				return fmt.Errorf("client %d: mutation %s: %w", cfg.id, mutID, err)
+			}
+		}
+		if !waitPred(ctx, func() bool {
+			_, _, _, acks := inbox.snapshot()
+			for id := range wantIDs {
+				if _, ok := acks[id]; !ok {
+					return false
+				}
+			}
+			return true
+		}) {
+			_, _, _, acks := inbox.snapshot()
+			var got []string
+			for id := range acks {
+				got = append(got, id)
+			}
+			slices.Sort(got)
+			return fmt.Errorf("client %d: missing mutation acks: got %d/%d %v", cfg.id, len(acks), len(wantIDs), got)
+		}
+		_, _, _, acks := inbox.snapshot()
+		for mutID, body := range wantIDs {
+			ack := acks[mutID]
+			if ack["location"] != "createMessage" {
+				return fmt.Errorf("client %d: ack %s location = %v, want createMessage", cfg.id, mutID, ack["location"])
+			}
+			data, _ := ack["data"].(map[string]interface{})
+			if data["error"] != nil {
+				return fmt.Errorf("client %d: mutation %s error: %v", cfg.id, mutID, data["error"])
+			}
+			if data["Body"] != body {
+				return fmt.Errorf("client %d: mutation %s Body = %v, want %s", cfg.id, mutID, data["Body"], body)
+			}
+			if data["RoomID"] != cfg.room {
+				return fmt.Errorf("client %d: mutation %s RoomID = %v, want %s", cfg.id, mutID, data["RoomID"], cfg.room)
+			}
+		}
+		for mutID := range acks {
+			if _, ok := wantIDs[mutID]; !ok {
+				return fmt.Errorf("client %d: received unexpected mutation_id %q", cfg.id, mutID)
+			}
+		}
+	}
+
+	if !waitPred(ctx, func() bool {
+		_, _, data, _ := inbox.snapshot()
+		return e2eBodiesMatch(e2eMessageBodies(data), cfg.wantBodies)
+	}) {
+		hits, _, data, _ := inbox.snapshot()
+		got := e2eMessageBodies(data)
+		missing, extra := e2eBodyDiff(got, cfg.wantBodies)
+		return fmt.Errorf("client %d: query did not converge to all room %q messages (hits=%d got=%d want=%d missing=%v extra=%v)",
+			cfg.id, cfg.room, hits, len(got), len(cfg.wantBodies), missing, extra)
+	}
+
+	_, key, data, _ := inbox.snapshot()
+	if key != cfg.queryKey {
+		return fmt.Errorf("client %d: query_key = %q, want %q", cfg.id, key, cfg.queryKey)
+	}
+	for _, item := range data {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("client %d: query item is %T, want object", cfg.id, item)
+		}
+		if m["RoomID"] != cfg.room {
+			return fmt.Errorf("client %d: query leaked RoomID %v into room %s", cfg.id, m["RoomID"], cfg.room)
+		}
+	}
+	return nil
+}
+
+func TestConcurrentWebsocketClientsEndToEnd(t *testing.T) {
+	const (
+		nMutators     = 24
+		nWatchers     = 16
+		nDroppers     = 10
+		mutationsEach = 5
+	)
+	nClients := nMutators + nWatchers + nDroppers
+
+	e := newConcurrentTestEngine(t)
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		room := ctx.Params["room"].(string)
+		ctx.TrackCollection("messages", "room_id", room)
+		var msgs []testMessage
+		if err := ctx.DB.Where("room_id = ?", room).Order("id").Find(&msgs).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return msgs
+	}, nil)
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+		msg := testMessage{
+			Body:   ctx.Params["body"].(string),
+			RoomID: ctx.Params["room"].(string),
+		}
+		if err := ctx.DB.Create(&msg).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return msg
+	})
+
+	srv := httptest.NewServer(http.HandlerFunc(e.Handle))
+	t.Cleanup(srv.Close)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/"
+
+	roomOf := func(id int) string {
+		if id%2 == 0 {
+			return "alpha"
+		}
+		return "bravo"
+	}
+	bodyOf := func(mutatorID, n int) string {
+		return fmt.Sprintf("c%d-n%d", mutatorID, n)
+	}
+
+	wantBodies := map[string]map[string]struct{}{
+		"alpha": {},
+		"bravo": {},
+	}
+	for id := 0; id < nMutators; id++ {
+		for n := 0; n < mutationsEach; n++ {
+			wantBodies[roomOf(id)][bodyOf(id, n)] = struct{}{}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	barriers := &e2eBarriers{goMutate: make(chan struct{})}
+	barriers.subscribed.Add(nClients)
+	errCh := make(chan error, nClients)
+
+	startClient := func(id int, role e2eRole) {
+		go func() {
+			errCh <- runE2EClient(ctx, wsURL, e2eClientCfg{
+				id:            id,
+				role:          role,
+				room:          roomOf(id),
+				queryKey:      fmt.Sprintf("client-%d", id),
+				mutationsEach: mutationsEach,
+				wantBodies:    wantBodies[roomOf(id)],
+				bodyOf:        bodyOf,
+			}, barriers)
+		}()
+	}
+	for id := 0; id < nMutators; id++ {
+		startClient(id, e2eMutator)
+	}
+	for i := 0; i < nWatchers; i++ {
+		startClient(nMutators+i, e2eWatcher)
+	}
+	for i := 0; i < nDroppers; i++ {
+		startClient(nMutators+nWatchers+i, e2eDropper)
+	}
+
+	subscribed := make(chan struct{})
+	go func() {
+		barriers.subscribed.Wait()
+		close(subscribed)
+	}()
+	select {
+	case <-subscribed:
+	case <-ctx.Done():
+		for {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Error(err)
+				}
+			default:
+				t.Fatal("timed out waiting for all clients to subscribe and receive an initial query result")
+			}
+		}
+	}
+	close(barriers.goMutate)
+
+	for i := 0; i < nClients; i++ {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for concurrent clients to finish")
+		}
 	}
 }
