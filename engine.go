@@ -718,6 +718,19 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	return result, nil
 }
 
+func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
+	if _, exists := e.mutations[mutation]; !exists {
+		return nil, fmt.Errorf("mutation not found")
+	}
+	authCtx := &AuthCtx{
+		GetIdentity: func() (string, error) { panic("tether: mutations with auth cannot be executed internally") },
+	}
+	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params}
+	result := e.mutations[mutation].Func(mutationCtx)
+	slog.Debug("Executing mutation internally", "mutation", mutation, "params", params, "result", result)
+	return result, nil
+}
+
 func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{}, clientID string, mutationID string) (interface{}, error) {
 	if _, exists := e.mutations[mutation]; !exists {
 		return nil, fmt.Errorf("mutation not found")
