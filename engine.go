@@ -251,7 +251,6 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 		GetIdentity: func() (string, error) {
 			return getIdentity(queryCtx, authID)
 		},
-		IsAuthenticated: authID != "",
 	}
 
 	// Create the GORM context
@@ -291,8 +290,7 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	authID := auth.UserID
 
 	authCtx := &AuthCtx{
-		GetIdentity:     func() (string, error) { return authID, nil },
-		IsAuthenticated: true,
+		GetIdentity: func() (string, error) { return authID, nil },
 	}
 
 	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params}

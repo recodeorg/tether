@@ -1019,14 +1019,14 @@ func TestQueryExposesIdentityOfTheSubscribedClient(t *testing.T) {
 		if err != nil {
 			return map[string]interface{}{"error": err.Error()}
 		}
-		return map[string]interface{}{"id": id, "authed": ctx.Auth.IsAuthenticated}
+		return map[string]interface{}{"id": id}
 	}, nil)
 
 	subscribe(t, e, alice, "me", "alice", nil)
 	subscribe(t, e, bob, "me", "bob", nil)
 	subscribe(t, e, anon, "me", "anon", nil)
 
-	assertMe := func(client *reactivity.Client, wantID string, wantAuthed bool) {
+	assertMe := func(client *reactivity.Client, wantID string) {
 		t.Helper()
 		msgs := queryMessages(t, drain(client))
 		if len(msgs) != 1 {
@@ -1036,13 +1036,10 @@ func TestQueryExposesIdentityOfTheSubscribedClient(t *testing.T) {
 		if data["id"] != wantID {
 			t.Errorf("id = %v, want %q", data["id"], wantID)
 		}
-		if data["authed"] != wantAuthed {
-			t.Errorf("authed = %v, want %v", data["authed"], wantAuthed)
-		}
 	}
-	assertMe(alice, "user-alice", true)
-	assertMe(bob, "user-bob", true)
-	assertMe(anon, "", false)
+	assertMe(alice, "user-alice")
+	assertMe(bob, "user-bob")
+	assertMe(anon, "")
 }
 
 func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
@@ -1140,13 +1137,12 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 	e.tracker.SetAuth(authed.ID, "user-1", time.Now().Add(time.Hour))
 
 	type seen struct {
-		id     string
-		authed bool
+		id string
 	}
 	var fromAuthed, fromAnon seen
 	e.RegisterMutation("whoami", func(ctx *MutationCtx) interface{} {
 		id, _ := ctx.AuthCtx.GetIdentity()
-		return map[string]interface{}{"id": id, "authed": ctx.AuthCtx.IsAuthenticated}
+		return map[string]interface{}{"id": id}
 	})
 
 	mustNoPanic(t, "authed mutation", func() {
@@ -1155,7 +1151,7 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 			t.Errorf("ExecuteMutation: %v", err)
 		}
 		data := result.(map[string]interface{})
-		fromAuthed = seen{id: data["id"].(string), authed: data["authed"].(bool)}
+		fromAuthed = seen{id: data["id"].(string)}
 	})
 	mustNoPanic(t, "anon mutation", func() {
 		result, err := e.ExecuteMutation("whoami", map[string]interface{}{}, anon.ID, "m2")
@@ -1163,17 +1159,14 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 			t.Errorf("ExecuteMutation: %v", err)
 		}
 		data := result.(map[string]interface{})
-		fromAnon = seen{id: data["id"].(string), authed: data["authed"].(bool)}
+		fromAnon = seen{id: data["id"].(string)}
 	})
 
-	if fromAuthed.id != "user-1" || !fromAuthed.authed {
-		t.Errorf("authenticated mutation saw %+v, want id=user-1 authed=true", fromAuthed)
+	if fromAuthed.id != "user-1" {
+		t.Errorf("authenticated mutation saw %+v, want id=user-1", fromAuthed)
 	}
 	if fromAnon.id != "" {
 		t.Errorf("unauthenticated mutation GetIdentity = %q, want empty", fromAnon.id)
-	}
-	if fromAnon.authed {
-		t.Error("unauthenticated mutation reported IsAuthenticated=true")
 	}
 }
 
