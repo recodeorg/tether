@@ -205,10 +205,6 @@ func TestNewEngineRejectsInvalidDBType(t *testing.T) {
 	NewEngine(newTestDB(t), "mysql")
 }
 
-func TestGithubWorkflowTemporary(t *testing.T) {
-	t.Fatal("This should cause the github workflow to fail")
-}
-
 func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 	for _, dbType := range []string{"sqlite", "postgres"} {
 		t.Run(dbType, func(t *testing.T) {
