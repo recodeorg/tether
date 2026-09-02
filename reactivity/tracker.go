@@ -99,14 +99,14 @@ func (t *Tracker) SetAuth(clientID string, userID string, expiresAt time.Time) {
 	}
 }
 
-func (t *Tracker) GetAuth(clientID string) *AuthCtx {
+func (t *Tracker) GetAuth(clientID string) (*AuthCtx, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	if client, exists := t.clients[clientID]; exists {
-		return client.GetAuth()
+		return client.GetAuth(), true
 	}
 	slog.Error("Tracker: Client not found", "clientID", clientID)
-	return nil
+	return nil, false
 }
 
 func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey string, params map[string]interface{}) *Subscription {

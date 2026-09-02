@@ -966,8 +966,14 @@ func TestAuthMapsToTheAuthenticatedClientOnly(t *testing.T) {
 		t.Fatalf("auth alice: %v", err)
 	}
 
-	aliceAuth := e.tracker.GetAuth(alice.ID)
-	bobAuth := e.tracker.GetAuth(bob.ID)
+	aliceAuth, ok := e.tracker.GetAuth(alice.ID)
+	if !ok {
+		t.Fatalf("alice auth not found")
+	}
+	bobAuth, ok := e.tracker.GetAuth(bob.ID)
+	if !ok {
+		t.Fatalf("bob auth not found")
+	}
 	if aliceAuth == nil || aliceAuth.UserID != "alice" {
 		t.Fatalf("alice auth = %+v, want userID alice", aliceAuth)
 	}
@@ -1083,7 +1089,7 @@ func TestFailedAuthDoesNotSetIdentityOrPanic(t *testing.T) {
 	if !slices.Equal(auth.tokens, []string{"nope"}) {
 		t.Errorf("VerifyToken tokens = %v, want [nope]", auth.tokens)
 	}
-	if got := e.tracker.GetAuth(client.ID); got == nil || got.UserID != "" {
+	if got, ok := e.tracker.GetAuth(client.ID); !ok || got.UserID != "" {
 		t.Errorf("failed auth left UserID = %+v", got)
 	}
 
@@ -1184,13 +1190,16 @@ func TestAuthExpiryClearsOnlyThatClient(t *testing.T) {
 	e.tracker.SetAuth(kept.ID, "kept", time.Now().Add(time.Hour))
 
 	if !waitUntil(t, time.Second, func() bool {
-		auth := e.tracker.GetAuth(expiring.ID)
+		auth, ok := e.tracker.GetAuth(expiring.ID)
+		if !ok {
+			return false
+		}
 		return auth != nil && auth.UserID == ""
 	}) {
 		t.Fatal("expired auth was not cleared")
 	}
-	if got := e.tracker.GetAuth(kept.ID); got == nil || got.UserID != "kept" {
-		t.Errorf("other client's auth was cleared: %+v", got)
+	if auth, ok := e.tracker.GetAuth(kept.ID); !ok || auth.UserID != "kept" {
+		t.Errorf("other client's auth was cleared: %+v", auth)
 	}
 }
 

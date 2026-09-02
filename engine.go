@@ -230,7 +230,11 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	if err != nil {
 		return nil, err
 	}
-	authID := e.tracker.GetAuth(subscription.Client.ID).UserID
+	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
+	if !ok {
+		return nil, fmt.Errorf("client not found")
+	}
+	authID := auth.UserID
 	cacheKey := query + "?" + string(paramsJSON) + "?" + authID
 	e.hashMu.Lock()
 	lastHash := e.queryHashes[cacheKey]
@@ -280,7 +284,11 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 }
 
 func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{}, clientID string, mutationID string) (interface{}, error) {
-	authID := e.tracker.GetAuth(clientID).UserID
+	auth, ok := e.tracker.GetAuth(clientID)
+	if !ok {
+		return nil, fmt.Errorf("client not found")
+	}
+	authID := auth.UserID
 
 	authCtx := &AuthCtx{
 		GetIdentity:     func() (string, error) { return authID, nil },
@@ -318,7 +326,11 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 	case "auth":
 		userID, expiresAt, err := e.auth.VerifyToken(e.db, msg["token"].(string))
 		time.AfterFunc(time.Until(expiresAt), func() {
-			if time.Time.Equal(e.tracker.GetAuth(clientID).ExpiresAt, expiresAt) {
+			auth, ok := e.tracker.GetAuth(clientID)
+			if !ok {
+				return
+			}
+			if time.Time.Equal(auth.ExpiresAt, expiresAt) {
 				e.tracker.SetAuth(clientID, "", time.Time{})
 			}
 		})
