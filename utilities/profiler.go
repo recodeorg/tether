@@ -1,7 +1,9 @@
 package utilities
 
 import (
+	"errors"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,77 +19,106 @@ const (
 )
 
 type Metric struct {
-	ID       string            // The id of the metric
-	Name     string            // The name of the metric
-	Type     MetricType        // The type of the metric
-	Time     time.Time         // The time the metric was recorded
-	Duration time.Duration     // The duration of the metric
-	Tags     map[string]string // The tracking tags of the metric
+	ID       string        // The id of the metric
+	Name     string        // The name of the metric
+	Type     MetricType    // The type of the metric
+	Time     time.Time     // The time the metric was recorded
+	Duration time.Duration // The duration of the metric
+	Tags     []string      // The tracking tags of the metric
 }
 
+var ErrProfilerRunning = errors.New("tether: profiler is already running")
+
 type Profiler struct {
-	mu             sync.Mutex
-	profilerActive bool
-	metrics        []Metric
-	onFlush        func(mutationName string)
+	active   atomic.Bool
+	mu       sync.Mutex
+	metrics  []Metric
+	capacity int
+	stopChan chan struct{}
+	onFlush  func(mutationName string)
 }
 
 func NewProfiler(onFlush func(mutationName string)) *Profiler {
 	return &Profiler{
-		metrics: make([]Metric, 0),
-		onFlush: onFlush,
+		metrics:  make([]Metric, 0, 2048),
+		capacity: 100_000, // Safe ceiling to prevent runaway RAM usage
+		onFlush:  onFlush,
 	}
 }
 
-func (p *Profiler) Start() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.profilerActive = true
+func (p *Profiler) Start() error {
+	if !p.active.CompareAndSwap(false, true) {
+		return ErrProfilerRunning
+	}
+	return nil
 }
 
-func (p *Profiler) StartWithCallback(flushInterval time.Duration, mutationName string) {
-	p.mu.Lock()
-	if p.profilerActive {
-		p.mu.Unlock()
-		return
+func (p *Profiler) StartWithCallback(flushInterval time.Duration, mutationName string) error {
+	if !p.active.CompareAndSwap(false, true) {
+		return ErrProfilerRunning
 	}
-	p.profilerActive = true
+
+	p.mu.Lock()
+	p.stopChan = make(chan struct{})
+	stop := p.stopChan
 	p.mu.Unlock()
+
 	go func() {
 		ticker := time.NewTicker(flushInterval)
 		defer ticker.Stop()
-		for range ticker.C {
-			p.mu.Lock()
-			isActive := p.profilerActive
-			p.mu.Unlock()
-			if !isActive {
+
+		for {
+			select {
+			case <-stop:
 				return
+			case <-ticker.C:
+				if p.onFlush != nil {
+					p.onFlush(mutationName)
+				}
 			}
-			p.onFlush(mutationName)
 		}
 	}()
+
+	return nil
 }
 
 func (p *Profiler) Add(m Metric) {
+	// Ultra-fast path: lock-free when inactive
+	if !p.active.Load() {
+		return
+	}
+
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if !p.profilerActive {
-		return
+	// Guard against runaway memory if flushes are delayed
+	if len(p.metrics) < p.capacity {
+		p.metrics = append(p.metrics, m)
 	}
-	p.metrics = append(p.metrics, m)
 }
 
 func (p *Profiler) DumpMetricsAndFlush() []Metric {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	metrics := p.metrics
-	p.metrics = make([]Metric, 0, len(metrics))
-	return metrics
+
+	if len(p.metrics) == 0 {
+		return nil
+	}
+
+	flushed := p.metrics
+	p.metrics = make([]Metric, 0, 2048)
+	return flushed
 }
 
 func (p *Profiler) Stop() {
+	if !p.active.CompareAndSwap(true, false) {
+		return
+	}
+
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.profilerActive = false
+	if p.stopChan != nil {
+		close(p.stopChan)
+		p.stopChan = nil
+	}
+	p.mu.Unlock()
 }

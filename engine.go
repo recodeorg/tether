@@ -21,14 +21,24 @@ import (
 type Engine struct {
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
-	mutations       map[string]func(ctx *MutationCtx) interface{}
-	queries         map[string]func(ctx *QueryCtx) interface{}
+	mutations       map[string]Mutation
+	queries         map[string]Query
 	dependencies    map[string][]string
 	hashMu          sync.RWMutex
 	queryHashes     map[string]uint64
 	tracker         *reactivity.Tracker
 	auth            Auth
 	websocketHelper *reactivity.WebsocketHelper
+}
+
+type Mutation struct {
+	Func     func(ctx *MutationCtx) interface{}
+	Internal bool
+}
+
+type Query struct {
+	Func     func(ctx *QueryCtx) interface{}
+	Internal bool
 }
 
 type defaultAuth struct{}
@@ -57,8 +67,8 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	e := &Engine{
 		db:              db,
 		dbType:          dbType,
-		mutations:       make(map[string]func(ctx *MutationCtx) interface{}),
-		queries:         make(map[string]func(ctx *QueryCtx) interface{}),
+		mutations:       make(map[string]Mutation),
+		queries:         make(map[string]Query),
 		dependencies:    make(map[string][]string),
 		queryHashes:     make(map[string]uint64),
 		tracker:         tracker,
@@ -559,13 +569,25 @@ func (e *Engine) SetAuth(auth Auth) {
 	e.auth = auth
 }
 
-func (e *Engine) RegisterMutation(name string, mutation func(ctx *MutationCtx) interface{}) {
-	e.mutations[name] = mutation // stores the mutation in the list of valid mutations
+func (e *Engine) RegisterMutation(name string, mutation func(ctx *MutationCtx) interface{}, opts ...MutationOptions) {
+	options := MutationOptions{
+		Internal: false,
+	}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	e.mutations[name] = Mutation{Func: mutation, Internal: options.Internal} // stores the mutation in the list of valid mutations
 	slog.Debug("Registered mutation", "name", name)
 }
 
-func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, dependencies []string) {
-	e.queries[name] = query // stores the query in the list of valid queries
+func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, dependencies []string, opts ...QueryOptions) {
+	options := QueryOptions{
+		Internal: false,
+	}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	e.queries[name] = Query{Func: query, Internal: options.Internal} // stores the query in the list of valid queries
 	for _, dependency := range dependencies {
 		e.dependencies[dependency] = append(e.dependencies[dependency], name)
 	}
@@ -634,12 +656,15 @@ func (e *Engine) InvalidateTags(tags []string) {
 }
 
 func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) (interface{}, error) {
+	if _, exists := e.queries[query]; !exists {
+		return nil, fmt.Errorf("query not found")
+	}
+	if e.queries[query].Internal {
+		return nil, fmt.Errorf("query not found") // return non-descriptive error to prevent enumeration
+	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		return nil, err
-	}
-	if _, exists := e.queries[query]; !exists {
-		return nil, fmt.Errorf("query not found")
 	}
 	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
 	if !ok {
@@ -669,7 +694,7 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	queryCtx.DB = e.db.WithContext(gormCtx)
 
 	// Execute the query
-	result := e.queries[query](queryCtx)
+	result := e.queries[query].Func(queryCtx)
 
 	// Update the dependencies
 	e.tracker.UpdateTags(subscription.SubID, queryCtx.Dependencies)
@@ -694,12 +719,15 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 }
 
 func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{}, clientID string, mutationID string) (interface{}, error) {
+	if _, exists := e.mutations[mutation]; !exists {
+		return nil, fmt.Errorf("mutation not found")
+	}
+	if e.mutations[mutation].Internal {
+		return nil, fmt.Errorf("mutation not found") // return non-descriptive error to prevent enumeration
+	}
 	auth, ok := e.tracker.GetAuth(clientID)
 	if !ok {
 		return nil, fmt.Errorf("client not found")
-	}
-	if _, exists := e.mutations[mutation]; !exists {
-		return nil, fmt.Errorf("mutation not found")
 	}
 	authID := auth.UserID
 
@@ -709,7 +737,7 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 
 	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params}
 
-	result := e.mutations[mutation](mutationCtx)
+	result := e.mutations[mutation].Func(mutationCtx)
 	slog.Debug("Executing mutation", "mutation", mutation, "params", params, "result", result)
 	responseJSON, err := json.Marshal(map[string]interface{}{"type": "mutation", "location": mutation, "data": result, "mutation_id": mutationID})
 	if err != nil {

@@ -37,3 +37,11 @@ type MutationCtx struct {
 type Auth interface {
 	VerifyToken(DB *gorm.DB, token string) (userID string, expiresAt time.Time, error error)
 }
+
+type MutationOptions struct {
+	Internal bool
+}
+
+type QueryOptions struct {
+	Internal bool
+}
