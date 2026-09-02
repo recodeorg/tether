@@ -1055,10 +1055,10 @@ func TestAuthMapsToTheAuthenticatedClientOnly(t *testing.T) {
 	if !ok {
 		t.Fatalf("bob auth not found")
 	}
-	if aliceAuth == nil || aliceAuth.UserID != "alice" {
+	if aliceAuth.UserID != "alice" {
 		t.Fatalf("alice auth = %+v, want userID alice", aliceAuth)
 	}
-	if bobAuth == nil || bobAuth.UserID != "" {
+	if bobAuth.UserID != "" {
 		t.Errorf("bob auth leaked alice's identity: %+v", bobAuth)
 	}
 
@@ -1268,7 +1268,7 @@ func TestAuthExpiryClearsOnlyThatClient(t *testing.T) {
 		if !ok {
 			return false
 		}
-		return auth != nil && auth.UserID == ""
+		return auth.UserID == ""
 	}) {
 		t.Fatal("expired auth was not cleared")
 	}

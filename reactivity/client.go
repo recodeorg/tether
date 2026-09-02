@@ -2,6 +2,7 @@ package reactivity
 
 import (
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -9,6 +10,7 @@ import (
 )
 
 type Client struct {
+	mu   sync.RWMutex
 	ID   string
 	Conn *websocket.Conn
 	Send chan []byte
@@ -25,12 +27,17 @@ func NewClient(conn *websocket.Conn) *Client {
 }
 
 func (c *Client) SetAuth(userID string, expiresAt time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.Auth.UserID = userID
 	c.Auth.ExpiresAt = expiresAt
 }
 
-func (c *Client) GetAuth() *AuthCtx {
-	return c.Auth
+func (c *Client) GetAuth() AuthCtx {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	copy := *c.Auth
+	return copy
 }
 
 func (c *Client) WritePump() {
