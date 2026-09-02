@@ -289,6 +289,9 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	if !ok {
 		return nil, fmt.Errorf("client not found")
 	}
+	if _, exists := e.mutations[mutation]; !exists {
+		return nil, fmt.Errorf("mutation not found")
+	}
 	authID := auth.UserID
 
 	authCtx := &AuthCtx{
