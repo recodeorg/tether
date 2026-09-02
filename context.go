@@ -8,8 +8,7 @@ import (
 )
 
 type AuthCtx struct {
-	GetIdentity     func() (string, error)
-	IsAuthenticated bool
+	GetIdentity func() (string, error)
 }
 
 type QueryCtx struct {

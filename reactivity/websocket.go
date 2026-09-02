@@ -19,11 +19,11 @@ type WebsocketHelper struct {
 	CheckOrigin func(r *http.Request) bool
 }
 
-var upgrader = websocket.Upgrader{}
-
 func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tracker, helper *WebsocketHelper) {
+	upgrader := websocket.Upgrader{
+		CheckOrigin: helper.CheckOrigin,
+	}
 	ws, err := upgrader.Upgrade(w, r, nil)
-	upgrader.CheckOrigin = helper.CheckOrigin
 	if err != nil {
 		slog.Error("WS: Failed to upgrade to websocket", "error", err)
 		return
