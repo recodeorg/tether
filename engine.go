@@ -63,32 +63,15 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		auth:            defaultAuth{},
 		websocketHelper: &reactivity.WebsocketHelper{},
 	}
-	db.Callback().Create().After("gorm:create").Register("tether:after_create", func(tx *gorm.DB) {
+	invalidate := func(tx *gorm.DB) {
 		if dbType == "postgres" {
 			return
 		}
-		for _, tag := range extractMutationTags(tx) {
-			e.InvalidateTag(tag)
-		}
-	})
-
-	db.Callback().Update().After("gorm:update").Register("tether:after_update", func(tx *gorm.DB) {
-		if dbType == "postgres" {
-			return
-		}
-		for _, tag := range extractMutationTags(tx) {
-			e.InvalidateTag(tag)
-		}
-	})
-
-	db.Callback().Delete().After("gorm:delete").Register("tether:after_delete", func(tx *gorm.DB) {
-		if dbType == "postgres" {
-			return
-		}
-		for _, tag := range extractMutationTags(tx) {
-			e.InvalidateTag(tag)
-		}
-	})
+		e.InvalidateTags(extractMutationTags(tx))
+	}
+	db.Callback().Create().After("gorm:create").Register("tether:after_create", invalidate)
+	db.Callback().Update().After("gorm:update").Register("tether:after_update", invalidate)
+	db.Callback().Delete().After("gorm:delete").Register("tether:after_delete", invalidate)
 
 	// Automatically track the dependencies for the query
 	db.Callback().Query().After("gorm:query").Register("tether:auto_track", func(tx *gorm.DB) {
@@ -140,6 +123,9 @@ func extractMutationTags(tx *gorm.DB) []string {
 	} else if val.Kind() == reflect.Struct {
 		items = append(items, val)
 	}
+
+	// Emit table mutated tag
+	tags = append(tags, fmt.Sprintf("table_%s:mutated", tableName))
 
 	for _, item := range items {
 		// 1. Extract Primary Keys (e.g., "messages:5")
@@ -218,8 +204,26 @@ func (e *Engine) GetDependentQueries(tableName string) []string {
 }
 
 func (e *Engine) InvalidateTag(tag string) {
-	subscriptions := e.tracker.GetSubscriptionsToTag(tag)
-	for _, subscription := range subscriptions {
+	e.InvalidateTags([]string{tag})
+}
+
+// InvalidateTags re-runs each distinct subscription that listens to any of the
+// given tags. Subscriptions are snapshotted before any query executes so a
+// re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
+// cause the same mutation to fire the query a second time.
+func (e *Engine) InvalidateTags(tags []string) {
+	seen := make(map[string]struct{})
+	var unique []*reactivity.Subscription
+	for _, tag := range tags {
+		for _, subscription := range e.tracker.GetSubscriptionsToTag(tag) {
+			if _, ok := seen[subscription.SubID]; ok {
+				continue
+			}
+			seen[subscription.SubID] = struct{}{}
+			unique = append(unique, subscription)
+		}
+	}
+	for _, subscription := range unique {
 		e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true)
 	}
 }

@@ -431,9 +431,9 @@ func TestUpdateInvalidatesPrimaryKeyAndCollectionTags(t *testing.T) {
 		t.Errorf("primary-key query runs after Update = %d, want 2", got)
 	}
 	// The room query is subscribed to both the collection tag and the
-	// auto-tracked row id, so one Save that emits both tags re-runs it twice.
-	if got := colRuns.Load(); got != 3 {
-		t.Errorf("collection query runs after Update = %d, want 3", got)
+	// auto-tracked row id, but a single Save must re-run it only once.
+	if got := colRuns.Load(); got != 2 {
+		t.Errorf("collection query runs after Update = %d, want 2", got)
 	}
 	if got := otherRuns.Load(); got != 1 {
 		t.Errorf("unrelated collection query runs after Update = %d, want 1", got)
@@ -465,9 +465,10 @@ func TestDeleteInvalidatesTrackedTags(t *testing.T) {
 	if err := e.db.Delete(&msg).Error; err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	// Delete emits both the PK tag and the collection tag; this query listens to both.
-	if got := runs.Load(); got != 3 {
-		t.Errorf("query runs after Delete = %d, want 3", got)
+	// Delete emits both the PK tag and the collection tag; this query listens
+	// to both, but a single Delete must re-run it only once.
+	if got := runs.Load(); got != 2 {
+		t.Errorf("query runs after Delete = %d, want 2", got)
 	}
 }
 
