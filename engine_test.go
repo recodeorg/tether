@@ -315,6 +315,29 @@ func TestExtractMutationTagsFromMapUpdate(t *testing.T) {
 	}
 }
 
+func TestExtractMutationTagsFromSaveIncludesOldAndNewCollection(t *testing.T) {
+	e := newTestEngine(t)
+	tags := captureMutationTags(t, e.db)
+	msg := testMessage{Body: "moving", RoomID: "old"}
+	if err := e.db.Create(&msg).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	msg.RoomID = "new"
+	if err := e.db.Save(&msg).Error; err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	if !slices.Contains(*tags, "messages_room_id:old") {
+		t.Errorf("tags = %v, missing old collection tag", *tags)
+	}
+	if !slices.Contains(*tags, "messages_room_id:new") {
+		t.Errorf("tags = %v, missing new collection tag", *tags)
+	}
+	if !slices.Contains(*tags, fmt.Sprintf("messages:%v", msg.ID)) {
+		t.Errorf("tags = %v, missing primary key tag", *tags)
+	}
+}
+
 func TestExtractMutationTagsWithoutSchema(t *testing.T) {
 	e := newTestEngine(t)
 	if err := e.db.Exec("SELECT 1").Error; err != nil {
@@ -514,6 +537,41 @@ func TestMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
 	msg.RoomID = "new"
 	if err := e.db.Save(&msg).Error; err != nil {
 		t.Fatalf("Save: %v", err)
+	}
+
+	if got := newRuns.Load(); got != 2 {
+		t.Errorf("destination collection runs = %d, want 2", got)
+	}
+	if got := oldRuns.Load(); got != 2 {
+		t.Errorf("source collection runs = %d, want 2 (old collection should also be invalidated)", got)
+	}
+}
+
+func TestMapUpdatesMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	msg := testMessage{Body: "moving", RoomID: "old"}
+	if err := e.db.Create(&msg).Error; err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	var oldRuns, newRuns atomic.Int64
+	e.RegisterQuery("oldRoom", func(ctx *QueryCtx) interface{} {
+		oldRuns.Add(1)
+		ctx.TrackCollection("messages", "room_id", "old")
+		return "old"
+	}, nil)
+	e.RegisterQuery("newRoom", func(ctx *QueryCtx) interface{} {
+		newRuns.Add(1)
+		ctx.TrackCollection("messages", "room_id", "new")
+		return "new"
+	}, nil)
+	subscribe(t, e, client, "oldRoom", "old", nil)
+	subscribe(t, e, client, "newRoom", "new", nil)
+
+	if err := e.db.Model(&testMessage{}).Where("id = ?", msg.ID).Updates(map[string]interface{}{"room_id": "new"}).Error; err != nil {
+		t.Fatalf("Updates: %v", err)
 	}
 
 	if got := newRuns.Load(); got != 2 {

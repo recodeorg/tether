@@ -71,7 +71,17 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		}
 		e.InvalidateTags(extractMutationTags(tx))
 	}
+	// GORM callbacks only see the post-update Dest, so a Save that moves a
+	// tracked collection field would miss the old collection. Snapshot the
+	// matching rows before the UPDATE SQL runs.
+	snapshotOld := func(tx *gorm.DB) {
+		if dbType == "postgres" {
+			return
+		}
+		snapshotOldTrackedTags(tx)
+	}
 	db.Callback().Create().After("gorm:create").Register("tether:after_create", invalidate)
+	db.Callback().Update().Before("gorm:update").Register("tether:before_update", snapshotOld)
 	db.Callback().Update().After("gorm:update").Register("tether:after_update", invalidate)
 	db.Callback().Delete().After("gorm:delete").Register("tether:after_delete", invalidate)
 
@@ -154,7 +164,159 @@ func extractMutationTags(tx *gorm.DB) []string {
 	}
 	appendWhereTags(tx, add)
 
+	if old, ok := tx.InstanceGet(oldTrackedTagsKey); ok {
+		if oldTags, ok := old.([]string); ok {
+			for _, tag := range oldTags {
+				add(tag)
+			}
+		}
+	}
+
 	return tags
+}
+
+const oldTrackedTagsKey = "tether:old_tracked_tags"
+
+func hasTrackedFields(tx *gorm.DB) bool {
+	if tx.Statement == nil || tx.Statement.Schema == nil {
+		return false
+	}
+	for _, field := range tx.Statement.Schema.Fields {
+		if field.Tag.Get("tether") == "track" {
+			return true
+		}
+	}
+	return false
+}
+
+// snapshotOldTrackedTags loads the rows about to be updated and stashes their
+// tracked-field tags on the statement. GORM does not expose a before-image in
+// update callbacks, so this extra SELECT (same transaction, hooks skipped) is
+// what lets a collection move invalidate both the old and new collections.
+func snapshotOldTrackedTags(tx *gorm.DB) {
+	if tx.Error != nil || tx.DryRun || tx.Statement == nil || tx.Statement.Schema == nil {
+		return
+	}
+	if !hasTrackedFields(tx) {
+		return
+	}
+
+	dest := tx.Statement.Schema.MakeSlice().Interface()
+	q := tx.Session(&gorm.Session{
+		NewDB:       true,
+		SkipHooks:   true,
+		Initialized: true,
+		Context:     context.Background(),
+	}).Model(reflect.New(tx.Statement.Schema.ModelType).Interface())
+	if tx.Statement.Table != "" {
+		q = q.Table(tx.Statement.Table)
+	}
+	q.Statement.Unscoped = tx.Statement.Unscoped
+
+	if !restrictToUpdatingRows(tx, q) {
+		return
+	}
+	if err := q.Find(dest).Error; err != nil {
+		slog.Debug("tether: failed to snapshot rows before update", "error", err)
+		return
+	}
+
+	seen := make(map[string]struct{})
+	var tags []string
+	add := func(tag string) {
+		if _, ok := seen[tag]; ok {
+			return
+		}
+		seen[tag] = struct{}{}
+		tags = append(tags, tag)
+	}
+	slice := reflect.Indirect(reflect.ValueOf(dest))
+	for i := 0; i < slice.Len(); i++ {
+		appendRecordTags(tx, reflect.Indirect(slice.Index(i)), add)
+	}
+	if len(tags) > 0 {
+		tx.InstanceSet(oldTrackedTagsKey, tags)
+	}
+}
+
+// restrictToUpdatingRows copies the update's WHERE and/or primary keys onto q.
+// Save() does not attach the PK to WHERE until gorm:update itself, so we also
+// read PKs from Dest and Model. Returns false if we cannot identify rows
+// without scanning the whole table.
+func restrictToUpdatingRows(updateTx, queryTx *gorm.DB) bool {
+	identified := false
+	if where, ok := updateTx.Statement.Clauses["WHERE"]; ok && where.Expression != nil {
+		queryTx.Statement.AddClause(clause.Where{Exprs: []clause.Expression{where.Expression}})
+		identified = true
+	}
+	if addPrimaryKeyIdentity(updateTx, queryTx) {
+		identified = true
+	}
+	return identified
+}
+
+func addPrimaryKeyIdentity(updateTx, queryTx *gorm.DB) bool {
+	if updateTx.Statement.Schema == nil {
+		return false
+	}
+	pks := updateTx.Statement.Schema.PrimaryFields
+	if len(pks) == 0 {
+		return false
+	}
+
+	var items []reflect.Value
+	collectStructItems := func(v interface{}) {
+		if v == nil {
+			return
+		}
+		val := reflect.Indirect(reflect.ValueOf(v))
+		switch val.Kind() {
+		case reflect.Struct:
+			items = append(items, val)
+		case reflect.Slice:
+			for i := 0; i < val.Len(); i++ {
+				items = append(items, reflect.Indirect(val.Index(i)))
+			}
+		}
+	}
+	collectStructItems(updateTx.Statement.Dest)
+	if updateTx.Statement.Model != nil && updateTx.Statement.Model != updateTx.Statement.Dest {
+		collectStructItems(updateTx.Statement.Model)
+	}
+
+	var groups []clause.Expression
+	for _, item := range items {
+		if item.Kind() != reflect.Struct {
+			continue
+		}
+		var eqs []clause.Expression
+		complete := true
+		for _, field := range pks {
+			pkVal, isZero := field.ValueOf(updateTx.Statement.Context, item)
+			if isZero {
+				complete = false
+				break
+			}
+			eqs = append(eqs, clause.Eq{Column: field.DBName, Value: pkVal})
+		}
+		if !complete || len(eqs) == 0 {
+			continue
+		}
+		if len(eqs) == 1 {
+			groups = append(groups, eqs[0])
+		} else {
+			groups = append(groups, clause.And(eqs...))
+		}
+	}
+	if len(groups) == 0 {
+		return false
+	}
+	if len(groups) == 1 {
+		queryTx.Statement.AddClause(clause.Where{Exprs: groups})
+	} else {
+		queryTx.Statement.AddClause(clause.Where{Exprs: []clause.Expression{clause.Or(groups...)}})
+	}
+	return true
 }
 
 func appendRecordTags(tx *gorm.DB, item reflect.Value, add func(string)) {
