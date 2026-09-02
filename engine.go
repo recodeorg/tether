@@ -338,7 +338,15 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			return err
 		}
 		e.tracker.SetAuth(clientID, userID, expiresAt)
-		e.tracker.SendMessage(clientID, []byte(`{"type": "auth", "success": true, "data": {"user_id": "`+userID+`"}}`))
+		message := map[string]interface{}{"type": "auth", "success": true, "data": map[string]interface{}{"user_id": userID}}
+		messageJSON, err := json.Marshal(message)
+		if err != nil {
+			slog.Error("Failed to encode auth message", "error", err)
+			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to encode auth message"}`))
+			return err
+		}
+		e.tracker.SendMessage(clientID, messageJSON)
+		return nil
 	}
 	return nil
 }
