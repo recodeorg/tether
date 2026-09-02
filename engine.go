@@ -229,6 +229,9 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	if err != nil {
 		return nil, err
 	}
+	if _, exists := e.queries[query]; !exists {
+		return nil, fmt.Errorf("query not found")
+	}
 	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
 	if !ok {
 		return nil, fmt.Errorf("client not found")
@@ -309,9 +312,21 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 	slog.Debug("Received message", "from", clientID, "message", msg)
 	switch msg["type"] {
 	case "subscribe":
-		query := msg["location"].(string)
-		params := msg["params"].(map[string]interface{})
-		queryKey := msg["query_key"].(string)
+		query, ok := msg["location"].(string)
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		params, ok := msg["params"].(map[string]interface{})
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		queryKey, ok := msg["query_key"].(string)
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
 		subscription := e.tracker.SubscribeToQuery(clientID, query, queryKey, params)
 		if subscription == nil {
 			slog.Error("Failed to subscribe to query", "query", query, "params", params)
@@ -319,9 +334,29 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 		}
 		e.ExecuteQuery(query, params, subscription, true)
 	case "mutation":
-		e.ExecuteMutation(msg["location"].(string), msg["params"].(map[string]interface{}), clientID, msg["mutation_id"].(string))
+		mutation, ok := msg["location"].(string)
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		params, ok := msg["params"].(map[string]interface{})
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		mutationID, ok := msg["mutation_id"].(string)
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		e.ExecuteMutation(mutation, params, clientID, mutationID)
 	case "auth":
-		userID, expiresAt, err := e.auth.VerifyToken(e.db, msg["token"].(string))
+		token, ok := msg["token"].(string)
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		userID, expiresAt, err := e.auth.VerifyToken(e.db, token)
 		time.AfterFunc(time.Until(expiresAt), func() {
 			auth, ok := e.tracker.GetAuth(clientID)
 			if !ok {
