@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash"
+	"github.com/google/uuid"
 	"github.com/recodeorg/tether/reactivity"
 	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
@@ -49,6 +50,13 @@ type contextKey string
 
 const tetherCtxKey contextKey = "tether_query_ctx"
 
+type traceContextKey string
+
+const (
+	ContextKeyExecutionID traceContextKey = "exec_id"
+	ContextKeyActionName  traceContextKey = "action_name"
+)
+
 func (defaultAuth) VerifyToken(_ *gorm.DB, _ string) (string, time.Time, error) {
 	return "", time.Time{}, nil
 }
@@ -65,6 +73,16 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	tracker := reactivity.NewTracker()
 	if dbType != "sqlite" && dbType != "postgres" {
 		panic("Invalid database type")
+	}
+	if dbType == "sqlite" {
+		var mode string
+		db.Raw("PRAGMA journal_mode").Scan(&mode)
+
+		if mode != "wal" {
+			slog.Warn("Tether: SQLite is running in default journal mode without WAL. " +
+				"Concurrent writes may cause 'database is locked' panics. " +
+				"Consider enabling WAL or setting SetMaxOpenConns(1).")
+		}
 	}
 	e := &Engine{
 		db:              db,
@@ -83,11 +101,31 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 			slog.Error("Failed to execute mutation internally", "error", err)
 		}
 	})
+	beforeProfiler := func(db *gorm.DB) {
+		// Profile the start time of the database operation
+		db.InstanceSet("tether:profiler_start", time.Now())
+	}
 	invalidate := func(tx *gorm.DB) {
 		if dbType == "postgres" {
 			return
 		}
-		e.InvalidateTags(extractMutationTags(tx))
+		tags := extractMutationTags(tx)
+		execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
+		actionName, _ := tx.Statement.Context.Value(ContextKeyActionName).(string)
+		if e.Profiler.IsActive() {
+			if startTime, ok := tx.InstanceGet("tether:profiler_start"); ok {
+
+				e.Profiler.Add(utilities.Metric{
+					ID:       execID,
+					Name:     "gorm:" + tx.Statement.Name(),
+					Type:     utilities.MetricTypeDatabase,
+					Time:     startTime.(time.Time),
+					Duration: time.Since(startTime.(time.Time)),
+					Tags:     tags,
+				})
+			}
+		}
+		e.InvalidateTags(tags, execID, actionName)
 	}
 	// GORM callbacks only see the post-update Dest, so a Save that moves a
 	// tracked collection field would miss the old collection. Snapshot the
@@ -98,10 +136,31 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		}
 		snapshotOldTrackedTags(tx)
 	}
+	db.Callback().Create().Before("gorm:create").Register("tether:before_create_profiler", beforeProfiler)
+	db.Callback().Update().Before("gorm:update").Register("tether:before_update_profiler", beforeProfiler)
+	db.Callback().Delete().Before("gorm:delete").Register("tether:before_delete_profiler", beforeProfiler)
+	db.Callback().Query().Before("gorm:query").Register("tether:before_query_profiler", beforeProfiler)
+
 	db.Callback().Create().After("gorm:create").Register("tether:after_create", invalidate)
 	db.Callback().Update().Before("gorm:update").Register("tether:before_update", snapshotOld)
 	db.Callback().Update().After("gorm:update").Register("tether:after_update", invalidate)
 	db.Callback().Delete().After("gorm:delete").Register("tether:after_delete", invalidate)
+
+	db.Callback().Query().After("gorm:query").Register("tether:after_query_profiler", func(tx *gorm.DB) {
+		if e.Profiler.IsActive() {
+			if startTime, ok := tx.InstanceGet("tether:profiler_start"); ok {
+				execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
+				e.Profiler.Add(utilities.Metric{
+					ID:       execID,
+					Name:     "gorm:query",
+					Type:     utilities.MetricTypeDatabase,
+					Time:     startTime.(time.Time),
+					Duration: time.Since(startTime.(time.Time)),
+					Tags:     []string{},
+				})
+			}
+		}
+	})
 
 	// Automatically track the dependencies for the query
 	db.Callback().Query().After("gorm:query").Register("tether:auto_track", func(tx *gorm.DB) {
@@ -639,14 +698,14 @@ func (e *Engine) GetDependentQueries(tableName string) []string {
 }
 
 func (e *Engine) InvalidateTag(tag string) {
-	e.InvalidateTags([]string{tag})
+	e.InvalidateTags([]string{tag}, "legacy", "legacy_invalidate_tag")
 }
 
 // InvalidateTags re-runs each distinct subscription that listens to any of the
 // given tags. Subscriptions are snapshotted before any query executes so a
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
 // cause the same mutation to fire the query a second time.
-func (e *Engine) InvalidateTags(tags []string) {
+func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
 	seen := make(map[string]struct{})
 	var unique []*reactivity.Subscription
 	for _, tag := range tags {
@@ -696,9 +755,12 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 			return getIdentity(queryCtx, authID)
 		},
 	}
+	execID := uuid.NewString()
 
 	// Create the GORM context
 	gormCtx := context.WithValue(context.Background(), tetherCtxKey, queryCtx)
+	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
+	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, query)
 	queryCtx.DB = e.db.WithContext(gormCtx)
 
 	// Execute the query
@@ -752,11 +814,16 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	}
 	authID := auth.UserID
 
+	execID := uuid.NewString()
+	traceCtx := context.WithValue(context.Background(), ContextKeyExecutionID, execID)
+	traceCtx = context.WithValue(traceCtx, ContextKeyActionName, mutation)
+	scopedDB := e.db.WithContext(traceCtx)
+
 	authCtx := &AuthCtx{
 		GetIdentity: func() (string, error) { return authID, nil },
 	}
 
-	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params}
+	mutationCtx := &MutationCtx{DB: scopedDB, AuthCtx: authCtx, Params: params}
 
 	result := e.mutations[mutation].Func(mutationCtx)
 	slog.Debug("Executing mutation", "mutation", mutation, "params", params, "result", result)

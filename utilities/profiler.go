@@ -46,6 +46,10 @@ func NewProfiler(onFlush func(mutationName string)) *Profiler {
 	}
 }
 
+func (p *Profiler) IsActive() bool {
+	return p.active.Load()
+}
+
 func (p *Profiler) Start() error {
 	if !p.active.CompareAndSwap(false, true) {
 		return ErrProfilerRunning
