@@ -706,6 +706,7 @@ func (e *Engine) InvalidateTag(tag string) {
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
 // cause the same mutation to fire the query a second time.
 func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
+	start := time.Now()
 	seen := make(map[string]struct{})
 	var unique []*reactivity.Subscription
 	for _, tag := range tags {
@@ -720,6 +721,14 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 	for _, subscription := range unique {
 		e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true)
 	}
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "invalidate_tags:" + actionName,
+		Type:     utilities.MetricTypeRouting,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     tags,
+	})
 }
 
 func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) (interface{}, error) {
@@ -764,7 +773,16 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	queryCtx.DB = e.db.WithContext(gormCtx)
 
 	// Execute the query
+	start := time.Now()
 	result := e.queries[query].Func(queryCtx)
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "query:" + query,
+		Type:     utilities.MetricTypeQuery,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
 
 	// Update the dependencies
 	e.tracker.UpdateTags(subscription.SubID, queryCtx.Dependencies)
@@ -796,7 +814,17 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 		GetIdentity: func() (string, error) { panic("tether: mutations with auth cannot be executed internally") },
 	}
 	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params, Profiler: e.Profiler}
+	execID := uuid.NewString()
+	start := time.Now()
 	result := e.mutations[mutation].Func(mutationCtx)
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "mutation:" + mutation,
+		Type:     utilities.MetricTypeMutation,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
 	slog.Debug("Executing mutation internally", "mutation", mutation, "params", params, "result", result)
 	return result, nil
 }
@@ -824,8 +852,16 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	}
 
 	mutationCtx := &MutationCtx{DB: scopedDB, AuthCtx: authCtx, Params: params}
-
+	start := time.Now()
 	result := e.mutations[mutation].Func(mutationCtx)
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "mutation:" + mutation,
+		Type:     utilities.MetricTypeMutation,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
 	slog.Debug("Executing mutation", "mutation", mutation, "params", params, "result", result)
 	responseJSON, err := json.Marshal(map[string]interface{}{"type": "mutation", "location": mutation, "data": result, "mutation_id": mutationID})
 	if err != nil {
@@ -884,7 +920,17 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			slog.Error("Invalid message", "message", msg)
 			return nil
 		}
+		start := time.Now()
+		execID := uuid.NewString()
 		userID, expiresAt, err := e.auth.VerifyToken(e.db, token)
+		e.Profiler.Add(utilities.Metric{
+			ID:       execID,
+			Name:     "authentication:" + token,
+			Type:     utilities.MetricTypeAuthentication,
+			Time:     start,
+			Duration: time.Since(start),
+			Tags:     []string{},
+		})
 		time.AfterFunc(time.Until(expiresAt), func() {
 			auth, ok := e.tracker.GetAuth(clientID)
 			if !ok {
