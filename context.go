@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 )
 
@@ -29,9 +30,10 @@ func (c *QueryCtx) TrackTable(tableName string) {
 }
 
 type MutationCtx struct {
-	DB      *gorm.DB
-	AuthCtx *AuthCtx
-	Params  map[string]interface{}
+	DB       *gorm.DB
+	AuthCtx  *AuthCtx
+	Params   map[string]interface{}
+	Profiler *utilities.Profiler
 }
 
 type Auth interface {

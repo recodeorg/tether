@@ -14,6 +14,7 @@ import (
 
 	"github.com/cespare/xxhash"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -29,6 +30,7 @@ type Engine struct {
 	tracker         *reactivity.Tracker
 	auth            Auth
 	websocketHelper *reactivity.WebsocketHelper
+	Profiler        *utilities.Profiler
 }
 
 type Mutation struct {
@@ -75,6 +77,12 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		auth:            defaultAuth{},
 		websocketHelper: &reactivity.WebsocketHelper{},
 	}
+	e.Profiler = utilities.NewProfiler(func(mutationName string) {
+		_, err := e.ExecuteMutationInternal(mutationName, map[string]interface{}{})
+		if err != nil {
+			slog.Error("Failed to execute mutation internally", "error", err)
+		}
+	})
 	invalidate := func(tx *gorm.DB) {
 		if dbType == "postgres" {
 			return
@@ -725,7 +733,7 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 	authCtx := &AuthCtx{
 		GetIdentity: func() (string, error) { panic("tether: mutations with auth cannot be executed internally") },
 	}
-	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params}
+	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params, Profiler: e.Profiler}
 	result := e.mutations[mutation].Func(mutationCtx)
 	slog.Debug("Executing mutation internally", "mutation", mutation, "params", params, "result", result)
 	return result, nil
