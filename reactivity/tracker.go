@@ -24,11 +24,12 @@ type Tracker struct {
 }
 
 type Subscription struct {
-	SubID    string
-	Client   *Client
-	Query    string
-	QueryKey string // provided by the client to help with caching
-	Params   map[string]interface{}
+	SubID      string
+	Client     *Client
+	Query      string
+	QueryKey   string // provided by the client to help with caching
+	ParamsHash string // used for batching/deduplication on tag invalidation
+	Params     map[string]interface{}
 }
 
 func NewTracker() *Tracker {
@@ -133,11 +134,12 @@ func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey strin
 	}
 
 	sub := &Subscription{
-		SubID:    subID,
-		Client:   t.clients[clientID],
-		Query:    query,
-		QueryKey: queryKey,
-		Params:   params,
+		SubID:      subID,
+		Client:     t.clients[clientID],
+		Query:      query,
+		QueryKey:   queryKey,
+		ParamsHash: strconv.FormatUint(xxhash.Sum64(paramsJSON), 10),
+		Params:     params,
 	}
 	t.subscriptions[subID] = sub
 	t.clientToSubs[clientID][subID] = struct{}{}
