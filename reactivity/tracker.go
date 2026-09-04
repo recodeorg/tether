@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"sort"
+	"strings"
+
 	"github.com/cespare/xxhash"
 )
 
@@ -205,6 +208,19 @@ func (t *Tracker) UpdateTags(subID string, newTags []string) {
 		t.tagsToSubs[newTag][subID] = struct{}{}
 		t.subToTags[subID][newTag] = struct{}{}
 	}
+}
+
+func (t *Tracker) GetAuthFingerprint(sub *Subscription) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var authTags []string
+	for tag := range t.subToTags[sub.SubID] {
+		if strings.HasPrefix(tag, "*") {
+			authTags = append(authTags, tag)
+		}
+	}
+	sort.Strings(authTags)
+	return strings.Join(authTags, "|")
 }
 
 func (t *Tracker) GetSubscriptionsToTag(tag string) []*Subscription {
