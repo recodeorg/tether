@@ -704,7 +704,9 @@ func (e *Engine) InvalidateTag(tag string) {
 // InvalidateTags re-runs each distinct subscription that listens to any of the
 // given tags. Subscriptions are snapshotted before any query executes so a
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
-// cause the same mutation to fire the query a second time.
+// cause the same mutation to fire the query a second time. Matching
+// subscriptions (same query, params, and auth fingerprint) share one execution
+// and are fanned out with each client's own query_key.
 func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
 	start := time.Now()
 	seen := make(map[string]struct{})
@@ -718,8 +720,37 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 			unique = append(unique, subscription)
 		}
 	}
+	batchedExecutions := make(map[string][]*reactivity.Subscription)
 	for _, subscription := range unique {
-		e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true)
+		authFingerprint := e.tracker.GetAuthFingerprint(subscription)
+		dedupKey := fmt.Sprintf("%s|%s|%s", subscription.Query, subscription.ParamsHash, authFingerprint)
+		batchedExecutions[dedupKey] = append(batchedExecutions[dedupKey], subscription)
+	}
+
+	for _, subscriptions := range batchedExecutions {
+		representative := subscriptions[0]
+		result, deps, cacheKey, err := e.runQuery(representative.Query, representative.Params, representative)
+		if err != nil {
+			slog.Error("Failed to execute query", "error", err)
+			continue
+		}
+		// Apply the same dependency set to every subscription in the batch so
+		// auto-tracked tags (e.g. new primary keys) stay in sync even though
+		// the query function ran only once.
+		for _, subscription := range subscriptions {
+			e.tracker.UpdateTags(subscription.SubID, deps)
+			responseJSON, err := marshalQueryMessage(representative.Query, result, subscription.QueryKey)
+			if err != nil {
+				slog.Error("Failed to encode query result", "error", err)
+				continue
+			}
+			e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+		}
+		if responseJSON, err := marshalQueryMessage(representative.Query, result, representative.QueryKey); err == nil {
+			e.hashMu.Lock()
+			e.queryHashes[cacheKey] = xxhash.Sum64(responseJSON)
+			e.hashMu.Unlock()
+		}
 	}
 	e.Profiler.Add(utilities.Metric{
 		ID:       execID,
@@ -731,26 +762,30 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 	})
 }
 
-func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) (interface{}, error) {
+func marshalQueryMessage(query string, result interface{}, queryKey string) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{"type": "query", "location": query, "data": result, "query_key": queryKey})
+}
+
+// runQuery executes the query function and returns the result plus the
+// dependency tags it collected. It does not push to clients or update
+// subscription tags; callers decide how to fan those out.
+func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) (interface{}, []string, string, error) {
 	if _, exists := e.queries[query]; !exists {
-		return nil, fmt.Errorf("query not found")
+		return nil, nil, "", fmt.Errorf("query not found")
 	}
 	if e.queries[query].Internal {
-		return nil, fmt.Errorf("query not found") // return non-descriptive error to prevent enumeration
+		return nil, nil, "", fmt.Errorf("query not found") // return non-descriptive error to prevent enumeration
 	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
-		return nil, err
+		return nil, nil, "", err
 	}
 	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
 	if !ok {
-		return nil, fmt.Errorf("client not found")
+		return nil, nil, "", fmt.Errorf("client not found")
 	}
 	authID := auth.UserID
 	cacheKey := query + "?" + string(paramsJSON) + "?" + authID
-	e.hashMu.Lock()
-	lastHash := e.queryHashes[cacheKey]
-	e.hashMu.Unlock()
 	slog.Debug("Executing query", "query", query, "params", params)
 
 	// Create the query context first so GetIdentity can append dependency tags.
@@ -772,7 +807,6 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, query)
 	queryCtx.DB = e.db.WithContext(gormCtx)
 
-	// Execute the query
 	start := time.Now()
 	result := e.queries[query].Func(queryCtx)
 	e.Profiler.Add(utilities.Metric{
@@ -783,19 +817,29 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 		Duration: time.Since(start),
 		Tags:     []string{},
 	})
+	return result, queryCtx.Dependencies, cacheKey, nil
+}
 
-	// Update the dependencies
-	e.tracker.UpdateTags(subscription.SubID, queryCtx.Dependencies)
-	slog.Debug("Updated dependencies on subscription", "subID", subscription.SubID, "dependencies", queryCtx.Dependencies)
+func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) ([]byte, error) {
+	result, deps, cacheKey, err := e.runQuery(query, params, subscription)
+	if err != nil {
+		return nil, err
+	}
 
-	// Serialize the result
-	responseJSON, err := json.Marshal(map[string]interface{}{"type": "query", "location": query, "data": result, "query_key": subscription.QueryKey})
+	e.tracker.UpdateTags(subscription.SubID, deps)
+	slog.Debug("Updated dependencies on subscription", "subID", subscription.SubID, "dependencies", deps)
+
+	e.hashMu.Lock()
+	lastHash := e.queryHashes[cacheKey]
+	e.hashMu.Unlock()
+
+	responseJSON, err := marshalQueryMessage(query, result, subscription.QueryKey)
 	if err != nil {
 		return nil, err
 	}
 	queryHash := xxhash.Sum64(responseJSON)
 	if lastHash == queryHash && !forceSend { // we want to force send on first subscription, regardless of if the query hasn't changed
-		return result, nil
+		return responseJSON, nil
 	}
 
 	e.hashMu.Lock()
@@ -803,7 +847,7 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	e.hashMu.Unlock()
 
 	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
-	return result, nil
+	return responseJSON, nil
 }
 
 func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
