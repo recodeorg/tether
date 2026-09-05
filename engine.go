@@ -13,7 +13,9 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash"
+	"github.com/google/uuid"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -21,14 +23,25 @@ import (
 type Engine struct {
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
-	mutations       map[string]func(ctx *MutationCtx) interface{}
-	queries         map[string]func(ctx *QueryCtx) interface{}
+	mutations       map[string]Mutation
+	queries         map[string]Query
 	dependencies    map[string][]string
 	hashMu          sync.RWMutex
 	queryHashes     map[string]uint64
 	tracker         *reactivity.Tracker
 	auth            Auth
 	websocketHelper *reactivity.WebsocketHelper
+	Profiler        *utilities.Profiler
+}
+
+type Mutation struct {
+	Func     func(ctx *MutationCtx) interface{}
+	Internal bool
+}
+
+type Query struct {
+	Func     func(ctx *QueryCtx) interface{}
+	Internal bool
 }
 
 type defaultAuth struct{}
@@ -36,6 +49,13 @@ type defaultAuth struct{}
 type contextKey string
 
 const tetherCtxKey contextKey = "tether_query_ctx"
+
+type traceContextKey string
+
+const (
+	ContextKeyExecutionID traceContextKey = "exec_id"
+	ContextKeyActionName  traceContextKey = "action_name"
+)
 
 func (defaultAuth) VerifyToken(_ *gorm.DB, _ string) (string, time.Time, error) {
 	return "", time.Time{}, nil
@@ -54,22 +74,58 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	if dbType != "sqlite" && dbType != "postgres" {
 		panic("Invalid database type")
 	}
+	if dbType == "sqlite" {
+		var mode string
+		db.Raw("PRAGMA journal_mode").Scan(&mode)
+
+		if mode != "wal" {
+			slog.Warn("Tether: SQLite is running in default journal mode without WAL. " +
+				"Concurrent writes may cause 'database is locked' panics. " +
+				"Consider enabling WAL or setting SetMaxOpenConns(1).")
+		}
+	}
 	e := &Engine{
 		db:              db,
 		dbType:          dbType,
-		mutations:       make(map[string]func(ctx *MutationCtx) interface{}),
-		queries:         make(map[string]func(ctx *QueryCtx) interface{}),
+		mutations:       make(map[string]Mutation),
+		queries:         make(map[string]Query),
 		dependencies:    make(map[string][]string),
 		queryHashes:     make(map[string]uint64),
 		tracker:         tracker,
 		auth:            defaultAuth{},
 		websocketHelper: &reactivity.WebsocketHelper{},
 	}
+	e.Profiler = utilities.NewProfiler(func(mutationName string) {
+		_, err := e.ExecuteMutationInternal(mutationName, map[string]interface{}{})
+		if err != nil {
+			slog.Error("Failed to execute mutation internally", "error", err)
+		}
+	})
+	beforeProfiler := func(db *gorm.DB) {
+		// Profile the start time of the database operation
+		db.InstanceSet("tether:profiler_start", time.Now())
+	}
 	invalidate := func(tx *gorm.DB) {
 		if dbType == "postgres" {
 			return
 		}
-		e.InvalidateTags(extractMutationTags(tx))
+		tags := extractMutationTags(tx)
+		execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
+		actionName, _ := tx.Statement.Context.Value(ContextKeyActionName).(string)
+		if e.Profiler.IsActive() {
+			if startTime, ok := tx.InstanceGet("tether:profiler_start"); ok {
+
+				e.Profiler.Add(utilities.Metric{
+					ID:       execID,
+					Name:     "gorm:" + tx.Statement.Name(),
+					Type:     utilities.MetricTypeDatabase,
+					Time:     startTime.(time.Time),
+					Duration: time.Since(startTime.(time.Time)),
+					Tags:     tags,
+				})
+			}
+		}
+		e.InvalidateTags(tags, execID, actionName)
 	}
 	// GORM callbacks only see the post-update Dest, so a Save that moves a
 	// tracked collection field would miss the old collection. Snapshot the
@@ -80,10 +136,31 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		}
 		snapshotOldTrackedTags(tx)
 	}
+	db.Callback().Create().Before("gorm:create").Register("tether:before_create_profiler", beforeProfiler)
+	db.Callback().Update().Before("gorm:update").Register("tether:before_update_profiler", beforeProfiler)
+	db.Callback().Delete().Before("gorm:delete").Register("tether:before_delete_profiler", beforeProfiler)
+	db.Callback().Query().Before("gorm:query").Register("tether:before_query_profiler", beforeProfiler)
+
 	db.Callback().Create().After("gorm:create").Register("tether:after_create", invalidate)
 	db.Callback().Update().Before("gorm:update").Register("tether:before_update", snapshotOld)
 	db.Callback().Update().After("gorm:update").Register("tether:after_update", invalidate)
 	db.Callback().Delete().After("gorm:delete").Register("tether:after_delete", invalidate)
+
+	db.Callback().Query().After("gorm:query").Register("tether:after_query_profiler", func(tx *gorm.DB) {
+		if e.Profiler.IsActive() {
+			if startTime, ok := tx.InstanceGet("tether:profiler_start"); ok {
+				execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
+				e.Profiler.Add(utilities.Metric{
+					ID:       execID,
+					Name:     "gorm:query",
+					Type:     utilities.MetricTypeDatabase,
+					Time:     startTime.(time.Time),
+					Duration: time.Since(startTime.(time.Time)),
+					Tags:     []string{},
+				})
+			}
+		}
+	})
 
 	// Automatically track the dependencies for the query
 	db.Callback().Query().After("gorm:query").Register("tether:auto_track", func(tx *gorm.DB) {
@@ -559,13 +636,25 @@ func (e *Engine) SetAuth(auth Auth) {
 	e.auth = auth
 }
 
-func (e *Engine) RegisterMutation(name string, mutation func(ctx *MutationCtx) interface{}) {
-	e.mutations[name] = mutation // stores the mutation in the list of valid mutations
+func (e *Engine) RegisterMutation(name string, mutation func(ctx *MutationCtx) interface{}, opts ...MutationOptions) {
+	options := MutationOptions{
+		Internal: false,
+	}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	e.mutations[name] = Mutation{Func: mutation, Internal: options.Internal} // stores the mutation in the list of valid mutations
 	slog.Debug("Registered mutation", "name", name)
 }
 
-func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, dependencies []string) {
-	e.queries[name] = query // stores the query in the list of valid queries
+func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, dependencies []string, opts ...QueryOptions) {
+	options := QueryOptions{
+		Internal: false,
+	}
+	if len(opts) > 0 {
+		options = opts[0]
+	}
+	e.queries[name] = Query{Func: query, Internal: options.Internal} // stores the query in the list of valid queries
 	for _, dependency := range dependencies {
 		e.dependencies[dependency] = append(e.dependencies[dependency], name)
 	}
@@ -609,14 +698,17 @@ func (e *Engine) GetDependentQueries(tableName string) []string {
 }
 
 func (e *Engine) InvalidateTag(tag string) {
-	e.InvalidateTags([]string{tag})
+	e.InvalidateTags([]string{tag}, "legacy", "legacy_invalidate_tag")
 }
 
 // InvalidateTags re-runs each distinct subscription that listens to any of the
 // given tags. Subscriptions are snapshotted before any query executes so a
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
-// cause the same mutation to fire the query a second time.
-func (e *Engine) InvalidateTags(tags []string) {
+// cause the same mutation to fire the query a second time. Matching
+// subscriptions (same query, params, and auth fingerprint) share one execution
+// and are fanned out with each client's own query_key.
+func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
+	start := time.Now()
 	seen := make(map[string]struct{})
 	var unique []*reactivity.Subscription
 	for _, tag := range tags {
@@ -628,28 +720,72 @@ func (e *Engine) InvalidateTags(tags []string) {
 			unique = append(unique, subscription)
 		}
 	}
+	batchedExecutions := make(map[string][]*reactivity.Subscription)
 	for _, subscription := range unique {
-		e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true)
+		authFingerprint := e.tracker.GetAuthFingerprint(subscription)
+		dedupKey := fmt.Sprintf("%s|%s|%s", subscription.Query, subscription.ParamsHash, authFingerprint)
+		batchedExecutions[dedupKey] = append(batchedExecutions[dedupKey], subscription)
 	}
+
+	for _, subscriptions := range batchedExecutions {
+		representative := subscriptions[0]
+		result, deps, cacheKey, err := e.runQuery(representative.Query, representative.Params, representative)
+		if err != nil {
+			slog.Error("Failed to execute query", "error", err)
+			continue
+		}
+		// Apply the same dependency set to every subscription in the batch so
+		// auto-tracked tags (e.g. new primary keys) stay in sync even though
+		// the query function ran only once.
+		for _, subscription := range subscriptions {
+			e.tracker.UpdateTags(subscription.SubID, deps)
+			responseJSON, err := marshalQueryMessage(representative.Query, result, subscription.QueryKey)
+			if err != nil {
+				slog.Error("Failed to encode query result", "error", err)
+				continue
+			}
+			e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+		}
+		if responseJSON, err := marshalQueryMessage(representative.Query, result, representative.QueryKey); err == nil {
+			e.hashMu.Lock()
+			e.queryHashes[cacheKey] = xxhash.Sum64(responseJSON)
+			e.hashMu.Unlock()
+		}
+	}
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "invalidate_tags:" + actionName,
+		Type:     utilities.MetricTypeRouting,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     tags,
+	})
 }
 
-func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) (interface{}, error) {
+func marshalQueryMessage(query string, result interface{}, queryKey string) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{"type": "query", "location": query, "data": result, "query_key": queryKey})
+}
+
+// runQuery executes the query function and returns the result plus the
+// dependency tags it collected. It does not push to clients or update
+// subscription tags; callers decide how to fan those out.
+func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) (interface{}, []string, string, error) {
+	if _, exists := e.queries[query]; !exists {
+		return nil, nil, "", fmt.Errorf("query not found")
+	}
+	if e.queries[query].Internal {
+		return nil, nil, "", fmt.Errorf("query not found") // return non-descriptive error to prevent enumeration
+	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
-		return nil, err
-	}
-	if _, exists := e.queries[query]; !exists {
-		return nil, fmt.Errorf("query not found")
+		return nil, nil, "", err
 	}
 	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
 	if !ok {
-		return nil, fmt.Errorf("client not found")
+		return nil, nil, "", fmt.Errorf("client not found")
 	}
 	authID := auth.UserID
 	cacheKey := query + "?" + string(paramsJSON) + "?" + authID
-	e.hashMu.Lock()
-	lastHash := e.queryHashes[cacheKey]
-	e.hashMu.Unlock()
 	slog.Debug("Executing query", "query", query, "params", params)
 
 	// Create the query context first so GetIdentity can append dependency tags.
@@ -663,26 +799,47 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 			return getIdentity(queryCtx, authID)
 		},
 	}
+	execID := uuid.NewString()
 
 	// Create the GORM context
 	gormCtx := context.WithValue(context.Background(), tetherCtxKey, queryCtx)
+	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
+	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, query)
 	queryCtx.DB = e.db.WithContext(gormCtx)
 
-	// Execute the query
-	result := e.queries[query](queryCtx)
+	start := time.Now()
+	result := e.queries[query].Func(queryCtx)
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "query:" + query,
+		Type:     utilities.MetricTypeQuery,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
+	return result, queryCtx.Dependencies, cacheKey, nil
+}
 
-	// Update the dependencies
-	e.tracker.UpdateTags(subscription.SubID, queryCtx.Dependencies)
-	slog.Debug("Updated dependencies on subscription", "subID", subscription.SubID, "dependencies", queryCtx.Dependencies)
+func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) ([]byte, error) {
+	result, deps, cacheKey, err := e.runQuery(query, params, subscription)
+	if err != nil {
+		return nil, err
+	}
 
-	// Serialize the result
-	responseJSON, err := json.Marshal(map[string]interface{}{"type": "query", "location": query, "data": result, "query_key": subscription.QueryKey})
+	e.tracker.UpdateTags(subscription.SubID, deps)
+	slog.Debug("Updated dependencies on subscription", "subID", subscription.SubID, "dependencies", deps)
+
+	e.hashMu.Lock()
+	lastHash := e.queryHashes[cacheKey]
+	e.hashMu.Unlock()
+
+	responseJSON, err := marshalQueryMessage(query, result, subscription.QueryKey)
 	if err != nil {
 		return nil, err
 	}
 	queryHash := xxhash.Sum64(responseJSON)
 	if lastHash == queryHash && !forceSend { // we want to force send on first subscription, regardless of if the query hasn't changed
-		return result, nil
+		return responseJSON, nil
 	}
 
 	e.hashMu.Lock()
@@ -690,26 +847,65 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	e.hashMu.Unlock()
 
 	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+	return responseJSON, nil
+}
+
+func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
+	if _, exists := e.mutations[mutation]; !exists {
+		return nil, fmt.Errorf("mutation not found")
+	}
+	authCtx := &AuthCtx{
+		GetIdentity: func() (string, error) { panic("tether: mutations with auth cannot be executed internally") },
+	}
+	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params, Profiler: e.Profiler}
+	execID := uuid.NewString()
+	start := time.Now()
+	result := e.mutations[mutation].Func(mutationCtx)
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "mutation:" + mutation,
+		Type:     utilities.MetricTypeMutation,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
+	slog.Debug("Executing mutation internally", "mutation", mutation, "params", params, "result", result)
 	return result, nil
 }
 
 func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{}, clientID string, mutationID string) (interface{}, error) {
+	if _, exists := e.mutations[mutation]; !exists {
+		return nil, fmt.Errorf("mutation not found")
+	}
+	if e.mutations[mutation].Internal {
+		return nil, fmt.Errorf("mutation not found") // return non-descriptive error to prevent enumeration
+	}
 	auth, ok := e.tracker.GetAuth(clientID)
 	if !ok {
 		return nil, fmt.Errorf("client not found")
 	}
-	if _, exists := e.mutations[mutation]; !exists {
-		return nil, fmt.Errorf("mutation not found")
-	}
 	authID := auth.UserID
+
+	execID := uuid.NewString()
+	traceCtx := context.WithValue(context.Background(), ContextKeyExecutionID, execID)
+	traceCtx = context.WithValue(traceCtx, ContextKeyActionName, mutation)
+	scopedDB := e.db.WithContext(traceCtx)
 
 	authCtx := &AuthCtx{
 		GetIdentity: func() (string, error) { return authID, nil },
 	}
 
-	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params}
-
-	result := e.mutations[mutation](mutationCtx)
+	mutationCtx := &MutationCtx{DB: scopedDB, AuthCtx: authCtx, Params: params}
+	start := time.Now()
+	result := e.mutations[mutation].Func(mutationCtx)
+	e.Profiler.Add(utilities.Metric{
+		ID:       execID,
+		Name:     "mutation:" + mutation,
+		Type:     utilities.MetricTypeMutation,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
 	slog.Debug("Executing mutation", "mutation", mutation, "params", params, "result", result)
 	responseJSON, err := json.Marshal(map[string]interface{}{"type": "mutation", "location": mutation, "data": result, "mutation_id": mutationID})
 	if err != nil {
@@ -768,7 +964,17 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			slog.Error("Invalid message", "message", msg)
 			return nil
 		}
+		start := time.Now()
+		execID := uuid.NewString()
 		userID, expiresAt, err := e.auth.VerifyToken(e.db, token)
+		e.Profiler.Add(utilities.Metric{
+			ID:       execID,
+			Name:     "authentication:" + token,
+			Type:     utilities.MetricTypeAuthentication,
+			Time:     start,
+			Duration: time.Since(start),
+			Tags:     []string{},
+		})
 		time.AfterFunc(time.Until(expiresAt), func() {
 			auth, ok := e.tracker.GetAuth(clientID)
 			if !ok {

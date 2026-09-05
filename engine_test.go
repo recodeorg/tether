@@ -1139,7 +1139,7 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 	}
 
 	// Permanent tags should survive a later query that does not call GetIdentity.
-	e.queries["me"] = func(ctx *QueryCtx) interface{} { return "no-auth-call" }
+	e.queries["me"] = Query{Func: func(ctx *QueryCtx) interface{} { return "no-auth-call" }, Internal: false}
 	if _, err := e.ExecuteQuery("me", map[string]interface{}{}, sub, true); err != nil {
 		t.Fatalf("ExecuteQuery: %v", err)
 	}
