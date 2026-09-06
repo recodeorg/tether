@@ -746,9 +746,9 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 			}
 			e.tracker.SendMessage(subscription.Client.ID, responseJSON)
 		}
-		if responseJSON, err := marshalQueryMessage(representative.Query, result, representative.QueryKey); err == nil {
+		if dataJSON, err := json.Marshal(result); err == nil {
 			e.hashMu.Lock()
-			e.queryHashes[cacheKey] = xxhash.Sum64(responseJSON)
+			e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
 			e.hashMu.Unlock()
 		}
 	}
@@ -837,7 +837,11 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	if err != nil {
 		return nil, err
 	}
-	queryHash := xxhash.Sum64(responseJSON)
+	dataJSON, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+	queryHash := xxhash.Sum64(dataJSON)
 	if lastHash == queryHash && !forceSend { // we want to force send on first subscription, regardless of if the query hasn't changed
 		return responseJSON, nil
 	}
