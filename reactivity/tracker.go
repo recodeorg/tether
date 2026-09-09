@@ -7,6 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"sort"
+	"strings"
+
 	"github.com/cespare/xxhash"
 )
 
@@ -24,11 +27,12 @@ type Tracker struct {
 }
 
 type Subscription struct {
-	SubID    string
-	Client   *Client
-	Query    string
-	QueryKey string // provided by the client to help with caching
-	Params   map[string]interface{}
+	SubID      string
+	Client     *Client
+	Query      string
+	QueryKey   string // provided by the client to help with caching
+	ParamsHash string // used for batching/deduplication on tag invalidation
+	Params     map[string]interface{}
 }
 
 func NewTracker() *Tracker {
@@ -133,11 +137,12 @@ func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey strin
 	}
 
 	sub := &Subscription{
-		SubID:    subID,
-		Client:   t.clients[clientID],
-		Query:    query,
-		QueryKey: queryKey,
-		Params:   params,
+		SubID:      subID,
+		Client:     t.clients[clientID],
+		Query:      query,
+		QueryKey:   queryKey,
+		ParamsHash: strconv.FormatUint(xxhash.Sum64(paramsJSON), 10),
+		Params:     params,
 	}
 	t.subscriptions[subID] = sub
 	t.clientToSubs[clientID][subID] = struct{}{}
@@ -203,6 +208,19 @@ func (t *Tracker) UpdateTags(subID string, newTags []string) {
 		t.tagsToSubs[newTag][subID] = struct{}{}
 		t.subToTags[subID][newTag] = struct{}{}
 	}
+}
+
+func (t *Tracker) GetAuthFingerprint(sub *Subscription) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var authTags []string
+	for tag := range t.subToTags[sub.SubID] {
+		if strings.HasPrefix(tag, "*") {
+			authTags = append(authTags, tag)
+		}
+	}
+	sort.Strings(authTags)
+	return strings.Join(authTags, "|")
 }
 
 func (t *Tracker) GetSubscriptionsToTag(tag string) []*Subscription {

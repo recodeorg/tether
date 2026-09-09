@@ -22,6 +22,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -1139,7 +1140,7 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 	}
 
 	// Permanent tags should survive a later query that does not call GetIdentity.
-	e.queries["me"] = func(ctx *QueryCtx) interface{} { return "no-auth-call" }
+	e.queries["me"] = Query{Func: func(ctx *QueryCtx) interface{} { return "no-auth-call" }, Internal: false}
 	if _, err := e.ExecuteQuery("me", map[string]interface{}{}, sub, true); err != nil {
 		t.Fatalf("ExecuteQuery: %v", err)
 	}
@@ -1467,8 +1468,8 @@ func newConcurrentTestEngine(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatalf("sql db: %v", err)
 	}
-	sqlDB.SetMaxOpenConns(32)
-	sqlDB.SetMaxIdleConns(32)
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	e := NewEngine(db, "sqlite")
@@ -1748,6 +1749,11 @@ func TestConcurrentWebsocketClientsEndToEnd(t *testing.T) {
 	nClients := nMutators + nWatchers + nDroppers
 
 	e := newConcurrentTestEngine(t)
+	e.Profiler.Start()
+	defer func() {
+		metrics := e.Profiler.DumpMetricsAndFlush()
+		t.Log(utilities.SanitizeMetrics(metrics))
+	}()
 	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
