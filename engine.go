@@ -734,6 +734,14 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 			slog.Error("Failed to execute query", "error", err)
 			continue
 		}
+		e.Profiler.Add(utilities.Metric{
+			ID:       execID,
+			Name:     "batch_execution:" + representative.Query,
+			Type:     utilities.MetricTypeRouting,
+			Time:     start,
+			Duration: time.Since(start),
+			Value:    len(subscriptions),
+		})
 		// Apply the same dependency set to every subscription in the batch so
 		// auto-tracked tags (e.g. new primary keys) stay in sync even though
 		// the query function ran only once.

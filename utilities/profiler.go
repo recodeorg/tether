@@ -24,6 +24,7 @@ type Metric struct {
 	Type     MetricType    // The type of the metric
 	Time     time.Time     // The time the metric was recorded
 	Duration time.Duration // The duration of the metric
+	Value    int           // The value of the metric
 	Tags     []string      // The tracking tags of the metric
 }
 
