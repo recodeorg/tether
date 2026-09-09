@@ -74,16 +74,6 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	if dbType != "sqlite" && dbType != "postgres" {
 		panic("Invalid database type")
 	}
-	if dbType == "sqlite" {
-		var mode string
-		db.Raw("PRAGMA journal_mode").Scan(&mode)
-
-		if mode != "wal" {
-			slog.Warn("Tether: SQLite is running in default journal mode without WAL. " +
-				"Concurrent writes may cause 'database is locked' panics. " +
-				"Consider enabling WAL or setting SetMaxOpenConns(1).")
-		}
-	}
 	e := &Engine{
 		db:              db,
 		dbType:          dbType,
@@ -727,39 +717,49 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 		batchedExecutions[dedupKey] = append(batchedExecutions[dedupKey], subscription)
 	}
 
+	sem := make(chan struct{}, 20)
+	var wg sync.WaitGroup
+
 	for _, subscriptions := range batchedExecutions {
-		representative := subscriptions[0]
-		result, deps, cacheKey, err := e.runQuery(representative.Query, representative.Params, representative)
-		if err != nil {
-			slog.Error("Failed to execute query", "error", err)
-			continue
-		}
-		e.Profiler.Add(utilities.Metric{
-			ID:       execID,
-			Name:     "batch_execution:" + representative.Query,
-			Type:     utilities.MetricTypeRouting,
-			Time:     start,
-			Duration: time.Since(start),
-			Value:    len(subscriptions),
-		})
-		// Apply the same dependency set to every subscription in the batch so
-		// auto-tracked tags (e.g. new primary keys) stay in sync even though
-		// the query function ran only once.
-		for _, subscription := range subscriptions {
-			e.tracker.UpdateTags(subscription.SubID, deps)
-			responseJSON, err := marshalQueryMessage(representative.Query, result, subscription.QueryKey)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(subscriptions []*reactivity.Subscription) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			representative := subscriptions[0]
+			result, deps, cacheKey, err := e.runQuery(representative.Query, representative.Params, representative)
 			if err != nil {
-				slog.Error("Failed to encode query result", "error", err)
-				continue
+				slog.Error("Failed to execute query", "error", err)
+				return
 			}
-			e.tracker.SendMessage(subscription.Client.ID, responseJSON)
-		}
-		if dataJSON, err := json.Marshal(result); err == nil {
-			e.hashMu.Lock()
-			e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
-			e.hashMu.Unlock()
-		}
+			e.Profiler.Add(utilities.Metric{
+				ID:       execID,
+				Name:     "batch_execution:" + representative.Query,
+				Type:     utilities.MetricTypeRouting,
+				Time:     start,
+				Duration: time.Since(start),
+				Value:    len(subscriptions),
+			})
+			// Apply the same dependency set to every subscription in the batch so
+			// auto-tracked tags (e.g. new primary keys) stay in sync even though
+			// the query function ran only once.
+			for _, subscription := range subscriptions {
+				e.tracker.UpdateTags(subscription.SubID, deps)
+				responseJSON, err := marshalQueryMessage(representative.Query, result, subscription.QueryKey)
+				if err != nil {
+					slog.Error("Failed to encode query result", "error", err)
+					continue
+				}
+				e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+			}
+			if dataJSON, err := json.Marshal(result); err == nil {
+				e.hashMu.Lock()
+				e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
+				e.hashMu.Unlock()
+			}
+		}(subscriptions)
 	}
+	wg.Wait()
 	e.Profiler.Add(utilities.Metric{
 		ID:       execID,
 		Name:     "invalidate_tags:" + actionName,

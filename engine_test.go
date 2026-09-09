@@ -1468,8 +1468,8 @@ func newConcurrentTestEngine(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatalf("sql db: %v", err)
 	}
-	sqlDB.SetMaxOpenConns(32)
-	sqlDB.SetMaxIdleConns(32)
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 
 	e := NewEngine(db, "sqlite")
