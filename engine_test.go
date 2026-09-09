@@ -22,6 +22,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -1748,6 +1749,11 @@ func TestConcurrentWebsocketClientsEndToEnd(t *testing.T) {
 	nClients := nMutators + nWatchers + nDroppers
 
 	e := newConcurrentTestEngine(t)
+	e.Profiler.Start()
+	defer func() {
+		metrics := e.Profiler.DumpMetricsAndFlush()
+		t.Log(utilities.SanitizeMetrics(metrics))
+	}()
 	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
