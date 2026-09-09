@@ -6,6 +6,13 @@
 - Performance profiler
 - Cron Jobs & Scheduling
 
+## [0.3.0] - 2026-09-09
+### Added
+- Native in-engine automatic performance profiling for all queries, mutations, authentication, etc.
+- Automatic batching of like-queries into a single query execution
+### Changed
+- Queries now execute concurrently within goroutines
+
 ## [0.2.0] - 2026-09-02
 ### Added
 - Unit tests for all applicable functionality
