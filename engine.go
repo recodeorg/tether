@@ -30,6 +30,7 @@ type Engine struct {
 	queryHashes     map[string]uint64
 	tracker         *reactivity.Tracker
 	auth            Auth
+	guards          map[string]Guard
 	websocketHelper *reactivity.WebsocketHelper
 	Profiler        *utilities.Profiler
 }
@@ -42,6 +43,10 @@ type Mutation struct {
 type Query struct {
 	Func     func(ctx *QueryCtx) interface{}
 	Internal bool
+}
+
+type Guard struct {
+	Func func(ctx *GuardCtx) interface{}
 }
 
 type defaultAuth struct{}
@@ -83,6 +88,7 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		queryHashes:     make(map[string]uint64),
 		tracker:         tracker,
 		auth:            defaultAuth{},
+		guards:          make(map[string]Guard),
 		websocketHelper: &reactivity.WebsocketHelper{},
 	}
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
@@ -649,6 +655,11 @@ func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{
 		e.dependencies[dependency] = append(e.dependencies[dependency], name)
 	}
 	slog.Debug("Registered query", "name", name)
+}
+
+func (e *Engine) RegisterGuard(name string, guard func(ctx *GuardCtx) interface{}) {
+	e.guards[name] = Guard{Func: guard}
+	slog.Debug("Registered guard", "name", name)
 }
 
 func (e *Engine) CreateTable(name string, schema interface{}) {

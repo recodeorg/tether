@@ -36,6 +36,12 @@ type MutationCtx struct {
 	Profiler *utilities.Profiler
 }
 
+type GuardCtx struct {
+	DB       *gorm.DB
+	AuthCtx  *AuthCtx
+	Profiler *utilities.Profiler
+}
+
 type Auth interface {
 	VerifyToken(DB *gorm.DB, token string) (userID string, expiresAt time.Time, error error)
 }
