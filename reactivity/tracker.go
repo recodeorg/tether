@@ -223,6 +223,17 @@ func (t *Tracker) GetAuthFingerprint(sub *Subscription) string {
 	return strings.Join(authTags, "|")
 }
 
+func (t *Tracker) GetGuardFingerprint(sub *Subscription, guardName string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for tag := range t.subToTags[sub.SubID] {
+		if strings.HasPrefix(tag, "*guard_"+guardName+":") {
+			return tag
+		}
+	}
+	return ""
+}
+
 func (t *Tracker) GetSubscriptionsToTag(tag string) []*Subscription {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

@@ -73,6 +73,14 @@ func getIdentity(queryCtx *QueryCtx, authID string) (string, error) {
 	return authID, nil
 }
 
+func executeGuard(e *Engine, guardCtx *GuardCtx, guardName string) (interface{}, error) {
+	guard, ok := e.guards[guardName]
+	if !ok {
+		return nil, fmt.Errorf("guard not found")
+	}
+	return guard.Func(guardCtx), nil
+}
+
 func NewEngine(db *gorm.DB, dbType string) *Engine {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	tracker := reactivity.NewTracker()
@@ -817,6 +825,37 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		GetIdentity: func() (string, error) {
 			return getIdentity(queryCtx, authID)
 		},
+		ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
+			guardFingerprint := e.tracker.GetGuardFingerprint(subscription, guardName)
+			if guardFingerprint == "" {
+				// Guard has not been executed yet, execute it and store the result
+				guardCtx := &GuardCtx{
+					DB:       e.db,
+					AuthCtx:  queryCtx.Auth,
+					Params:   params,
+					Profiler: e.Profiler,
+				}
+				result, err := executeGuard(e, guardCtx, guardName)
+				if err != nil {
+					return nil, err
+				}
+				resultJSON, err := json.Marshal(result)
+				if err != nil {
+					return nil, err
+				}
+				queryCtx.Dependencies = append(queryCtx.Dependencies, fmt.Sprintf("*guard_%s:%s", guardName, resultJSON))
+				return result, nil
+			} else {
+				// Guard has already been executed, return the result
+				filteredResult := strings.ReplaceAll(guardFingerprint, "*guard_"+guardName+":", "")
+				var result interface{}
+				err := json.Unmarshal([]byte(filteredResult), &result)
+				if err != nil {
+					return nil, err
+				}
+				return result, nil
+			}
+		},
 	}
 	execID := uuid.NewString()
 
@@ -879,6 +918,9 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 	}
 	authCtx := &AuthCtx{
 		GetIdentity: func() (string, error) { panic("tether: mutations with auth cannot be executed internally") },
+		ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
+			return nil, fmt.Errorf("guards cannot be executed internally")
+		},
 	}
 	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params, Profiler: e.Profiler}
 	execID := uuid.NewString()
@@ -916,6 +958,22 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 
 	authCtx := &AuthCtx{
 		GetIdentity: func() (string, error) { return authID, nil },
+	}
+
+	authCtx.ExecuteGuard = func(guardName string, params map[string]interface{}) (interface{}, error) {
+		// Execute the guard and return the result
+		// Mutations are single-fire, so no caching is needed
+		guardCtx := &GuardCtx{
+			DB:       e.db,
+			AuthCtx:  authCtx,
+			Params:   params,
+			Profiler: e.Profiler,
+		}
+		result, err := executeGuard(e, guardCtx, guardName)
+		if err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 
 	mutationCtx := &MutationCtx{DB: scopedDB, AuthCtx: authCtx, Params: params}

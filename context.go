@@ -9,7 +9,8 @@ import (
 )
 
 type AuthCtx struct {
-	GetIdentity func() (string, error)
+	GetIdentity  func() (string, error)
+	ExecuteGuard func(guardName string, params map[string]interface{}) (interface{}, error)
 }
 
 type QueryCtx struct {
@@ -39,6 +40,7 @@ type MutationCtx struct {
 type GuardCtx struct {
 	DB       *gorm.DB
 	AuthCtx  *AuthCtx
+	Params   map[string]interface{}
 	Profiler *utilities.Profiler
 }
 
