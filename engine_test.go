@@ -13,12 +13,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/cespare/xxhash"
 	"github.com/glebarez/sqlite"
 	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
@@ -246,6 +248,14 @@ func TestTrackCollectionAndTrackTableTagFormat(t *testing.T) {
 	want := []string{"messages_room_id:lobby", "messages_room_id:5", "table_messages:mutated"}
 	if !slices.Equal(ctx.Dependencies, want) {
 		t.Errorf("Dependencies = %v, want %v", ctx.Dependencies, want)
+	}
+
+	guard := &GuardCtx{}
+	guard.TrackCollection("room_members", "user_id", "user-7")
+	guard.TrackTable("room_members")
+	wantGuard := []string{"room_members_user_id:user-7", "table_room_members:mutated"}
+	if !slices.Equal(guard.Dependencies, wantGuard) {
+		t.Errorf("GuardCtx.Dependencies = %v, want %v", guard.Dependencies, wantGuard)
 	}
 }
 
@@ -1149,6 +1159,134 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 	}
 }
 
+func TestGuardIdentityDoesNotFingerprintTheQuery(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.tracker.SetAuth(client.ID, "user-7", time.Now().Add(time.Hour))
+
+	e.RegisterGuard("allow", func(ctx *GuardCtx) interface{} {
+		id, _ := ctx.Auth.GetIdentity()
+		ctx.TrackCollection("room_members", "user_id", id)
+		return map[string]interface{}{"access": true}
+	})
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		res, err := ctx.Auth.ExecuteGuard("allow", map[string]interface{}{"room": "lobby"})
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		ctx.TrackCollection("messages", "room_id", "lobby")
+		return res
+	}, nil)
+	sub := subscribe(t, e, client, "getMessages", "lobby", nil)
+
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:user-7"), sub.SubID) {
+		t.Fatal("GetIdentity inside a guard tagged the query; matching clients cannot be batched")
+	}
+	if len(sub.LinkedSubIDs) != 1 {
+		t.Fatalf("linked guards = %d, want 1", len(sub.LinkedSubIDs))
+	}
+	guardID := sub.LinkedSubIDs[0]
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:user-7"), guardID) {
+		t.Fatal("GetIdentity inside a guard did not register *user_identity on the guard")
+	}
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("room_members_user_id:user-7"), guardID) {
+		t.Fatal("guard did not subscribe to room_members_user_id:user-7")
+	}
+	paramsJSON, err := json.Marshal(map[string]interface{}{"room": "lobby"})
+	if err != nil {
+		t.Fatalf("marshal guard params: %v", err)
+	}
+	paramsHash := strconv.FormatUint(xxhash.Sum64(paramsJSON), 10)
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*guard_allow_"+paramsHash+":{\"access\":true}"), sub.SubID) {
+		t.Fatal("query is missing the guard fingerprint tag")
+	}
+}
+
+func TestGuardsBatchQueriesOnInvalidation(t *testing.T) {
+	e := newTestEngine(t)
+	a := trackClient(t, e)
+	b := trackClient(t, e)
+	e.tracker.SetAuth(a.ID, "user-a", time.Now().Add(time.Hour))
+	e.tracker.SetAuth(b.ID, "user-b", time.Now().Add(time.Hour))
+
+	var guardRuns, queryRuns atomic.Int64
+	e.RegisterGuard("allow", func(ctx *GuardCtx) interface{} {
+		guardRuns.Add(1)
+		id, _ := ctx.Auth.GetIdentity()
+		ctx.TrackCollection("room_members", "user_id", id)
+		return map[string]interface{}{"ok": true}
+	})
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		queryRuns.Add(1)
+		if _, err := ctx.Auth.ExecuteGuard("allow", map[string]interface{}{"room": "lobby"}); err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		ctx.TrackCollection("messages", "room_id", "lobby")
+		return map[string]interface{}{"ok": true}
+	}, nil)
+	subscribe(t, e, a, "getMessages", "a", map[string]interface{}{"room": "lobby"})
+	subscribe(t, e, b, "getMessages", "b", map[string]interface{}{"room": "lobby"})
+	if got, want := queryRuns.Load(), int64(2); got != want {
+		t.Fatalf("initial query runs = %d, want %d", got, want)
+	}
+	if got, want := guardRuns.Load(), int64(2); got != want {
+		t.Fatalf("initial guard runs = %d, want %d", got, want)
+	}
+
+	e.InvalidateTag("messages_room_id:lobby")
+	if got, want := queryRuns.Load(), int64(3); got != want {
+		t.Errorf("query runs after invalidate = %d, want %d (one batched execution)", got, want)
+	}
+	if got, want := guardRuns.Load(), int64(2); got != want {
+		t.Errorf("guard runs after query invalidate = %d, want %d (cached fingerprints)", got, want)
+	}
+}
+
+func TestGuardInvalidationRerunsAttachedQuery(t *testing.T) {
+	e := newTestEngine(t)
+	e.CreateTable("room_members", &testRoomMember{})
+	client := trackClient(t, e)
+	e.tracker.SetAuth(client.ID, "user-7", time.Now().Add(time.Hour))
+	if err := e.db.Create(&testRoomMember{UserID: "user-7", RoomID: "lobby"}).Error; err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	e.RegisterGuard("hasAccess", func(ctx *GuardCtx) interface{} {
+		id, _ := ctx.Auth.GetIdentity()
+		ctx.TrackCollection("room_members", "user_id", id)
+		var member testRoomMember
+		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, ctx.Params["room"]).First(&member).Error; err != nil {
+			return map[string]interface{}{"error": "forbidden"}
+		}
+		return map[string]interface{}{"access": true}
+	})
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		hasAccess, err := ctx.Auth.ExecuteGuard("hasAccess", map[string]interface{}{"room": "lobby"})
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		access, _ := hasAccess.(map[string]interface{})
+		if errMsg, _ := access["error"].(string); errMsg != "" {
+			return map[string]interface{}{"error": errMsg}
+		}
+		return map[string]interface{}{"ok": true}
+	}, nil)
+	subscribe(t, e, client, "getMessages", "lobby", nil)
+	drain(client)
+
+	if err := e.db.Delete(&testRoomMember{UserID: "user-7", RoomID: "lobby"}).Error; err != nil {
+		t.Fatalf("revoke membership: %v", err)
+	}
+	msgs := queryMessages(t, drain(client))
+	if len(msgs) != 1 {
+		t.Fatalf("got %d query pushes after revoke, want 1: %v", len(msgs), msgs)
+	}
+	data, _ := msgs[0]["data"].(map[string]interface{})
+	if data["error"] != "forbidden" {
+		t.Errorf("after revoke data = %v, want error=forbidden", data)
+	}
+}
+
 func TestFailedAuthDoesNotSetIdentityOrPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
@@ -1223,7 +1361,7 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 	}
 	var fromAuthed, fromAnon seen
 	e.RegisterMutation("whoami", func(ctx *MutationCtx) interface{} {
-		id, _ := ctx.AuthCtx.GetIdentity()
+		id, _ := ctx.Auth.GetIdentity()
 		return map[string]interface{}{"id": id}
 	})
 
@@ -1487,8 +1625,10 @@ const (
 )
 
 type e2eBarriers struct {
-	subscribed sync.WaitGroup
-	goMutate   chan struct{}
+	subscribed    sync.WaitGroup
+	goMutate      chan struct{}
+	readyToRevoke sync.WaitGroup
+	goRevoke      chan struct{}
 }
 
 type e2eInbox struct {
@@ -1521,7 +1661,11 @@ func (in *e2eInbox) read(conn *websocket.Conn) {
 				in.queryKey = k
 			}
 			data, _ := msg["data"].([]interface{})
-			in.lastData = data
+			// Messages are only created in this test, so a shorter payload is a
+			// stale query result that finished after a newer one.
+			if len(data) >= len(in.lastData) {
+				in.lastData = data
+			}
 		case "mutation":
 			id, _ := msg["mutation_id"].(string)
 			in.acks[id] = msg
@@ -1856,7 +2000,1012 @@ func TestConcurrentWebsocketClientsEndToEnd(t *testing.T) {
 				t.Error(err)
 			}
 		case <-ctx.Done():
-			t.Fatal("timed out waiting for concurrent clients to finish")
+			for {
+				select {
+				case err := <-errCh:
+					if err != nil {
+						t.Error(err)
+					}
+				default:
+					t.Fatal("timed out waiting for concurrent clients to finish")
+				}
+			}
+		}
+	}
+}
+
+// Access-token auth fixtures used by the concurrent GetIdentity end-to-end test.
+// A later Guard-based variant can reuse the same schema and token lookup.
+type testUser struct {
+	ID   string `gorm:"primaryKey"`
+	Name string `gorm:"not null"`
+}
+
+func (testUser) TableName() string { return "users" }
+
+type testAccessToken struct {
+	Token     string    `gorm:"primaryKey"`
+	UserID    string    `gorm:"not null"`
+	ExpiresAt time.Time `gorm:"not null"`
+}
+
+func (testAccessToken) TableName() string { return "access_tokens" }
+
+type testRoomMember struct {
+	UserID string `gorm:"primaryKey" tether:"track"`
+	RoomID string `gorm:"primaryKey"`
+}
+
+func (testRoomMember) TableName() string { return "room_members" }
+
+type testAuthoredMessage struct {
+	ID       uint   `gorm:"primaryKey"`
+	Body     string `gorm:"not null"`
+	RoomID   string `tether:"track"`
+	AuthorID string
+}
+
+func (testAuthoredMessage) TableName() string { return "messages" }
+
+// accessTokenAuth looks up opaque access tokens in the database. It is intentionally
+// simple: the goal is to exercise Tether's auth plumbing, not a production token scheme.
+type accessTokenAuth struct{}
+
+func (accessTokenAuth) VerifyToken(db *gorm.DB, token string) (string, time.Time, error) {
+	if token == "" {
+		return "", time.Time{}, errors.New("missing token")
+	}
+	var row testAccessToken
+	if err := db.Where("token = ?", token).First(&row).Error; err != nil {
+		return "", time.Time{}, err
+	}
+	if time.Now().After(row.ExpiresAt) {
+		return "", time.Time{}, errors.New("token expired")
+	}
+	var user testUser
+	if err := db.Where("id = ?", row.UserID).First(&user).Error; err != nil {
+		return "", time.Time{}, err
+	}
+	return user.ID, row.ExpiresAt, nil
+}
+
+func newConcurrentAuthTestEngine(t *testing.T) *Engine {
+	t.Helper()
+	e := newConcurrentTestEngine(t)
+	e.CreateTable("users", &testUser{})
+	e.CreateTable("access_tokens", &testAccessToken{})
+	e.CreateTable("room_members", &testRoomMember{})
+	e.CreateTable("messages", &testAuthoredMessage{})
+	e.SetAuth(accessTokenAuth{})
+	return e
+}
+
+type e2eAuthRole int
+
+const (
+	e2eAuthMutator e2eAuthRole = iota
+	e2eAuthWatcher
+	e2eAuthDropper
+	e2eAuthBadToken
+	e2eAuthUnauthed
+	e2eAuthOutsider
+	e2eAuthRevoked
+)
+
+type authE2EInbox struct {
+	mu           sync.Mutex
+	queryHits    int
+	queryKey     string
+	lastIdentity string
+	lastUserName string
+	lastError    string
+	lastMessages []interface{}
+	acks         map[string]map[string]interface{}
+	auth         map[string]interface{}
+	errors       []map[string]interface{}
+}
+
+func newAuthE2EInbox() *authE2EInbox {
+	return &authE2EInbox{acks: make(map[string]map[string]interface{})}
+}
+
+func (in *authE2EInbox) read(conn *websocket.Conn) {
+	for {
+		_, raw, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var msg map[string]interface{}
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			continue
+		}
+		in.mu.Lock()
+		switch msg["type"] {
+		case "query":
+			in.queryHits++
+			if k, ok := msg["query_key"].(string); ok {
+				in.queryKey = k
+			}
+			data, _ := msg["data"].(map[string]interface{})
+			in.lastError, _ = data["error"].(string)
+			in.lastIdentity, _ = data["identity"].(string)
+			in.lastUserName, _ = data["user_name"].(string)
+			msgs, _ := data["messages"].([]interface{})
+			// Messages are only created in this test, so a shorter payload is a
+			// stale query result that finished after a newer one. An error
+			// payload is a later authorization change and always wins.
+			if in.lastError != "" || len(msgs) >= len(in.lastMessages) {
+				in.lastMessages = msgs
+			}
+		case "mutation":
+			id, _ := msg["mutation_id"].(string)
+			in.acks[id] = msg
+		case "auth":
+			in.auth = msg
+		case "error":
+			in.errors = append(in.errors, msg)
+		}
+		in.mu.Unlock()
+	}
+}
+
+type authE2ESnap struct {
+	queryHits int
+	queryKey  string
+	identity  string
+	userName  string
+	queryErr  string
+	messages  []interface{}
+	acks      map[string]map[string]interface{}
+	auth      map[string]interface{}
+	errors    []map[string]interface{}
+}
+
+func (in *authE2EInbox) snapshot() authE2ESnap {
+	in.mu.Lock()
+	defer in.mu.Unlock()
+	s := authE2ESnap{
+		queryHits: in.queryHits,
+		queryKey:  in.queryKey,
+		identity:  in.lastIdentity,
+		userName:  in.lastUserName,
+		queryErr:  in.lastError,
+		messages:  append([]interface{}(nil), in.lastMessages...),
+		acks:      make(map[string]map[string]interface{}, len(in.acks)),
+		auth:      in.auth,
+		errors:    append([]map[string]interface{}(nil), in.errors...),
+	}
+	for k, v := range in.acks {
+		s.acks[k] = v
+	}
+	return s
+}
+
+type authE2EClientCfg struct {
+	id            int
+	role          e2eAuthRole
+	room          string
+	queryKey      string
+	userID        string
+	userName      string
+	token         string
+	mutationsEach int
+	wantBodies    map[string]struct{}
+	bodyOf        func(mutatorID, n int) string
+	// skipQueryIdentity omits checks that getMessages includes identity and
+	// user_name. Guard-backed queries cannot return per-user fields without
+	// splitting the batched result.
+	skipQueryIdentity bool
+}
+
+func authorIDForMutator(mutatorID int) string {
+	return fmt.Sprintf("user-%d", mutatorID)
+}
+
+func runAuthE2EClient(ctx context.Context, wsURL string, cfg authE2EClientCfg, barriers *e2eBarriers) (err error) {
+	var readyOnce sync.Once
+	signalReady := func() { readyOnce.Do(func() { barriers.subscribed.Done() }) }
+	defer signalReady()
+	signalRevokeReady := func() {}
+	switch cfg.role {
+	case e2eAuthMutator, e2eAuthWatcher, e2eAuthRevoked:
+		var revokeOnce sync.Once
+		signalRevokeReady = func() { revokeOnce.Do(func() { barriers.readyToRevoke.Done() }) }
+		defer signalRevokeReady()
+	}
+
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		return fmt.Errorf("client %d: dial: %w", cfg.id, err)
+	}
+	defer conn.Close()
+	go func() {
+		<-ctx.Done()
+		_ = conn.Close()
+	}()
+
+	inbox := newAuthE2EInbox()
+	go inbox.read(conn)
+
+	if cfg.role == e2eAuthBadToken {
+		if err := conn.WriteJSON(map[string]interface{}{"type": "auth", "token": cfg.token}); err != nil {
+			return fmt.Errorf("client %d: auth: %w", cfg.id, err)
+		}
+		if !waitPred(ctx, func() bool {
+			s := inbox.snapshot()
+			return s.auth != nil || len(s.errors) > 0
+		}) {
+			return fmt.Errorf("client %d: did not receive an auth failure", cfg.id)
+		}
+		s := inbox.snapshot()
+		if s.auth != nil {
+			return fmt.Errorf("client %d: invalid token was accepted: %v", cfg.id, s.auth)
+		}
+		if len(s.errors) == 0 {
+			return fmt.Errorf("client %d: invalid token did not produce an error message", cfg.id)
+		}
+		return nil
+	}
+
+	if cfg.role != e2eAuthUnauthed {
+		if err := conn.WriteJSON(map[string]interface{}{"type": "auth", "token": cfg.token}); err != nil {
+			return fmt.Errorf("client %d: auth: %w", cfg.id, err)
+		}
+		if !waitPred(ctx, func() bool {
+			s := inbox.snapshot()
+			return s.auth != nil || len(s.errors) > 0
+		}) {
+			return fmt.Errorf("client %d: did not receive an auth response", cfg.id)
+		}
+		s := inbox.snapshot()
+		if len(s.errors) > 0 {
+			return fmt.Errorf("client %d: auth failed: %v", cfg.id, s.errors)
+		}
+		if s.auth["success"] != true {
+			return fmt.Errorf("client %d: auth success = %v, want true", cfg.id, s.auth["success"])
+		}
+		data, _ := s.auth["data"].(map[string]interface{})
+		if data["user_id"] != cfg.userID {
+			return fmt.Errorf("client %d: auth user_id = %v, want %s", cfg.id, data["user_id"], cfg.userID)
+		}
+	}
+
+	if err := conn.WriteJSON(map[string]interface{}{
+		"type":      "subscribe",
+		"location":  "getMessages",
+		"params":    map[string]interface{}{"room": cfg.room},
+		"query_key": cfg.queryKey,
+	}); err != nil {
+		return fmt.Errorf("client %d: subscribe: %w", cfg.id, err)
+	}
+
+	wantQueryErr := ""
+	switch cfg.role {
+	case e2eAuthUnauthed:
+		wantQueryErr = "unauthenticated"
+	case e2eAuthOutsider:
+		wantQueryErr = "forbidden"
+	}
+	if !waitPred(ctx, func() bool {
+		s := inbox.snapshot()
+		if s.queryHits < 1 || s.queryKey != cfg.queryKey || s.queryErr != wantQueryErr {
+			return false
+		}
+		if cfg.skipQueryIdentity {
+			return true
+		}
+		if cfg.role == e2eAuthUnauthed {
+			return s.identity == ""
+		}
+		return s.identity == cfg.userID
+	}) {
+		s := inbox.snapshot()
+		return fmt.Errorf("client %d: initial query mismatch (hits=%d query_key=%q identity=%q error=%q wantError=%q data=%v)",
+			cfg.id, s.queryHits, s.queryKey, s.identity, s.queryErr, wantQueryErr, s.messages)
+	}
+
+	signalReady()
+	select {
+	case <-barriers.goMutate:
+	case <-ctx.Done():
+		return fmt.Errorf("client %d: %w", cfg.id, ctx.Err())
+	}
+
+	if cfg.role == e2eAuthDropper {
+		return nil
+	}
+
+	sendDeniedMutation := func(wantErr string) error {
+		mutID := fmt.Sprintf("denied-%d", cfg.id)
+		if err := conn.WriteJSON(map[string]interface{}{
+			"type":     "mutation",
+			"location": "createMessage",
+			"params": map[string]interface{}{
+				"body":      "should-not-land",
+				"room":      cfg.room,
+				"author_id": "spoofed",
+			},
+			"mutation_id": mutID,
+		}); err != nil {
+			return fmt.Errorf("client %d: mutation %s: %w", cfg.id, mutID, err)
+		}
+		if !waitPred(ctx, func() bool {
+			_, ok := inbox.snapshot().acks[mutID]
+			return ok
+		}) {
+			return fmt.Errorf("client %d: missing denied mutation ack", cfg.id)
+		}
+		data, _ := inbox.snapshot().acks[mutID]["data"].(map[string]interface{})
+		var gotErr interface{}
+		if data != nil {
+			gotErr = data["error"]
+		}
+		if gotErr != wantErr {
+			return fmt.Errorf("client %d: denied mutation error = %v, want %s", cfg.id, gotErr, wantErr)
+		}
+		if data != nil && (data["Body"] != nil || data["AuthorID"] != nil) {
+			return fmt.Errorf("client %d: denied mutation created a row: %v", cfg.id, data)
+		}
+		return nil
+	}
+
+	switch cfg.role {
+	case e2eAuthUnauthed:
+		return sendDeniedMutation("unauthenticated")
+	case e2eAuthOutsider:
+		return sendDeniedMutation("forbidden")
+	}
+
+	if cfg.role == e2eAuthMutator {
+		wantIDs := make(map[string]string, cfg.mutationsEach)
+		for n := 0; n < cfg.mutationsEach; n++ {
+			mutID := fmt.Sprintf("m-%d-%d", cfg.id, n)
+			body := cfg.bodyOf(cfg.id, n)
+			wantIDs[mutID] = body
+			if err := conn.WriteJSON(map[string]interface{}{
+				"type":     "mutation",
+				"location": "createMessage",
+				"params": map[string]interface{}{
+					"body":      body,
+					"room":      cfg.room,
+					"author_id": "spoofed-author",
+					"user_id":   "spoofed-user",
+				},
+				"mutation_id": mutID,
+			}); err != nil {
+				return fmt.Errorf("client %d: mutation %s: %w", cfg.id, mutID, err)
+			}
+		}
+		if !waitPred(ctx, func() bool {
+			acks := inbox.snapshot().acks
+			for id := range wantIDs {
+				if _, ok := acks[id]; !ok {
+					return false
+				}
+			}
+			return true
+		}) {
+			acks := inbox.snapshot().acks
+			var got []string
+			for id := range acks {
+				got = append(got, id)
+			}
+			slices.Sort(got)
+			return fmt.Errorf("client %d: missing mutation acks: got %d/%d %v", cfg.id, len(acks), len(wantIDs), got)
+		}
+		acks := inbox.snapshot().acks
+		for mutID, body := range wantIDs {
+			ack := acks[mutID]
+			if ack["location"] != "createMessage" {
+				return fmt.Errorf("client %d: ack %s location = %v, want createMessage", cfg.id, mutID, ack["location"])
+			}
+			data, _ := ack["data"].(map[string]interface{})
+			if data["error"] != nil {
+				return fmt.Errorf("client %d: mutation %s error: %v", cfg.id, mutID, data["error"])
+			}
+			if data["Body"] != body {
+				return fmt.Errorf("client %d: mutation %s Body = %v, want %s", cfg.id, mutID, data["Body"], body)
+			}
+			if data["RoomID"] != cfg.room {
+				return fmt.Errorf("client %d: mutation %s RoomID = %v, want %s", cfg.id, mutID, data["RoomID"], cfg.room)
+			}
+			if data["AuthorID"] != cfg.userID {
+				return fmt.Errorf("client %d: mutation %s AuthorID = %v, want %s (identity, not client-supplied author_id)", cfg.id, mutID, data["AuthorID"], cfg.userID)
+			}
+		}
+		for mutID := range acks {
+			if _, ok := wantIDs[mutID]; !ok {
+				return fmt.Errorf("client %d: received unexpected mutation_id %q", cfg.id, mutID)
+			}
+		}
+	}
+
+	if !waitPred(ctx, func() bool {
+		s := inbox.snapshot()
+		if s.queryErr != "" || !e2eBodiesMatch(e2eMessageBodies(s.messages), cfg.wantBodies) {
+			return false
+		}
+		if cfg.skipQueryIdentity {
+			return true
+		}
+		return s.identity == cfg.userID && s.userName == cfg.userName
+	}) {
+		s := inbox.snapshot()
+		got := e2eMessageBodies(s.messages)
+		missing, extra := e2eBodyDiff(got, cfg.wantBodies)
+		return fmt.Errorf("client %d: query did not converge with identity %q (hits=%d identity=%q user_name=%q error=%q got=%d want=%d missing=%v extra=%v)",
+			cfg.id, cfg.userID, s.queryHits, s.identity, s.userName, s.queryErr, len(got), len(cfg.wantBodies), missing, extra)
+	}
+
+	if cfg.role == e2eAuthRevoked {
+		hitsAfterAuth := inbox.snapshot().queryHits
+		signalRevokeReady()
+		select {
+		case <-barriers.goRevoke:
+		case <-ctx.Done():
+			return fmt.Errorf("client %d: %w", cfg.id, ctx.Err())
+		}
+		if !waitPred(ctx, func() bool {
+			s := inbox.snapshot()
+			if s.queryHits <= hitsAfterAuth || s.queryErr != "forbidden" {
+				return false
+			}
+			if cfg.skipQueryIdentity {
+				return true
+			}
+			return s.identity == cfg.userID
+		}) {
+			s := inbox.snapshot()
+			return fmt.Errorf("client %d: did not de-auth after room access was removed (hits=%d identity=%q error=%q)",
+				cfg.id, s.queryHits, s.identity, s.queryErr)
+		}
+		return nil
+	}
+
+	s := inbox.snapshot()
+	if s.queryKey != cfg.queryKey {
+		return fmt.Errorf("client %d: query_key = %q, want %q", cfg.id, s.queryKey, cfg.queryKey)
+	}
+	if !cfg.skipQueryIdentity {
+		if s.identity != cfg.userID {
+			return fmt.Errorf("client %d: query identity = %q, want %q", cfg.id, s.identity, cfg.userID)
+		}
+		if s.userName != cfg.userName {
+			return fmt.Errorf("client %d: query user_name = %q, want %q", cfg.id, s.userName, cfg.userName)
+		}
+	}
+	if s.queryErr != "" {
+		return fmt.Errorf("client %d: query error = %q, want empty", cfg.id, s.queryErr)
+	}
+	for _, item := range s.messages {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("client %d: query item is %T, want object", cfg.id, item)
+		}
+		if m["RoomID"] != cfg.room {
+			return fmt.Errorf("client %d: query leaked RoomID %v into room %s", cfg.id, m["RoomID"], cfg.room)
+		}
+		body, _ := m["Body"].(string)
+		wantAuthor, ok := authorIDFromBody(body)
+		if !ok {
+			return fmt.Errorf("client %d: unexpected message body %q", cfg.id, body)
+		}
+		if m["AuthorID"] != wantAuthor {
+			return fmt.Errorf("client %d: message %q AuthorID = %v, want %s", cfg.id, body, m["AuthorID"], wantAuthor)
+		}
+	}
+	return nil
+}
+
+func authorIDFromBody(body string) (string, bool) {
+	var mutatorID, n int
+	if _, err := fmt.Sscanf(body, "c%d-n%d", &mutatorID, &n); err != nil {
+		return "", false
+	}
+	return authorIDForMutator(mutatorID), true
+}
+
+// TestConcurrentWebsocketAuthGetIdentityEndToEnd is the authenticated counterpart of
+// TestConcurrentWebsocketClientsEndToEnd. Each client presents an access token that
+// VerifyToken looks up in the database. Queries use ctx.Auth.GetIdentity and mutations
+// use ctx.AuthCtx.GetIdentity, then compare that identity against users/memberships in
+// the DB. Queries also track room_members by user id, so deleting some members mid-run
+// re-fires those clients from an authorized result into a forbidden state. A later
+// test will cover the same scenario with Guard functions.
+func TestConcurrentWebsocketAuthGetIdentityEndToEnd(t *testing.T) {
+	const (
+		nMutators     = 24
+		nWatchers     = 16
+		nDroppers     = 10
+		nRevoked      = 6
+		nOutsiders    = 4
+		nBadTokens    = 4
+		nUnauthed     = 4
+		mutationsEach = 5
+	)
+	nMembers := nMutators + nWatchers + nDroppers + nRevoked
+	nClients := nMembers + nOutsiders + nBadTokens + nUnauthed
+
+	e := newConcurrentAuthTestEngine(t)
+	e.Profiler.Start()
+	defer func() {
+		metrics := e.Profiler.DumpMetricsAndFlush()
+		t.Log(utilities.SanitizeMetrics(metrics))
+	}()
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		id, err := ctx.Auth.GetIdentity()
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		if id == "" {
+			return map[string]interface{}{"error": "unauthenticated"}
+		}
+		ctx.TrackCollection("room_members", "user_id", id)
+		var user testUser
+		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
+			return map[string]interface{}{"error": "unknown user", "identity": id}
+		}
+		room, _ := ctx.Params["room"].(string)
+		var member testRoomMember
+		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
+			return map[string]interface{}{"error": "forbidden", "identity": id, "user_name": user.Name}
+		}
+		ctx.TrackCollection("messages", "room_id", room)
+		msgs := make([]testAuthoredMessage, 0)
+		if err := ctx.DB.Where("room_id = ?", room).Order("id").Find(&msgs).Error; err != nil {
+			return map[string]interface{}{"error": err.Error(), "identity": id, "user_name": user.Name}
+		}
+		return map[string]interface{}{
+			"identity":  id,
+			"user_name": user.Name,
+			"messages":  msgs,
+		}
+	}, nil)
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+		id, err := ctx.Auth.GetIdentity()
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		if id == "" {
+			return map[string]interface{}{"error": "unauthenticated"}
+		}
+		var user testUser
+		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
+			return map[string]interface{}{"error": "unknown user"}
+		}
+		room, _ := ctx.Params["room"].(string)
+		var member testRoomMember
+		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
+			return map[string]interface{}{"error": "forbidden"}
+		}
+		msg := testAuthoredMessage{
+			Body:     ctx.Params["body"].(string),
+			RoomID:   room,
+			AuthorID: id,
+		}
+		if err := ctx.DB.Create(&msg).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return msg
+	})
+
+	expiresAt := time.Now().Add(time.Hour)
+	users := make([]testUser, 0, nMembers+nOutsiders)
+	tokens := make([]testAccessToken, 0, nMembers+nOutsiders)
+	members := make([]testRoomMember, 0, nMembers+nOutsiders)
+	userNameOf := func(id int) string { return fmt.Sprintf("User %d", id) }
+	tokenOf := func(id int) string { return fmt.Sprintf("tok-%d", id) }
+	roomOf := func(id int) string {
+		if id%2 == 0 {
+			return "alpha"
+		}
+		return "bravo"
+	}
+	bodyOf := func(mutatorID, n int) string {
+		return fmt.Sprintf("c%d-n%d", mutatorID, n)
+	}
+
+	for id := 0; id < nMembers; id++ {
+		uid := authorIDForMutator(id)
+		users = append(users, testUser{ID: uid, Name: userNameOf(id)})
+		tokens = append(tokens, testAccessToken{Token: tokenOf(id), UserID: uid, ExpiresAt: expiresAt})
+		members = append(members, testRoomMember{UserID: uid, RoomID: roomOf(id)})
+	}
+	for i := 0; i < nOutsiders; i++ {
+		uid := fmt.Sprintf("outsider-%d", i)
+		users = append(users, testUser{ID: uid, Name: fmt.Sprintf("Outsider %d", i)})
+		tokens = append(tokens, testAccessToken{Token: fmt.Sprintf("tok-outsider-%d", i), UserID: uid, ExpiresAt: expiresAt})
+		members = append(members, testRoomMember{UserID: uid, RoomID: "gamma"})
+	}
+	if err := e.db.Create(&users).Error; err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	if err := e.db.Create(&tokens).Error; err != nil {
+		t.Fatalf("seed access tokens: %v", err)
+	}
+	if err := e.db.Create(&members).Error; err != nil {
+		t.Fatalf("seed room members: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(e.Handle))
+	t.Cleanup(srv.Close)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/"
+
+	wantBodies := map[string]map[string]struct{}{
+		"alpha": {},
+		"bravo": {},
+	}
+	for id := 0; id < nMutators; id++ {
+		for n := 0; n < mutationsEach; n++ {
+			wantBodies[roomOf(id)][bodyOf(id, n)] = struct{}{}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	barriers := &e2eBarriers{goMutate: make(chan struct{}), goRevoke: make(chan struct{})}
+	barriers.subscribed.Add(nClients)
+	barriers.readyToRevoke.Add(nMutators + nWatchers + nRevoked)
+	errCh := make(chan error, nClients)
+
+	startClient := func(id int, role e2eAuthRole, room, userID, userName, token string, want map[string]struct{}) {
+		go func() {
+			errCh <- runAuthE2EClient(ctx, wsURL, authE2EClientCfg{
+				id:            id,
+				role:          role,
+				room:          room,
+				queryKey:      fmt.Sprintf("client-%d", id),
+				userID:        userID,
+				userName:      userName,
+				token:         token,
+				mutationsEach: mutationsEach,
+				wantBodies:    want,
+				bodyOf:        bodyOf,
+			}, barriers)
+		}()
+	}
+	for id := 0; id < nMutators; id++ {
+		startClient(id, e2eAuthMutator, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nWatchers; i++ {
+		id := nMutators + i
+		startClient(id, e2eAuthWatcher, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nDroppers; i++ {
+		id := nMutators + nWatchers + i
+		startClient(id, e2eAuthDropper, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nRevoked; i++ {
+		id := nMutators + nWatchers + nDroppers + i
+		startClient(id, e2eAuthRevoked, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nOutsiders; i++ {
+		id := nMembers + i
+		startClient(id, e2eAuthOutsider, "alpha", fmt.Sprintf("outsider-%d", i), fmt.Sprintf("Outsider %d", i), fmt.Sprintf("tok-outsider-%d", i), nil)
+	}
+	for i := 0; i < nBadTokens; i++ {
+		id := nMembers + nOutsiders + i
+		startClient(id, e2eAuthBadToken, "alpha", "", "", fmt.Sprintf("no-such-token-%d", i), nil)
+	}
+	for i := 0; i < nUnauthed; i++ {
+		id := nMembers + nOutsiders + nBadTokens + i
+		startClient(id, e2eAuthUnauthed, "alpha", "", "", "", nil)
+	}
+
+	subscribed := make(chan struct{})
+	go func() {
+		barriers.subscribed.Wait()
+		close(subscribed)
+	}()
+	select {
+	case <-subscribed:
+	case <-ctx.Done():
+		for {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Error(err)
+				}
+			default:
+				t.Fatal("timed out waiting for all clients to authenticate and receive an initial query result")
+			}
+		}
+	}
+	close(barriers.goMutate)
+
+	readyToRevoke := make(chan struct{})
+	go func() {
+		barriers.readyToRevoke.Wait()
+		close(readyToRevoke)
+	}()
+	select {
+	case <-readyToRevoke:
+	case <-ctx.Done():
+		for {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Error(err)
+				}
+			default:
+				t.Fatal("timed out waiting for authenticated clients to converge before revoking room access")
+			}
+		}
+	}
+	for i := 0; i < nRevoked; i++ {
+		id := nMutators + nWatchers + nDroppers + i
+		member := testRoomMember{UserID: authorIDForMutator(id), RoomID: roomOf(id)}
+		if err := e.db.Delete(&member).Error; err != nil {
+			t.Fatalf("revoke room access for %s: %v", member.UserID, err)
+		}
+	}
+	close(barriers.goRevoke)
+
+	for i := 0; i < nClients; i++ {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for concurrent authenticated clients to finish")
+		}
+	}
+}
+
+func TestConcurrentWebsocketAuthGuardsEndToEnd(t *testing.T) {
+	const (
+		nMutators     = 24
+		nWatchers     = 16
+		nDroppers     = 10
+		nRevoked      = 6
+		nOutsiders    = 4
+		nBadTokens    = 4
+		nUnauthed     = 4
+		mutationsEach = 5
+	)
+	nMembers := nMutators + nWatchers + nDroppers + nRevoked
+	nClients := nMembers + nOutsiders + nBadTokens + nUnauthed
+
+	e := newConcurrentAuthTestEngine(t)
+	e.Profiler.Start()
+	defer func() {
+		metrics := e.Profiler.DumpMetricsAndFlush()
+		t.Log(utilities.SanitizeMetrics(metrics))
+	}()
+	e.RegisterGuard("hasAccess", func(ctx *GuardCtx) interface{} {
+		id, err := ctx.Auth.GetIdentity()
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		if id == "" {
+			return map[string]interface{}{"error": "unauthenticated"}
+		}
+		var user testUser
+		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
+			return map[string]interface{}{"error": "unknown user"}
+		}
+		room, _ := ctx.Params["room"].(string)
+		var member testRoomMember
+		ctx.TrackCollection("room_members", "user_id", id)
+		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
+			return map[string]interface{}{"error": "forbidden"}
+		}
+		return map[string]interface{}{"access": true}
+	})
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		hasAccess, err := ctx.Auth.ExecuteGuard("hasAccess", map[string]interface{}{"room": ctx.Params["room"]})
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		access, _ := hasAccess.(map[string]interface{})
+		if errMsg, _ := access["error"].(string); errMsg != "" {
+			return map[string]interface{}{"error": errMsg}
+		}
+		if access["access"] != true {
+			return map[string]interface{}{"error": "forbidden"}
+		}
+		room := ctx.Params["room"].(string)
+		ctx.TrackCollection("messages", "room_id", room)
+		msgs := make([]testAuthoredMessage, 0)
+		if err := ctx.DB.Where("room_id = ?", room).Order("id").Find(&msgs).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return map[string]interface{}{
+			"messages": msgs,
+		}
+	}, nil)
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+		id, err := ctx.Auth.GetIdentity()
+		if err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		if id == "" {
+			return map[string]interface{}{"error": "unauthenticated"}
+		}
+		var user testUser
+		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
+			return map[string]interface{}{"error": "unknown user"}
+		}
+		room, _ := ctx.Params["room"].(string)
+		var member testRoomMember
+		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
+			return map[string]interface{}{"error": "forbidden"}
+		}
+		msg := testAuthoredMessage{
+			Body:     ctx.Params["body"].(string),
+			RoomID:   room,
+			AuthorID: id,
+		}
+		if err := ctx.DB.Create(&msg).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return msg
+	})
+
+	expiresAt := time.Now().Add(time.Hour)
+	users := make([]testUser, 0, nMembers+nOutsiders)
+	tokens := make([]testAccessToken, 0, nMembers+nOutsiders)
+	members := make([]testRoomMember, 0, nMembers+nOutsiders)
+	userNameOf := func(id int) string { return fmt.Sprintf("User %d", id) }
+	tokenOf := func(id int) string { return fmt.Sprintf("tok-%d", id) }
+	roomOf := func(id int) string {
+		if id%2 == 0 {
+			return "alpha"
+		}
+		return "bravo"
+	}
+	bodyOf := func(mutatorID, n int) string {
+		return fmt.Sprintf("c%d-n%d", mutatorID, n)
+	}
+
+	for id := 0; id < nMembers; id++ {
+		uid := authorIDForMutator(id)
+		users = append(users, testUser{ID: uid, Name: userNameOf(id)})
+		tokens = append(tokens, testAccessToken{Token: tokenOf(id), UserID: uid, ExpiresAt: expiresAt})
+		members = append(members, testRoomMember{UserID: uid, RoomID: roomOf(id)})
+	}
+	for i := 0; i < nOutsiders; i++ {
+		uid := fmt.Sprintf("outsider-%d", i)
+		users = append(users, testUser{ID: uid, Name: fmt.Sprintf("Outsider %d", i)})
+		tokens = append(tokens, testAccessToken{Token: fmt.Sprintf("tok-outsider-%d", i), UserID: uid, ExpiresAt: expiresAt})
+		members = append(members, testRoomMember{UserID: uid, RoomID: "gamma"})
+	}
+	if err := e.db.Create(&users).Error; err != nil {
+		t.Fatalf("seed users: %v", err)
+	}
+	if err := e.db.Create(&tokens).Error; err != nil {
+		t.Fatalf("seed access tokens: %v", err)
+	}
+	if err := e.db.Create(&members).Error; err != nil {
+		t.Fatalf("seed room members: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(e.Handle))
+	t.Cleanup(srv.Close)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/"
+
+	wantBodies := map[string]map[string]struct{}{
+		"alpha": {},
+		"bravo": {},
+	}
+	for id := 0; id < nMutators; id++ {
+		for n := 0; n < mutationsEach; n++ {
+			wantBodies[roomOf(id)][bodyOf(id, n)] = struct{}{}
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	barriers := &e2eBarriers{goMutate: make(chan struct{}), goRevoke: make(chan struct{})}
+	barriers.subscribed.Add(nClients)
+	barriers.readyToRevoke.Add(nMutators + nWatchers + nRevoked)
+	errCh := make(chan error, nClients)
+
+	startClient := func(id int, role e2eAuthRole, room, userID, userName, token string, want map[string]struct{}) {
+		go func() {
+			errCh <- runAuthE2EClient(ctx, wsURL, authE2EClientCfg{
+				id:                id,
+				role:              role,
+				room:              room,
+				queryKey:          fmt.Sprintf("client-%d", id),
+				userID:            userID,
+				userName:          userName,
+				token:             token,
+				mutationsEach:     mutationsEach,
+				wantBodies:        want,
+				bodyOf:            bodyOf,
+				skipQueryIdentity: true,
+			}, barriers)
+		}()
+	}
+	for id := 0; id < nMutators; id++ {
+		startClient(id, e2eAuthMutator, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nWatchers; i++ {
+		id := nMutators + i
+		startClient(id, e2eAuthWatcher, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nDroppers; i++ {
+		id := nMutators + nWatchers + i
+		startClient(id, e2eAuthDropper, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nRevoked; i++ {
+		id := nMutators + nWatchers + nDroppers + i
+		startClient(id, e2eAuthRevoked, roomOf(id), authorIDForMutator(id), userNameOf(id), tokenOf(id), wantBodies[roomOf(id)])
+	}
+	for i := 0; i < nOutsiders; i++ {
+		id := nMembers + i
+		startClient(id, e2eAuthOutsider, "alpha", fmt.Sprintf("outsider-%d", i), fmt.Sprintf("Outsider %d", i), fmt.Sprintf("tok-outsider-%d", i), nil)
+	}
+	for i := 0; i < nBadTokens; i++ {
+		id := nMembers + nOutsiders + i
+		startClient(id, e2eAuthBadToken, "alpha", "", "", fmt.Sprintf("no-such-token-%d", i), nil)
+	}
+	for i := 0; i < nUnauthed; i++ {
+		id := nMembers + nOutsiders + nBadTokens + i
+		startClient(id, e2eAuthUnauthed, "alpha", "", "", "", nil)
+	}
+
+	subscribed := make(chan struct{})
+	go func() {
+		barriers.subscribed.Wait()
+		close(subscribed)
+	}()
+	select {
+	case <-subscribed:
+	case <-ctx.Done():
+		for {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Error(err)
+				}
+			default:
+				t.Fatal("timed out waiting for all clients to authenticate and receive an initial query result")
+			}
+		}
+	}
+	close(barriers.goMutate)
+
+	readyToRevoke := make(chan struct{})
+	go func() {
+		barriers.readyToRevoke.Wait()
+		close(readyToRevoke)
+	}()
+	select {
+	case <-readyToRevoke:
+	case <-ctx.Done():
+		for {
+			select {
+			case err := <-errCh:
+				if err != nil {
+					t.Error(err)
+				}
+			default:
+				t.Fatal("timed out waiting for authenticated clients to converge before revoking room access")
+			}
+		}
+	}
+	for i := 0; i < nRevoked; i++ {
+		id := nMutators + nWatchers + nDroppers + i
+		member := testRoomMember{UserID: authorIDForMutator(id), RoomID: roomOf(id)}
+		if err := e.db.Delete(&member).Error; err != nil {
+			t.Fatalf("revoke room access for %s: %v", member.UserID, err)
+		}
+	}
+	close(barriers.goRevoke)
+
+	for i := 0; i < nClients; i++ {
+		select {
+		case err := <-errCh:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-ctx.Done():
+			t.Fatal("timed out waiting for concurrent authenticated clients to finish")
 		}
 	}
 }

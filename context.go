@@ -9,7 +9,8 @@ import (
 )
 
 type AuthCtx struct {
-	GetIdentity func() (string, error)
+	GetIdentity  func() (string, error)
+	ExecuteGuard func(guardName string, params map[string]interface{}) (interface{}, error)
 }
 
 type QueryCtx struct {
@@ -31,9 +32,25 @@ func (c *QueryCtx) TrackTable(tableName string) {
 
 type MutationCtx struct {
 	DB       *gorm.DB
-	AuthCtx  *AuthCtx
+	Auth     *AuthCtx
 	Params   map[string]interface{}
 	Profiler *utilities.Profiler
+}
+
+type GuardCtx struct {
+	DB           *gorm.DB
+	Auth         *AuthCtx
+	Params       map[string]interface{}
+	Profiler     *utilities.Profiler
+	Dependencies []string
+}
+
+func (c *GuardCtx) TrackCollection(tableName string, columnName string, value interface{}) {
+	c.Dependencies = append(c.Dependencies, tableName+"_"+columnName+":"+fmt.Sprint(value))
+}
+
+func (c *GuardCtx) TrackTable(tableName string) {
+	c.Dependencies = append(c.Dependencies, "table_"+tableName+":mutated")
 }
 
 type Auth interface {

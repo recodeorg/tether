@@ -27,12 +27,13 @@ type Tracker struct {
 }
 
 type Subscription struct {
-	SubID      string
-	Client     *Client
-	Query      string
-	QueryKey   string // provided by the client to help with caching
-	ParamsHash string // used for batching/deduplication on tag invalidation
-	Params     map[string]interface{}
+	SubID        string
+	Client       *Client
+	Query        string
+	LinkedSubIDs []string
+	QueryKey     string // provided by the client to help with caching
+	ParamsHash   string // used for batching/deduplication on tag invalidation
+	Params       map[string]interface{}
 }
 
 func NewTracker() *Tracker {
@@ -43,6 +44,31 @@ func NewTracker() *Tracker {
 		subToTags:     make(map[string]map[string]struct{}),
 		tagsToSubs:    make(map[string]map[string]struct{}),
 	}
+}
+
+func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardName string, params map[string]interface{}) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	querySub, ok := t.subscriptions[subID]
+	if !ok {
+		slog.Error("Tracker: Subscription not found", "subID", subID)
+		return
+	}
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		slog.Error("Tracker: Failed to marshal params", "error", err)
+		return
+	}
+	t.subscriptions[guardID] = &Subscription{
+		SubID:        guardID,
+		Client:       nil,
+		Query:        guardName,
+		LinkedSubIDs: []string{subID},
+		QueryKey:     "",
+		ParamsHash:   strconv.FormatUint(xxhash.Sum64(paramsJSON), 10),
+		Params:       params,
+	}
+	querySub.LinkedSubIDs = append(querySub.LinkedSubIDs, guardID)
 }
 
 func (t *Tracker) Track(c *Client) {
@@ -61,6 +87,11 @@ func (t *Tracker) Untrack(c *Client) {
 	}
 
 	for subID := range t.clientToSubs[c.ID] {
+		if sub, ok := t.subscriptions[subID]; ok {
+			for _, linkedID := range append([]string(nil), sub.LinkedSubIDs...) {
+				t.removeSubscription(linkedID)
+			}
+		}
 		t.removeSubscription(subID)
 	}
 	delete(t.clientToSubs, c.ID)
@@ -87,7 +118,9 @@ func (t *Tracker) removeSubscription(subID string) {
 	delete(t.subToTags, subID)
 
 	// 3. Remove from the client's personal list
-	delete(t.clientToSubs[sub.Client.ID], subID)
+	if sub.Client != nil {
+		delete(t.clientToSubs[sub.Client.ID], subID)
+	}
 
 	// 4. Finally, delete the subscription itself
 	delete(t.subscriptions, subID)
@@ -111,6 +144,15 @@ func (t *Tracker) GetAuth(clientID string) (AuthCtx, bool) {
 	}
 	slog.Error("Tracker: Client not found", "clientID", clientID)
 	return AuthCtx{}, false
+}
+
+func (t *Tracker) GetSubscription(subID string) (*Subscription, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if sub, exists := t.subscriptions[subID]; exists {
+		return sub, true
+	}
+	return nil, false
 }
 
 func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey string, params map[string]interface{}) *Subscription {
@@ -223,12 +265,65 @@ func (t *Tracker) GetAuthFingerprint(sub *Subscription) string {
 	return strings.Join(authTags, "|")
 }
 
+func (t *Tracker) GetGuardFingerprint(sub *Subscription, guardName string, paramsHash string) string {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	for tag := range t.subToTags[sub.SubID] {
+		if strings.HasPrefix(tag, "*guard_"+guardName+"_"+paramsHash+":") {
+			return tag
+		}
+	}
+	return ""
+}
+
+func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsHash string, newValue string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, exists := t.subscriptions[subID]; !exists {
+		slog.Error("Tracker: Subscription not found", "subID", subID)
+		return false
+	}
+	if t.subToTags[subID] == nil {
+		t.subToTags[subID] = make(map[string]struct{})
+	}
+
+	prefix := "*guard_" + guardName + "_" + paramsHash + ":"
+	newTag := prefix + newValue
+	var oldTag string
+	for tag := range t.subToTags[subID] {
+		if strings.HasPrefix(tag, prefix) {
+			oldTag = tag
+			break
+		}
+	}
+	if oldTag == newTag {
+		return false
+	}
+	if oldTag != "" {
+		delete(t.subToTags[subID], oldTag)
+		delete(t.tagsToSubs[oldTag], subID)
+		if len(t.tagsToSubs[oldTag]) == 0 {
+			delete(t.tagsToSubs, oldTag)
+		}
+	}
+	t.subToTags[subID][newTag] = struct{}{}
+	if _, exists := t.tagsToSubs[newTag]; !exists {
+		t.tagsToSubs[newTag] = make(map[string]struct{})
+	}
+	t.tagsToSubs[newTag][subID] = struct{}{}
+	return true
+}
+
 func (t *Tracker) GetSubscriptionsToTag(tag string) []*Subscription {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	subscriptions := make([]*Subscription, 0, len(t.tagsToSubs[tag]))
 	for subID := range t.tagsToSubs[tag] {
-		subscriptions = append(subscriptions, t.subscriptions[subID])
+		sub := t.subscriptions[subID]
+		if sub == nil {
+			continue
+		}
+		subscriptions = append(subscriptions, sub)
 	}
 	return subscriptions
 }

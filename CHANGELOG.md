@@ -2,9 +2,11 @@
 
 - Postgres support
 - Easy file uploads
-- Guards API for query and mutation auth
-- Performance profiler
 - Cron Jobs & Scheduling
+
+## [0.4.0] - 2026-09-20
+### Added
+- Guard functions for improved auth performance and safety
 
 ## [0.3.0] - 2026-09-09
 ### Added
