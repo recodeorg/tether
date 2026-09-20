@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -66,9 +67,9 @@ func (defaultAuth) VerifyToken(_ *gorm.DB, _ string) (string, time.Time, error) 
 	return "", time.Time{}, nil
 }
 
-func getIdentity(queryCtx *QueryCtx, authID string) (string, error) {
+func getIdentity(deps *[]string, authID string) (string, error) {
 	if authID != "" {
-		queryCtx.Dependencies = append(queryCtx.Dependencies, "*user_identity:"+authID)
+		*deps = append(*deps, "*user_identity:"+authID)
 	}
 	return authID, nil
 }
@@ -79,6 +80,101 @@ func executeGuard(e *Engine, guardCtx *GuardCtx, guardName string) (interface{},
 		return nil, fmt.Errorf("guard not found")
 	}
 	return guard.Func(guardCtx), nil
+}
+
+func dependenciesFromContext(v interface{}) *[]string {
+	switch ctx := v.(type) {
+	case *QueryCtx:
+		return &ctx.Dependencies
+	case *GuardCtx:
+		return &ctx.Dependencies
+	default:
+		return nil
+	}
+}
+
+func decodeGuardFingerprint(guardName, paramsHash, fingerprint string) (interface{}, error) {
+	raw := strings.TrimPrefix(fingerprint, "*guard_"+guardName+"_"+paramsHash+":")
+	var result interface{}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func (e *Engine) bindGuardAuth(guardCtx *GuardCtx, authID string) {
+	authCtx := &AuthCtx{
+		GetIdentity: func() (string, error) {
+			return getIdentity(&guardCtx.Dependencies, authID)
+		},
+	}
+	authCtx.ExecuteGuard = func(name string, params map[string]interface{}) (interface{}, error) {
+		nested := &GuardCtx{
+			DB:       e.db,
+			Auth:     authCtx,
+			Params:   params,
+			Profiler: e.Profiler,
+		}
+		return executeGuard(e, nested, name)
+	}
+	guardCtx.Auth = authCtx
+}
+
+func (e *Engine) prepareGuardCtx(params map[string]interface{}, authID, execID, actionName string) *GuardCtx {
+	guardCtx := &GuardCtx{
+		Params:       params,
+		Profiler:     e.Profiler,
+		Dependencies: []string{},
+	}
+	e.bindGuardAuth(guardCtx, authID)
+	gormCtx := context.WithValue(context.Background(), tetherCtxKey, guardCtx)
+	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
+	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, actionName)
+	guardCtx.DB = e.db.WithContext(gormCtx)
+	return guardCtx
+}
+
+// reevaluateGuard runs a guard subscription after one of its data tags changed.
+// Identity and DB dependencies stay on the guard; the attached query only
+// stores the *guard_ fingerprint used for batching. Returns the attached
+// query subscription when that fingerprint actually changed.
+func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID string) *reactivity.Subscription {
+	if len(subscription.LinkedSubIDs) == 0 {
+		return nil
+	}
+	attachedID := subscription.LinkedSubIDs[0]
+	attached, ok := e.tracker.GetSubscription(attachedID)
+	if !ok || attached.Client == nil {
+		slog.Error("Tracker: Attached subscription not found", "subID", attachedID)
+		return nil
+	}
+	auth, ok := e.tracker.GetAuth(attached.Client.ID)
+	if !ok {
+		return nil
+	}
+	guardName := subscription.Query
+	guardCtx := e.prepareGuardCtx(subscription.Params, auth.UserID, execID, guardName)
+	guardResult, err := executeGuard(e, guardCtx, guardName)
+	if err != nil {
+		slog.Error("Failed to execute guard", "error", err)
+		return nil
+	}
+	e.tracker.UpdateTags(subscription.SubID, guardCtx.Dependencies)
+	guardResultJSON, err := json.Marshal(guardResult)
+	if err != nil {
+		slog.Error("Failed to marshal guard result", "error", err)
+		return nil
+	}
+	paramsJSON, err := json.Marshal(subscription.Params)
+	if err != nil {
+		slog.Error("Failed to marshal params", "error", err)
+		return nil
+	}
+	paramsHash := xxhash.Sum64(paramsJSON)
+	if e.tracker.UpdateGuardFingerprint(attachedID, guardName, strconv.FormatUint(paramsHash, 10), string(guardResultJSON)) {
+		return attached
+	}
+	return nil
 }
 
 func NewEngine(db *gorm.DB, dbType string) *Engine {
@@ -168,8 +264,8 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 
 	// Automatically track the dependencies for the query
 	db.Callback().Query().After("gorm:query").Register("tether:auto_track", func(tx *gorm.DB) {
-		tCtx, ok := tx.Statement.Context.Value(tetherCtxKey).(*QueryCtx)
-		if !ok || tx.Statement.Dest == nil || tx.Statement.Schema == nil {
+		deps := dependenciesFromContext(tx.Statement.Context.Value(tetherCtxKey))
+		if deps == nil || tx.Statement.Dest == nil || tx.Statement.Schema == nil {
 			return
 		}
 
@@ -188,7 +284,7 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		for _, item := range items {
 			for _, field := range tx.Statement.Schema.PrimaryFields {
 				if pkVal, isZero := field.ValueOf(tx.Statement.Context, item); !isZero {
-					tCtx.Dependencies = append(tCtx.Dependencies, fmt.Sprintf("%s:%v", tableName, pkVal))
+					*deps = append(*deps, fmt.Sprintf("%s:%v", tableName, pkVal))
 				}
 			}
 		}
@@ -722,7 +818,23 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 	var unique []*reactivity.Subscription
 	for _, tag := range tags {
 		for _, subscription := range e.tracker.GetSubscriptionsToTag(tag) {
+			if subscription == nil {
+				continue
+			}
 			if _, ok := seen[subscription.SubID]; ok {
+				continue
+			}
+			if subscription.Client == nil {
+				// Guard subscriptions are per-user and cannot be batched. Re-run
+				// the guard first so the attached query's *guard_ fingerprint is
+				// current before we dedupe and execute queries.
+				seen[subscription.SubID] = struct{}{}
+				if attached := e.reevaluateGuard(subscription, execID); attached != nil {
+					if _, ok := seen[attached.SubID]; !ok {
+						seen[attached.SubID] = struct{}{}
+						unique = append(unique, attached)
+					}
+				}
 				continue
 			}
 			seen[subscription.SubID] = struct{}{}
@@ -823,38 +935,32 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	}
 	queryCtx.Auth = &AuthCtx{
 		GetIdentity: func() (string, error) {
-			return getIdentity(queryCtx, authID)
+			return getIdentity(&queryCtx.Dependencies, authID)
 		},
 		ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
-			guardFingerprint := e.tracker.GetGuardFingerprint(subscription, guardName)
-			if guardFingerprint == "" {
-				// Guard has not been executed yet, execute it and store the result
-				guardCtx := &GuardCtx{
-					DB:       e.db,
-					AuthCtx:  queryCtx.Auth,
-					Params:   params,
-					Profiler: e.Profiler,
-				}
-				result, err := executeGuard(e, guardCtx, guardName)
-				if err != nil {
-					return nil, err
-				}
-				resultJSON, err := json.Marshal(result)
-				if err != nil {
-					return nil, err
-				}
-				queryCtx.Dependencies = append(queryCtx.Dependencies, fmt.Sprintf("*guard_%s:%s", guardName, resultJSON))
-				return result, nil
-			} else {
-				// Guard has already been executed, return the result
-				filteredResult := strings.ReplaceAll(guardFingerprint, "*guard_"+guardName+":", "")
-				var result interface{}
-				err := json.Unmarshal([]byte(filteredResult), &result)
-				if err != nil {
-					return nil, err
-				}
-				return result, nil
+			paramsJSON, err := json.Marshal(params)
+			paramsHash := strconv.FormatUint(xxhash.Sum64(paramsJSON), 10)
+			guardFingerprint := e.tracker.GetGuardFingerprint(subscription, guardName, paramsHash)
+			if guardFingerprint != "" {
+				return decodeGuardFingerprint(guardName, paramsHash, guardFingerprint)
 			}
+			// First run: execute the guard, attach it as its own subscription,
+			// and store only the result fingerprint on the query so matching
+			// clients can share one batched execution.
+			guardID := uuid.NewString()
+			guardCtx := e.prepareGuardCtx(params, authID, guardID, guardName)
+			result, err := executeGuard(e, guardCtx, guardName)
+			if err != nil {
+				return nil, err
+			}
+			e.tracker.AttachGuardToSubscription(subscription.SubID, guardID, guardName, params)
+			e.tracker.UpdateTags(guardID, guardCtx.Dependencies)
+			resultJSON, err := json.Marshal(result)
+			if err != nil {
+				return nil, err
+			}
+			queryCtx.Dependencies = append(queryCtx.Dependencies, fmt.Sprintf("*guard_%s_%s:%s", guardName, paramsHash, resultJSON))
+			return result, nil
 		},
 	}
 	execID := uuid.NewString()
@@ -922,7 +1028,7 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 			return nil, fmt.Errorf("guards cannot be executed internally")
 		},
 	}
-	mutationCtx := &MutationCtx{DB: e.db, AuthCtx: authCtx, Params: params, Profiler: e.Profiler}
+	mutationCtx := &MutationCtx{DB: e.db, Auth: authCtx, Params: params, Profiler: e.Profiler}
 	execID := uuid.NewString()
 	start := time.Now()
 	result := e.mutations[mutation].Func(mutationCtx)
@@ -965,7 +1071,7 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 		// Mutations are single-fire, so no caching is needed
 		guardCtx := &GuardCtx{
 			DB:       e.db,
-			AuthCtx:  authCtx,
+			Auth:     authCtx,
 			Params:   params,
 			Profiler: e.Profiler,
 		}
@@ -976,7 +1082,7 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 		return result, nil
 	}
 
-	mutationCtx := &MutationCtx{DB: scopedDB, AuthCtx: authCtx, Params: params}
+	mutationCtx := &MutationCtx{DB: scopedDB, Auth: authCtx, Params: params}
 	start := time.Now()
 	result := e.mutations[mutation].Func(mutationCtx)
 	e.Profiler.Add(utilities.Metric{

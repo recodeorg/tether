@@ -50,7 +50,20 @@ func assertTrackerConsistent(t *testing.T, tr *Tracker) {
 			t.Errorf("subscriptions[%q] has SubID %q", subID, sub.SubID)
 		}
 		if sub.Client == nil {
-			t.Errorf("subscriptions[%q] has nil Client", subID)
+			if len(sub.LinkedSubIDs) == 0 {
+				t.Errorf("subscriptions[%q] has nil Client and no linked query", subID)
+				continue
+			}
+			for _, queryID := range sub.LinkedSubIDs {
+				q, ok := tr.subscriptions[queryID]
+				if !ok {
+					t.Errorf("guard subscription %q links to missing %q", subID, queryID)
+					continue
+				}
+				if q.Client == nil {
+					t.Errorf("guard subscription %q links to another guard %q", subID, queryID)
+				}
+			}
 			continue
 		}
 		if _, ok := tr.clients[sub.Client.ID]; !ok {
