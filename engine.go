@@ -215,6 +215,13 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			ClaimedBy:    &e.EphemeralID,
 		}
 		e.db.Create(&task)
+
+		time.AfterFunc(time.Until(timestamp), func() {
+			_, err := e.ExecuteMutationInternal(functionName, params)
+			if err != nil {
+				slog.Error("Failed to execute mutation internally", "error", err)
+			}
+		})
 	} else {
 		// if it is not due within the schedule loop interval, we simply wait for the loop to catch it
 		// it is created without a claimant so that whatever instance is alive at the time of execution can claim it
