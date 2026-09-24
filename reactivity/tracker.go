@@ -205,6 +205,11 @@ func (t *Tracker) UnsubscribeFromQuery(clientID string, query string, params map
 		slog.Debug("Tracker: Subscription not found", "subID", subID)
 		return
 	}
+	if sub, ok := t.subscriptions[subID]; ok {
+		for _, linkedID := range append([]string(nil), sub.LinkedSubIDs...) {
+			t.removeSubscription(linkedID)
+		}
+	}
 	t.removeSubscription(subID)
 	slog.Debug("Tracker: Unsubscribed from query", "query", query, "clientID", clientID, "params", params)
 }

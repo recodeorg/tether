@@ -1508,6 +1508,53 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	}
 }
 
+func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	var queryRuns atomic.Int64
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		queryRuns.Add(1)
+		room := ctx.Params["room"].(string)
+		ctx.TrackCollection("messages", "room_id", room)
+		return room
+	}, nil)
+
+	params := map[string]interface{}{"room": "lobby"}
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
+		"type":      "subscribe",
+		"location":  "getMessages",
+		"params":    params,
+		"query_key": "lobby",
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	initial := queryMessages(t, drain(client))
+	if len(initial) != 1 {
+		t.Fatalf("initial query pushes = %d, want 1", len(initial))
+	}
+	if initial[0]["query_key"] != "lobby" {
+		t.Fatalf("query_key = %v, want lobby", initial[0]["query_key"])
+	}
+
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
+		"type":      "unsubscribe",
+		"location":  "getMessages",
+		"params":    params,
+		"query_key": "lobby",
+	}); err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+
+	e.InvalidateTag("messages_room_id:lobby")
+	if got := queryMessages(t, drain(client)); len(got) != 0 {
+		t.Errorf("query pushes after unsubscribe = %d, want 0", len(got))
+	}
+	if got := queryRuns.Load(); got != 1 {
+		t.Errorf("query runs after unsubscribe = %d, want 1", got)
+	}
+}
+
 func TestOnReceiveMessageUnknownTypeDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)

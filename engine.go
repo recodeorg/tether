@@ -21,6 +21,19 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+type TetherTask struct {
+	ID           string `gorm:"primaryKey"`
+	FunctionName string `gorm:"not null"`
+	ParamsJSON   string
+	ExecuteAt    time.Time `gorm:"index"`
+	ClaimedBy    *string   `gorm:"index"`
+	LockedUntil  *time.Time
+
+	// Cron specific (Can be empty for runAfter tasks)
+	CronString   *string // e.g., "0 16 1 * *"
+	LastExecuted *time.Time
+}
+
 type Engine struct {
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
@@ -34,6 +47,7 @@ type Engine struct {
 	guards          map[string]Guard
 	websocketHelper *reactivity.WebsocketHelper
 	Profiler        *utilities.Profiler
+	EphemeralID     string
 }
 
 type Mutation struct {
@@ -49,6 +63,10 @@ type Query struct {
 type Guard struct {
 	Func func(ctx *GuardCtx) interface{}
 }
+
+const SCHEDULE_LOOP_INTERVAL = 10 * time.Second
+
+const SCHEDULE_LOOKAHEAD = 15 * time.Second
 
 type defaultAuth struct{}
 
@@ -177,6 +195,41 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 	return nil
 }
 
+func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params map[string]interface{}) (string, error) {
+	paramsJSON, err := json.Marshal(params)
+	taskID := uuid.New().String()
+	if err != nil {
+		slog.Error("Failed to marshal params", "error", err)
+		return "", err
+	}
+
+	if time.Until(timestamp) < SCHEDULE_LOOP_INTERVAL+SCHEDULE_LOOKAHEAD+(5*time.Second) {
+		// if the task is due within the schedule loop interval, we need to run it immediately
+		// the task is added to the database in case of a crash or restart, so that it is not lost
+		// it is claimed at insertion so another instance doesn't claim it before it is executed
+		task := TetherTask{
+			ID:           taskID,
+			FunctionName: functionName,
+			ParamsJSON:   string(paramsJSON),
+			ExecuteAt:    timestamp,
+			ClaimedBy:    &e.EphemeralID,
+		}
+		e.db.Create(&task)
+	} else {
+		// if it is not due within the schedule loop interval, we simply wait for the loop to catch it
+		// it is created without a claimant so that whatever instance is alive at the time of execution can claim it
+		task := TetherTask{
+			ID:           taskID,
+			FunctionName: functionName,
+			ParamsJSON:   string(paramsJSON),
+			ExecuteAt:    timestamp,
+		}
+		e.db.Create(&task)
+	}
+
+	return taskID, nil
+}
+
 func NewEngine(db *gorm.DB, dbType string) *Engine {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	tracker := reactivity.NewTracker()
@@ -194,7 +247,9 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		auth:            defaultAuth{},
 		guards:          make(map[string]Guard),
 		websocketHelper: &reactivity.WebsocketHelper{},
+		EphemeralID:     uuid.New().String(),
 	}
+	e.CreateTable("_tether_tasks", []TetherTask{}) // Create the internal table for the scheduled tasks
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
 		_, err := e.ExecuteMutationInternal(mutationName, map[string]interface{}{})
 		if err != nil {
@@ -933,6 +988,11 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		Params:       params,
 		Dependencies: []string{},
 	}
+	queryCtx.Scheduler = &SchedulerCtx{
+		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) {
+			e.scheduleTask(time.Now().Add(duration), functionName, params)
+		},
+	}
 	queryCtx.Auth = &AuthCtx{
 		GetIdentity: func() (string, error) {
 			return getIdentity(&queryCtx.Dependencies, authID)
@@ -1028,7 +1088,11 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 			return nil, fmt.Errorf("guards cannot be executed internally")
 		},
 	}
-	mutationCtx := &MutationCtx{DB: e.db, Auth: authCtx, Params: params, Profiler: e.Profiler}
+	mutationCtx := &MutationCtx{DB: e.db, Auth: authCtx, Params: params, Profiler: e.Profiler, Scheduler: &SchedulerCtx{
+		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) {
+			e.scheduleTask(time.Now().Add(duration), functionName, params)
+		},
+	}}
 	execID := uuid.NewString()
 	start := time.Now()
 	result := e.mutations[mutation].Func(mutationCtx)
@@ -1082,7 +1146,11 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 		return result, nil
 	}
 
-	mutationCtx := &MutationCtx{DB: scopedDB, Auth: authCtx, Params: params}
+	mutationCtx := &MutationCtx{DB: scopedDB, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
+		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) {
+			e.scheduleTask(time.Now().Add(duration), functionName, params)
+		},
+	}}
 	start := time.Now()
 	result := e.mutations[mutation].Func(mutationCtx)
 	e.Profiler.Add(utilities.Metric{
@@ -1128,6 +1196,18 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			return nil
 		}
 		e.ExecuteQuery(query, params, subscription, true)
+	case "unsubscribe":
+		query, ok := msg["location"].(string)
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		params, ok := msg["params"].(map[string]interface{})
+		if !ok {
+			slog.Error("Invalid message", "message", msg)
+			return nil
+		}
+		e.tracker.UnsubscribeFromQuery(clientID, query, params)
 	case "mutation":
 		mutation, ok := msg["location"].(string)
 		if !ok {
