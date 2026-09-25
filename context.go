@@ -13,9 +13,15 @@ type AuthCtx struct {
 	ExecuteGuard func(guardName string, params map[string]interface{}) (interface{}, error)
 }
 
+type SchedulerCtx struct {
+	RunAfter func(duration time.Duration, functionName string, params map[string]interface{}) (string, error)
+	Cancel   func(taskID string) bool
+}
+
 type QueryCtx struct {
 	DB           *gorm.DB
 	Auth         *AuthCtx
+	Scheduler    *SchedulerCtx
 	Params       map[string]interface{}
 	Dependencies []string
 }
@@ -31,10 +37,11 @@ func (c *QueryCtx) TrackTable(tableName string) {
 }
 
 type MutationCtx struct {
-	DB       *gorm.DB
-	Auth     *AuthCtx
-	Params   map[string]interface{}
-	Profiler *utilities.Profiler
+	DB        *gorm.DB
+	Auth      *AuthCtx
+	Scheduler *SchedulerCtx
+	Params    map[string]interface{}
+	Profiler  *utilities.Profiler
 }
 
 type GuardCtx struct {
