@@ -349,9 +349,6 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		db.InstanceSet("tether:profiler_start", time.Now())
 	}
 	invalidate := func(tx *gorm.DB) {
-		if dbType == "postgres" {
-			return
-		}
 		tags := extractMutationTags(tx)
 		execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
 		actionName, _ := tx.Statement.Context.Value(ContextKeyActionName).(string)
@@ -374,9 +371,6 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	// tracked collection field would miss the old collection. Snapshot the
 	// matching rows before the UPDATE SQL runs.
 	snapshotOld := func(tx *gorm.DB) {
-		if dbType == "postgres" {
-			return
-		}
 		snapshotOldTrackedTags(tx)
 	}
 	db.Callback().Create().Before("gorm:create").Register("tether:before_create_profiler", beforeProfiler)
