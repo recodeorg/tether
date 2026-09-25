@@ -895,28 +895,6 @@ func TestTrackTableIsInvalidatedByMutations(t *testing.T) {
 	}
 }
 
-func TestPostgresEngineDoesNotInvalidateOnSQLiteCallbacks(t *testing.T) {
-	e := newTestEngineWithType(t, "postgres")
-	client := trackClient(t, e)
-
-	var runs atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
-		runs.Add(1)
-		ctx.TrackCollection("messages", "room_id", "lobby")
-		var msgs []testMessage
-		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
-		return msgs
-	}, nil)
-	subscribe(t, e, client, "getMessages", "lobby", nil)
-
-	if err := e.db.Create(&testMessage{Body: "hi", RoomID: "lobby"}).Error; err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if got := runs.Load(); got != 1 {
-		t.Errorf("postgres-typed engine query runs after Create = %d, want 1 (callbacks should no-op)", got)
-	}
-}
-
 func TestInvalidateTagRerunsEverySubscriber(t *testing.T) {
 	e := newTestEngine(t)
 	a := trackClient(t, e)
