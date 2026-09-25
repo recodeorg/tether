@@ -285,7 +285,7 @@ func (e *Engine) RegisterCron(cronName string, cronString string, functionName s
 			"cron_string":   clause.Column{Table: "excluded", Name: "cron_string"},
 			"is_cron":       clause.Column{Table: "excluded", Name: "is_cron"},
 			"execute_at": clause.Expr{
-				SQL:  `CASE WHEN (claimed_by IS NOT NULL AND locked_until IS NOT NULL AND locked_until > ?) OR (execute_at < ? AND (last_executed IS NULL OR last_executed < execute_at)) THEN execute_at ELSE excluded.execute_at END`,
+				SQL:  `CASE WHEN (tether_tasks.claimed_by IS NOT NULL AND tether_tasks.locked_until IS NOT NULL AND tether_tasks.locked_until > ?) OR (tether_tasks.execute_at < ? AND (tether_tasks.last_executed IS NULL OR tether_tasks.last_executed < tether_tasks.execute_at)) THEN tether_tasks.execute_at ELSE excluded.execute_at END`,
 				Vars: []interface{}{now, now},
 			},
 		}),
