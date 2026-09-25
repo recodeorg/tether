@@ -2,7 +2,12 @@
 
 - Postgres support
 - Easy file uploads
-- Cron Jobs & Scheduling
+
+## [0.5.0] - 2026-09-25
+### Added
+- ctx.Scheduler.RunAfter() for scheduling mutation calls in the future
+- ctx.Scheduler.Cancel() for canceling said scheduled calls
+- engine.RegisterCron() for registering recurring cron jobs
 
 ## [0.4.0] - 2026-09-20
 ### Added
