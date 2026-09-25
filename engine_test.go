@@ -76,13 +76,6 @@ func (a *stubAuth) VerifyToken(db *gorm.DB, token string) (string, time.Time, er
 	return a.userID, a.expiresAt, nil
 }
 
-func testDBType() string {
-	if *usePostgres {
-		return "postgres"
-	}
-	return "sqlite"
-}
-
 func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
 	if *usePostgres {
@@ -151,10 +144,10 @@ func dropPostgresSchema(schema string) {
 
 func newTestEngine(t *testing.T) *Engine {
 	t.Helper()
-	return newTestEngineWithType(t, testDBType())
+	return newTestEngineWithType(t)
 }
 
-func newTestEngineWithType(t *testing.T, dbType string) *Engine {
+func newTestEngineWithType(t *testing.T) *Engine {
 	t.Helper()
 	e := NewEngine(newTestDB(t))
 	e.CreateTable("messages", &testMessage{})

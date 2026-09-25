@@ -15,9 +15,11 @@ import (
 
 	"github.com/cespare/xxhash"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/recodeorg/tether/reactivity"
 	"github.com/recodeorg/tether/utilities"
 	"github.com/robfig/cron/v3"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -313,6 +315,13 @@ func calculateNextCronTime(cronString string, fromTime time.Time) time.Time {
 	return schedule.Next(fromTime)
 }
 
+func getPostgresDSN(db *gorm.DB) (string, error) {
+	if dia, ok := db.Dialector.(*postgres.Dialector); ok {
+		return dia.Config.DSN, nil
+	}
+	return "", fmt.Errorf("dialector is not *postgres.Dialector")
+}
+
 func NewEngine(db *gorm.DB) *Engine {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	tracker := reactivity.NewTracker()
@@ -337,6 +346,15 @@ func NewEngine(db *gorm.DB) *Engine {
 	// scheduler initialization
 	e.CreateTable("_tether_tasks", []TetherTask{}) // Create the internal table for the scheduled tasks
 	e.startScheduler(context.Background())
+
+	if e.dbType == "postgres" {
+		dsn, err := getPostgresDSN(db)
+		if err != nil {
+			slog.Error("Failed to get PostgreSQL DSN", "error", err)
+			return nil
+		}
+		e.startPostgresListener(context.Background(), dsn)
+	}
 
 	// profiler initialization
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
@@ -364,6 +382,17 @@ func NewEngine(db *gorm.DB) *Engine {
 					Duration: time.Since(startTime.(time.Time)),
 					Tags:     tags,
 				})
+			}
+		}
+		if e.dbType == "postgres" {
+			joinedTags := strings.Join(tags, ",")
+			payload := fmt.Sprintf("%s|%s", e.EphemeralID, joinedTags)
+
+			if len(payload) < 8000 {
+				e.db.Exec("SELECT pg_notify('tether_sync', ?)", payload)
+			} else {
+				// TODO: send the payload in chunks
+				slog.Error("Payload too large to send via PostgreSQL notification", "payload", payload)
 			}
 		}
 		e.InvalidateTags(tags, execID, actionName)
@@ -429,6 +458,50 @@ func NewEngine(db *gorm.DB) *Engine {
 		}
 	})
 	return e
+}
+
+func (e *Engine) startPostgresListener(ctx context.Context, dsn string) {
+	go func() {
+		for {
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				slog.Error("Failed to connect to PostgreSQL", "error", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			_, err = conn.Exec(ctx, "LISTEN tether_sync")
+			if err != nil {
+				slog.Error("Failed to listen to PostgreSQL", "error", err)
+				conn.Close(ctx)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			slog.Info("Connected to Postgres pub/sub channel")
+
+			for {
+				notification, err := conn.WaitForNotification(ctx)
+				if err != nil {
+					slog.Error("Postgres notification error, reconnecting", "error", err)
+					conn.Close(ctx)
+					break
+				}
+
+				parts := strings.SplitN(notification.Payload, "|", 2)
+				if len(parts) != 2 {
+					slog.Error("Invalid payload format", "payload", notification.Payload)
+					continue
+				}
+				senderID, tags := parts[0], parts[1]
+
+				if senderID != e.EphemeralID {
+					remoteTags := strings.Split(tags, ",")
+					uniqueID := uuid.New().String()
+					e.InvalidateTags(remoteTags, senderID+"|"+uniqueID, "remote_update") // TODO: forward execID and actionName from the sender for better profiling
+				}
+			}
+		}
+	}()
 }
 
 func (e *Engine) startScheduler(ctx context.Context) {
