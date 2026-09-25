@@ -525,7 +525,12 @@ func (e *Engine) pollScheduledTasks() {
 	now := time.Now()
 
 	var tasks []TetherTask
-	err := e.db.Where("execute_at <= ? AND (claimed_by IS NULL or locked_until IS NULL or locked_until <= ?)", lookAhead, now).Find(&tasks).Error
+	q := e.db.Where("execute_at <= ? AND (claimed_by IS NULL or locked_until IS NULL or locked_until <= ?)", lookAhead, now)
+
+	if e.dbType == "postgres" {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+	}
+	err := q.Find(&tasks).Error
 	if err != nil {
 		slog.Error("Failed to poll scheduled tasks", "error", err)
 		return
