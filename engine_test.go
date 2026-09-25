@@ -32,7 +32,7 @@ import (
 )
 
 // postgresTestDSN is the server used when tests are run with -postgres.
-const postgresTestDSN = "host=localhost user=postgres password=secret dbname=mydb port=5432 sslmode=disable"
+const postgresTestDSN = "host=cheetah user=postgres password=secret dbname=mydb port=5432 sslmode=disable"
 
 // usePostgres swaps the engine test suite from in-memory SQLite to Postgres.
 var usePostgres = flag.Bool("postgres", false, "run the engine test suite against Postgres instead of SQLite")
@@ -156,7 +156,7 @@ func newTestEngine(t *testing.T) *Engine {
 
 func newTestEngineWithType(t *testing.T, dbType string) *Engine {
 	t.Helper()
-	e := NewEngine(newTestDB(t), dbType)
+	e := NewEngine(newTestDB(t))
 	e.CreateTable("messages", &testMessage{})
 	return e
 }
@@ -440,15 +440,6 @@ func captureMutationTags(t *testing.T, db *gorm.DB) *[]string {
 	return &tags
 }
 
-func TestNewEngineRejectsInvalidDBType(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("NewEngine(\"mysql\") did not panic")
-		}
-	}()
-	NewEngine(newTestDB(t), "mysql")
-}
-
 func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 	for _, dbType := range []string{"sqlite", "postgres"} {
 		t.Run(dbType, func(t *testing.T) {
@@ -457,7 +448,7 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 					t.Fatalf("NewEngine(%q) panicked: %v", dbType, r)
 				}
 			}()
-			_ = NewEngine(newTestDB(t), dbType)
+			_ = NewEngine(newTestDB(t))
 		})
 	}
 }
@@ -1882,7 +1873,7 @@ func newConcurrentTestEngine(t *testing.T) *Engine {
 		t.Cleanup(func() { _ = sqlDB.Close() })
 	}
 
-	e := NewEngine(db, testDBType())
+	e := NewEngine(db)
 	e.CreateTable("messages", &testMessage{})
 	e.SetCheckOrigin(func(*http.Request) bool { return true })
 	return e

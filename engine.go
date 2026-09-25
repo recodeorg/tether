@@ -313,9 +313,10 @@ func calculateNextCronTime(cronString string, fromTime time.Time) time.Time {
 	return schedule.Next(fromTime)
 }
 
-func NewEngine(db *gorm.DB, dbType string) *Engine {
+func NewEngine(db *gorm.DB) *Engine {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	tracker := reactivity.NewTracker()
+	dbType := db.Dialector.Name()
 	if dbType != "sqlite" && dbType != "postgres" {
 		panic("Invalid database type")
 	}
