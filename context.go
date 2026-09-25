@@ -14,7 +14,8 @@ type AuthCtx struct {
 }
 
 type SchedulerCtx struct {
-	RunAfter func(duration time.Duration, functionName string, params map[string]interface{})
+	RunAfter func(duration time.Duration, functionName string, params map[string]interface{}) (string, error)
+	Cancel   func(taskID string) bool
 }
 
 type QueryCtx struct {

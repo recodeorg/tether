@@ -94,6 +94,180 @@ func newTestEngineWithType(t *testing.T, dbType string) *Engine {
 	return e
 }
 
+func TestRegisterCronUpsertsByName(t *testing.T) {
+	e := newTestEngine(t)
+
+	id, err := e.RegisterCron("cleanup", "0 0 1 1 *", "cleanupOld", map[string]interface{}{"days": 7})
+	if err != nil {
+		t.Fatalf("first register: %v", err)
+	}
+	executed := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", id).Update("last_executed", executed).Error; err != nil {
+		t.Fatalf("set last_executed: %v", err)
+	}
+	var before TetherTask
+	if err := e.db.First(&before, "id = ?", id).Error; err != nil {
+		t.Fatalf("load cron: %v", err)
+	}
+
+	again, err := e.RegisterCron("cleanup", "15 4 * * *", "cleanupNew", map[string]interface{}{"days": 30})
+	if err != nil {
+		t.Fatalf("second register: %v", err)
+	}
+	if again != id {
+		t.Fatalf("upsert returned %s, want existing id %s", again, id)
+	}
+
+	var crons []TetherTask
+	if err := e.db.Where("is_cron = ?", true).Find(&crons).Error; err != nil {
+		t.Fatalf("find crons: %v", err)
+	}
+	if len(crons) != 1 {
+		t.Fatalf("cron rows = %d, want 1", len(crons))
+	}
+	got := crons[0]
+	if got.ID != id || got.FunctionName != "cleanupNew" || got.ParamsJSON != `{"days":30}` {
+		t.Fatalf("updated cron = %+v", got)
+	}
+	if got.CronString == nil || *got.CronString != "15 4 * * *" {
+		t.Fatalf("cron string = %v", got.CronString)
+	}
+	if got.LastExecuted == nil || !got.LastExecuted.Equal(executed) {
+		t.Fatalf("last_executed = %v, want %v", got.LastExecuted, executed)
+	}
+	if got.ExecuteAt.Equal(before.ExecuteAt) {
+		t.Fatalf("idle cron execute_at stayed %v, want a recalculated time", got.ExecuteAt)
+	}
+
+	if _, err := e.RegisterCron("other", "0 0 1 1 *", "otherFn", nil); err != nil {
+		t.Fatalf("register other: %v", err)
+	}
+	var count int64
+	if err := e.db.Model(&TetherTask{}).Where("is_cron = ?", true).Count(&count).Error; err != nil {
+		t.Fatalf("count crons: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("cron rows = %d, want 2", count)
+	}
+
+	if _, err := e.scheduleTask(time.Now().Add(time.Hour), "later", nil); err != nil {
+		t.Fatalf("schedule task: %v", err)
+	}
+	if _, err := e.scheduleTask(time.Now().Add(2*time.Hour), "later", nil); err != nil {
+		t.Fatalf("schedule second task: %v", err)
+	}
+}
+
+func TestRegisterCronKeepsExecuteAtWhenClaimedOrOverdue(t *testing.T) {
+	e := newTestEngine(t)
+
+	id, err := e.RegisterCron("cleanup", "0 0 1 1 *", "cleanupOld", map[string]interface{}{"days": 7})
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	claimedBy := "other-instance"
+	lockedUntil := time.Now().Add(5 * time.Minute).Truncate(time.Second)
+	claimedAt := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"claimed_by":   claimedBy,
+		"locked_until": lockedUntil,
+		"execute_at":   claimedAt,
+	}).Error; err != nil {
+		t.Fatalf("claim cron: %v", err)
+	}
+
+	if _, err := e.RegisterCron("cleanup", "15 4 * * *", "cleanupNew", map[string]interface{}{"days": 30}); err != nil {
+		t.Fatalf("register while claimed: %v", err)
+	}
+	got := loadCron(t, e, id)
+	if !sameSecond(got.ExecuteAt, claimedAt) {
+		t.Fatalf("claimed execute_at = %v, want %v", got.ExecuteAt, claimedAt)
+	}
+	if got.ClaimedBy == nil || *got.ClaimedBy != claimedBy {
+		t.Fatalf("claimed_by = %v", got.ClaimedBy)
+	}
+	if got.LockedUntil == nil || !got.LockedUntil.Equal(lockedUntil) {
+		t.Fatalf("locked_until = %v, want %v", got.LockedUntil, lockedUntil)
+	}
+	if got.CronString == nil || *got.CronString != "15 4 * * *" || got.FunctionName != "cleanupNew" {
+		t.Fatalf("claimed cron definition = %+v", got)
+	}
+
+	overdueAt := time.Now().Add(-time.Minute).Truncate(time.Second)
+	lastExecuted := overdueAt.Add(-time.Hour)
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"claimed_by":    nil,
+		"locked_until":  nil,
+		"execute_at":    overdueAt,
+		"last_executed": lastExecuted,
+	}).Error; err != nil {
+		t.Fatalf("mark overdue: %v", err)
+	}
+	if _, err := e.RegisterCron("cleanup", "30 5 * * *", "cleanupOverdue", map[string]interface{}{"days": 1}); err != nil {
+		t.Fatalf("register while overdue: %v", err)
+	}
+	got = loadCron(t, e, id)
+	if !sameSecond(got.ExecuteAt, overdueAt) {
+		t.Fatalf("overdue execute_at = %v, want %v", got.ExecuteAt, overdueAt)
+	}
+	if got.CronString == nil || *got.CronString != "30 5 * * *" || got.FunctionName != "cleanupOverdue" {
+		t.Fatalf("overdue cron definition = %+v", got)
+	}
+	if got.LastExecuted == nil || !got.LastExecuted.Equal(lastExecuted) {
+		t.Fatalf("last_executed = %v, want %v", got.LastExecuted, lastExecuted)
+	}
+
+	// A never-run slot that is already due is still owed.
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"execute_at":    overdueAt,
+		"last_executed": nil,
+	}).Error; err != nil {
+		t.Fatalf("clear last_executed: %v", err)
+	}
+	if _, err := e.RegisterCron("cleanup", "45 6 * * *", "cleanupNeverRun", nil); err != nil {
+		t.Fatalf("register never-run overdue: %v", err)
+	}
+	got = loadCron(t, e, id)
+	if !sameSecond(got.ExecuteAt, overdueAt) {
+		t.Fatalf("never-run execute_at = %v, want %v", got.ExecuteAt, overdueAt)
+	}
+
+	// An expired lease is not a current claim, so a future slot can move.
+	expired := time.Now().Add(-time.Minute).Truncate(time.Second)
+	future := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", id).Updates(map[string]interface{}{
+		"claimed_by":   claimedBy,
+		"locked_until": expired,
+		"execute_at":   future,
+	}).Error; err != nil {
+		t.Fatalf("expire claim: %v", err)
+	}
+	if _, err := e.RegisterCron("cleanup", "0 7 * * *", "cleanupExpired", nil); err != nil {
+		t.Fatalf("register after expired claim: %v", err)
+	}
+	got = loadCron(t, e, id)
+	if sameSecond(got.ExecuteAt, future) {
+		t.Fatalf("expired claim kept execute_at %v", got.ExecuteAt)
+	}
+	if got.ClaimedBy == nil || *got.ClaimedBy != claimedBy {
+		t.Fatalf("expired claim cleared claimed_by: %v", got.ClaimedBy)
+	}
+}
+
+func loadCron(t *testing.T, e *Engine, id string) TetherTask {
+	t.Helper()
+	var got TetherTask
+	if err := e.db.First(&got, "id = ?", id).Error; err != nil {
+		t.Fatalf("load cron: %v", err)
+	}
+	return got
+}
+
+func sameSecond(a, b time.Time) bool {
+	return a.Truncate(time.Second).Equal(b.Truncate(time.Second))
+}
+
 func trackClient(t *testing.T, e *Engine) *reactivity.Client {
 	t.Helper()
 	client := reactivity.NewClient(nil)

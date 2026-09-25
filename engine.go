@@ -17,12 +17,14 @@ import (
 	"github.com/google/uuid"
 	"github.com/recodeorg/tether/reactivity"
 	"github.com/recodeorg/tether/utilities"
+	"github.com/robfig/cron/v3"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 type TetherTask struct {
 	ID           string `gorm:"primaryKey"`
+	Name         string `gorm:"uniqueIndex:idx_tether_cron_name,where:is_cron = true"` // unique among crons; one-shot tasks leave this empty
 	FunctionName string `gorm:"not null"`
 	ParamsJSON   string
 	ExecuteAt    time.Time `gorm:"index"`
@@ -32,6 +34,7 @@ type TetherTask struct {
 	// Cron specific (Can be empty for runAfter tasks)
 	CronString   *string // e.g., "0 16 1 * *"
 	LastExecuted *time.Time
+	IsCron       bool
 }
 
 type Engine struct {
@@ -45,6 +48,8 @@ type Engine struct {
 	tracker         *reactivity.Tracker
 	auth            Auth
 	guards          map[string]Guard
+	timerMutex      sync.RWMutex
+	taskToTimer     map[string]*time.Timer
 	websocketHelper *reactivity.WebsocketHelper
 	Profiler        *utilities.Profiler
 	EphemeralID     string
@@ -215,6 +220,7 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			ExecuteAt:    timestamp,
 			ClaimedBy:    &e.EphemeralID,
 			LockedUntil:  &lockedUntil,
+			IsCron:       false,
 		}
 		err := e.db.Create(&task).Error
 		if err != nil {
@@ -222,13 +228,16 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			return "", err
 		}
 
-		time.AfterFunc(time.Until(timestamp), func() {
+		timer := time.AfterFunc(time.Until(timestamp), func() {
 			defer e.db.Delete(&TetherTask{}, "id = ?", taskID)
 			_, err := e.ExecuteMutationInternal(functionName, params)
 			if err != nil {
 				slog.Error("Failed to execute mutation internally", "error", err)
 			}
 		})
+		e.timerMutex.Lock()
+		e.taskToTimer[taskID] = timer
+		e.timerMutex.Unlock()
 	} else {
 		// if it is not due within the schedule loop interval, we simply wait for the loop to catch it
 		// it is created without a claimant so that whatever instance is alive at the time of execution can claim it
@@ -237,11 +246,71 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			FunctionName: functionName,
 			ParamsJSON:   string(paramsJSON),
 			ExecuteAt:    timestamp,
+			IsCron:       false,
 		}
 		e.db.Create(&task)
 	}
 
 	return taskID, nil
+}
+
+func (e *Engine) RegisterCron(cronName string, cronString string, functionName string, params map[string]interface{}) (string, error) {
+	paramsJSON, err := json.Marshal(params)
+	if err != nil {
+		slog.Error("Failed to marshal params", "error", err)
+		return "", err
+	}
+	now := time.Now()
+	task := TetherTask{
+		ID:           uuid.New().String(),
+		Name:         cronName,
+		FunctionName: functionName,
+		ParamsJSON:   string(paramsJSON),
+		ExecuteAt:    calculateNextCronTime(cronString, now),
+		IsCron:       true,
+		CronString:   &cronString,
+	}
+	// Conflict target matches idx_tether_cron_name. ID, claim, and last_executed stay on the existing row.
+	// execute_at is decided in the upsert so two instances cannot both move a row that one of them
+	// already holds, or that is still owed. A live lease matches the scheduler's claim predicate.
+	// Overdue means now is past execute_at and this occurrence has not run yet.
+	err = e.db.Clauses(clause.OnConflict{
+		Columns: []clause.Column{{Name: "name"}},
+		TargetWhere: clause.Where{Exprs: []clause.Expression{
+			clause.Expr{SQL: "is_cron = true"},
+		}},
+		DoUpdates: clause.Assignments(map[string]interface{}{
+			"function_name": clause.Column{Table: "excluded", Name: "function_name"},
+			"params_json":   clause.Column{Table: "excluded", Name: "params_json"},
+			"cron_string":   clause.Column{Table: "excluded", Name: "cron_string"},
+			"is_cron":       clause.Column{Table: "excluded", Name: "is_cron"},
+			"execute_at": clause.Expr{
+				SQL:  `CASE WHEN (claimed_by IS NOT NULL AND locked_until IS NOT NULL AND locked_until > ?) OR (execute_at < ? AND (last_executed IS NULL OR last_executed < execute_at)) THEN execute_at ELSE excluded.execute_at END`,
+				Vars: []interface{}{now, now},
+			},
+		}),
+	}).Create(&task).Error
+	if err != nil {
+		slog.Error("Failed to register cron", "error", err, "name", cronName)
+		return "", err
+	}
+	// Create keeps the UUID from the insert attempt. On conflict the stored row still has its original id.
+	var id string
+	if err := e.db.Model(&TetherTask{}).Where("name = ? AND is_cron = ?", cronName, true).Pluck("id", &id).Error; err != nil {
+		slog.Error("Failed to load cron id", "error", err, "name", cronName)
+		return "", err
+	}
+	return id, nil
+}
+
+func calculateNextCronTime(cronString string, fromTime time.Time) time.Time {
+	cron := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+	schedule, err := cron.Parse(cronString)
+	if err != nil {
+		slog.Error("Failed to parse cron string", "error", err)
+		return time.Time{}
+	}
+	return schedule.Next(fromTime)
 }
 
 func NewEngine(db *gorm.DB, dbType string) *Engine {
@@ -260,6 +329,7 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		tracker:         tracker,
 		auth:            defaultAuth{},
 		guards:          make(map[string]Guard),
+		taskToTimer:     make(map[string]*time.Timer),
 		websocketHelper: &reactivity.WebsocketHelper{},
 		EphemeralID:     uuid.New().String(),
 	}
@@ -418,14 +488,50 @@ func (e *Engine) pollScheduledTasks() {
 		var params map[string]interface{}
 		_ = json.Unmarshal([]byte(t.ParamsJSON), &params)
 
-		time.AfterFunc(delay, func() {
-			defer e.db.Delete(&TetherTask{}, "id = ?", t.ID)
+		timer := time.AfterFunc(delay, func() {
+			defer func() {
+				if err := recover(); err != nil {
+					slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
+				}
+				if t.IsCron && t.CronString != nil && *t.CronString != "" {
+					nextTime := calculateNextCronTime(*t.CronString, time.Now())
+					e.db.Model(&TetherTask{}).Where("id = ?", t.ID).Updates(map[string]interface{}{
+						"execute_at":    nextTime,
+						"claimed_by":    nil,
+						"locked_until":  nil,
+						"last_executed": time.Now(),
+					})
+				} else {
+					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
+				}
+			}()
 			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
 			if err != nil {
 				slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
 			}
 		})
+		e.timerMutex.Lock()
+		e.taskToTimer[t.ID] = timer
+		e.timerMutex.Unlock()
 	}
+}
+
+func (e *Engine) cancelTask(taskID string) bool {
+	err := e.db.Delete(&TetherTask{}, "id = ?", taskID).Error
+	if err != nil {
+		slog.Error("Failed to cancel task", "taskID", taskID, "error", err)
+		return false
+	}
+	e.timerMutex.Lock()
+	if timer, ok := e.taskToTimer[taskID]; ok {
+		stopped := timer.Stop()
+		delete(e.taskToTimer, taskID)
+		if !stopped {
+			return false
+		}
+	}
+	e.timerMutex.Unlock()
+	return true
 }
 
 // Helper function to extract the tags for a mutation
@@ -1070,8 +1176,11 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		Dependencies: []string{},
 	}
 	queryCtx.Scheduler = &SchedulerCtx{
-		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) {
-			e.scheduleTask(time.Now().Add(duration), functionName, params)
+		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
+			return e.scheduleTask(time.Now().Add(duration), functionName, params)
+		},
+		Cancel: func(taskID string) bool {
+			return e.cancelTask(taskID)
 		},
 	}
 	queryCtx.Auth = &AuthCtx{
@@ -1170,8 +1279,11 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 		},
 	}
 	mutationCtx := &MutationCtx{DB: e.db, Auth: authCtx, Params: params, Profiler: e.Profiler, Scheduler: &SchedulerCtx{
-		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) {
-			e.scheduleTask(time.Now().Add(duration), functionName, params)
+		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
+			return e.scheduleTask(time.Now().Add(duration), functionName, params)
+		},
+		Cancel: func(taskID string) bool {
+			return e.cancelTask(taskID)
 		},
 	}}
 	execID := uuid.NewString()
@@ -1228,8 +1340,11 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	}
 
 	mutationCtx := &MutationCtx{DB: scopedDB, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
-		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) {
-			e.scheduleTask(time.Now().Add(duration), functionName, params)
+		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
+			return e.scheduleTask(time.Now().Add(duration), functionName, params)
+		},
+		Cancel: func(taskID string) bool {
+			return e.cancelTask(taskID)
 		},
 	}}
 	start := time.Now()
