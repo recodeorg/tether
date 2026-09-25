@@ -207,16 +207,23 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 		// if the task is due within the schedule loop interval, we need to run it immediately
 		// the task is added to the database in case of a crash or restart, so that it is not lost
 		// it is claimed at insertion so another instance doesn't claim it before it is executed
+		lockedUntil := time.Now().Add(5 * time.Minute)
 		task := TetherTask{
 			ID:           taskID,
 			FunctionName: functionName,
 			ParamsJSON:   string(paramsJSON),
 			ExecuteAt:    timestamp,
 			ClaimedBy:    &e.EphemeralID,
+			LockedUntil:  &lockedUntil,
 		}
-		e.db.Create(&task)
+		err := e.db.Create(&task).Error
+		if err != nil {
+			slog.Error("Failed to create scheduled task", "error", err)
+			return "", err
+		}
 
 		time.AfterFunc(time.Until(timestamp), func() {
+			defer e.db.Delete(&TetherTask{}, "id = ?", taskID)
 			_, err := e.ExecuteMutationInternal(functionName, params)
 			if err != nil {
 				slog.Error("Failed to execute mutation internally", "error", err)
@@ -256,7 +263,11 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		websocketHelper: &reactivity.WebsocketHelper{},
 		EphemeralID:     uuid.New().String(),
 	}
+	// scheduler initialization
 	e.CreateTable("_tether_tasks", []TetherTask{}) // Create the internal table for the scheduled tasks
+	e.startScheduler(context.Background())
+
+	// profiler initialization
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
 		_, err := e.ExecuteMutationInternal(mutationName, map[string]interface{}{})
 		if err != nil {
@@ -303,6 +314,7 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	db.Callback().Delete().Before("gorm:delete").Register("tether:before_delete_profiler", beforeProfiler)
 	db.Callback().Query().Before("gorm:query").Register("tether:before_query_profiler", beforeProfiler)
 
+	// GORM callbacks for invalidation
 	db.Callback().Create().After("gorm:create").Register("tether:after_create", invalidate)
 	db.Callback().Update().Before("gorm:update").Register("tether:before_update", snapshotOld)
 	db.Callback().Update().After("gorm:update").Register("tether:after_update", invalidate)
@@ -352,6 +364,68 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		}
 	})
 	return e
+}
+
+func (e *Engine) startScheduler(ctx context.Context) {
+	slog.Debug("Starting scheduler")
+	ticker := time.NewTicker(SCHEDULE_LOOP_INTERVAL)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				slog.Debug("Scheduler stopped")
+				return
+			case <-ticker.C:
+				e.pollScheduledTasks()
+			}
+		}
+	}()
+}
+
+func (e *Engine) pollScheduledTasks() {
+	lookAhead := time.Now().Add(SCHEDULE_LOOKAHEAD)
+	now := time.Now()
+
+	var tasks []TetherTask
+	err := e.db.Where("execute_at <= ? AND (claimed_by IS NULL or locked_until IS NULL or locked_until <= ?)", lookAhead, now).Find(&tasks).Error
+	if err != nil {
+		slog.Error("Failed to poll scheduled tasks", "error", err)
+		return
+	}
+
+	slog.Debug("Polled scheduled tasks", "tasks", len(tasks))
+
+	for _, task := range tasks {
+		lease := now.Add(5 * time.Minute)
+		res := e.db.Model(&TetherTask{}).Where("id = ? AND (claimed_by IS NULL or locked_until IS NULL or locked_until <= ?)", task.ID, now).Updates(map[string]interface{}{
+			"claimed_by":   e.EphemeralID,
+			"locked_until": lease,
+		})
+		if res.Error != nil {
+			slog.Error("Failed to update scheduled task", "error", res.Error)
+			continue
+		}
+		if res.RowsAffected == 0 {
+			continue // task was claimed by another instance
+		}
+
+		t := task
+		delay := time.Until(t.ExecuteAt)
+		if delay < 0 {
+			delay = 0 // overdue, run immediately
+		}
+
+		var params map[string]interface{}
+		_ = json.Unmarshal([]byte(t.ParamsJSON), &params)
+
+		time.AfterFunc(delay, func() {
+			defer e.db.Delete(&TetherTask{}, "id = ?", t.ID)
+			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
+			if err != nil {
+				slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
+			}
+		})
+	}
 }
 
 // Helper function to extract the tags for a mutation
