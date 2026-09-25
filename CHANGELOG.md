@@ -1,7 +1,15 @@
 ## [Unreleased]
 
-- Postgres support
 - Easy file uploads
+
+## [0.6.0] - 2026-09-25
+### Added
+- Postgres support
+- An optional -postgres flag for running tests with a provided postgres instance
+- Horizontal scaling using listen/notify as a pub/sub
+
+### Changed
+- Removed the dbType parameter from NewEngine, it now pulls the dbType directly from GORM's Dialector
 
 ## [0.5.0] - 2026-09-25
 ### Added
