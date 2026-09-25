@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/storage"
 	"github.com/recodeorg/tether/utilities"
 	"github.com/robfig/cron/v3"
 	"gorm.io/driver/postgres"
@@ -55,6 +56,7 @@ type Engine struct {
 	websocketHelper *reactivity.WebsocketHelper
 	Profiler        *utilities.Profiler
 	EphemeralID     string
+	storage         storage.StorageAdapter
 }
 
 type Mutation struct {
@@ -1246,6 +1248,7 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	queryCtx := &QueryCtx{
 		DB:           e.db,
 		Params:       params,
+		Storage:      e.storage,
 		Dependencies: []string{},
 	}
 	queryCtx.Scheduler = &SchedulerCtx{
@@ -1351,7 +1354,7 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 			return nil, fmt.Errorf("guards cannot be executed internally")
 		},
 	}
-	mutationCtx := &MutationCtx{DB: e.db, Auth: authCtx, Params: params, Profiler: e.Profiler, Scheduler: &SchedulerCtx{
+	mutationCtx := &MutationCtx{DB: e.db, Storage: e.storage, Auth: authCtx, Params: params, Profiler: e.Profiler, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
 		},
@@ -1412,7 +1415,7 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 		return result, nil
 	}
 
-	mutationCtx := &MutationCtx{DB: scopedDB, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
+	mutationCtx := &MutationCtx{DB: scopedDB, Storage: e.storage, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
 		},
