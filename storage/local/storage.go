@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -101,88 +102,102 @@ func (l *LocalStorage) Delete(fileID string) error {
 	return nil
 }
 
-func (l *LocalStorage) MountRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/tether/storage/upload/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPut {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+func (l *LocalStorage) handleUpload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-		contentType := r.Header.Get("Content-Type")
-		if contentType == "" {
-			contentType = "application/octet-stream"
-		}
+	contentType := r.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
 
-		fileID := filepath.Base(r.URL.Path)
-		tokenData, ok := l.uploadTokens[fileID]
-		if ok {
-			delete(l.uploadTokens, fileID)
-		}
-		if !ok || time.Now().After(tokenData.ExpiresAt) {
-			http.Error(w, "Invalid file ID", http.StatusBadRequest)
-			return
-		}
+	fileID := filepath.Base(r.URL.Path)
+	l.mu.Lock()
+	tokenData, ok := l.uploadTokens[fileID]
+	if ok {
+		delete(l.uploadTokens, fileID)
+	}
+	l.mu.Unlock()
+	if !ok || time.Now().After(tokenData.ExpiresAt) {
+		http.Error(w, "Invalid file ID", http.StatusBadRequest)
+		return
+	}
 
-		r.Body = http.MaxBytesReader(w, r.Body, int64(tokenData.MaxBytes))
+	r.Body = http.MaxBytesReader(w, r.Body, int64(tokenData.MaxBytes))
 
-		dstPath := filepath.Join(l.UploadDir, fileID)
-		file, err := os.Create(dstPath)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer file.Close()
+	dstPath := filepath.Join(l.UploadDir, fileID)
+	file, err := os.Create(dstPath)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer file.Close()
 
-		_, err = io.Copy(file, r.Body)
-		if err != nil {
-			os.Remove(dstPath)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	_, err = io.Copy(file, r.Body)
+	if err != nil {
+		os.Remove(dstPath)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
-		// Create the .mime sidecar file with the content-type header
-		mimePath := dstPath + ".mime"
-		mimeFile, err := os.Create(mimePath)
-		if err != nil {
-			os.Remove(dstPath)
-			http.Error(w, "Failed to create .mime file: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		_, err = mimeFile.WriteString(contentType)
-		closeErr := mimeFile.Close()
-		if err != nil || closeErr != nil {
-			os.Remove(dstPath)
-			os.Remove(mimePath)
-			http.Error(w, "Failed to write .mime file", http.StatusInternalServerError)
-			return
-		}
+	// Create the .mime sidecar file with the content-type header
+	mimePath := dstPath + ".mime"
+	mimeFile, err := os.Create(mimePath)
+	if err != nil {
+		os.Remove(dstPath)
+		http.Error(w, "Failed to create .mime file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_, err = mimeFile.WriteString(contentType)
+	closeErr := mimeFile.Close()
+	if err != nil || closeErr != nil {
+		os.Remove(dstPath)
+		os.Remove(mimePath)
+		http.Error(w, "Failed to write .mime file", http.StatusInternalServerError)
+		return
+	}
 
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "File uploaded successfully")
-	})
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "File uploaded successfully")
+}
 
-	mux.HandleFunc("/tether/storage/file/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+func (l *LocalStorage) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-		downloadID := filepath.Base(r.URL.Path)
-		tokenData, ok := l.downloadTokens[downloadID]
-		if !ok {
-			http.Error(w, "Invalid download ID", http.StatusBadRequest)
-			return
-		}
+	downloadID := filepath.Base(r.URL.Path)
+	l.mu.RLock()
+	tokenData, ok := l.downloadTokens[downloadID]
+	l.mu.RUnlock()
+	if !ok {
+		http.Error(w, "Invalid download ID", http.StatusBadRequest)
+		return
+	}
 
-		filePath := filepath.Join(l.UploadDir, tokenData.FileID)
-		mimePath := filePath + ".mime"
-		if _, err := os.Stat(mimePath); err == nil {
-			mimeContent, err := os.ReadFile(mimePath)
-			if err == nil {
-				contentType := string(mimeContent)
-				w.Header().Set("Content-Type", contentType)
-			}
+	filePath := filepath.Join(l.UploadDir, tokenData.FileID)
+	mimePath := filePath + ".mime"
+	if _, err := os.Stat(mimePath); err == nil {
+		mimeContent, err := os.ReadFile(mimePath)
+		if err == nil {
+			contentType := string(mimeContent)
+			w.Header().Set("Content-Type", contentType)
 		}
-		http.ServeFile(w, r, filePath)
-	})
+	}
+	http.ServeFile(w, r, filePath)
+}
+
+func (l *LocalStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) bool {
+	if strings.HasPrefix(r.URL.Path, "/tether/storage/upload/") {
+		l.handleUpload(w, r)
+		return true
+	}
+	if strings.HasPrefix(r.URL.Path, "/tether/storage/file/") {
+		l.handleDownload(w, r)
+		return true
+	}
+	return false
 }

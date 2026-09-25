@@ -1089,6 +1089,11 @@ func (e *Engine) CreateTable(name string, schema interface{}) {
 }
 
 func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
+	if e.storage != nil {
+		if handled := e.storage.ServeHTTP(w, r); handled {
+			return // this request was handled by the storage adapter
+		}
+	}
 	reactivity.Handle(w, r, e, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
 }
 

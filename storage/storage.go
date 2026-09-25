@@ -15,5 +15,5 @@ type StorageAdapter interface {
 	GenerateDownload(fileID string) (url string, err error)
 	Delete(fileID string) error
 
-	MountRoutes(mux *http.ServeMux) // for local storage adapter to mount serving routes
+	ServeHTTP(w http.ResponseWriter, r *http.Request) bool // for local storage adapter to mount serving routes
 }
