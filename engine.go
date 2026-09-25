@@ -15,9 +15,11 @@ import (
 
 	"github.com/cespare/xxhash"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/recodeorg/tether/reactivity"
 	"github.com/recodeorg/tether/utilities"
 	"github.com/robfig/cron/v3"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -285,7 +287,7 @@ func (e *Engine) RegisterCron(cronName string, cronString string, functionName s
 			"cron_string":   clause.Column{Table: "excluded", Name: "cron_string"},
 			"is_cron":       clause.Column{Table: "excluded", Name: "is_cron"},
 			"execute_at": clause.Expr{
-				SQL:  `CASE WHEN (claimed_by IS NOT NULL AND locked_until IS NOT NULL AND locked_until > ?) OR (execute_at < ? AND (last_executed IS NULL OR last_executed < execute_at)) THEN execute_at ELSE excluded.execute_at END`,
+				SQL:  `CASE WHEN (tether_tasks.claimed_by IS NOT NULL AND tether_tasks.locked_until IS NOT NULL AND tether_tasks.locked_until > ?) OR (tether_tasks.execute_at < ? AND (tether_tasks.last_executed IS NULL OR tether_tasks.last_executed < tether_tasks.execute_at)) THEN tether_tasks.execute_at ELSE excluded.execute_at END`,
 				Vars: []interface{}{now, now},
 			},
 		}),
@@ -313,9 +315,17 @@ func calculateNextCronTime(cronString string, fromTime time.Time) time.Time {
 	return schedule.Next(fromTime)
 }
 
-func NewEngine(db *gorm.DB, dbType string) *Engine {
+func getPostgresDSN(db *gorm.DB) (string, error) {
+	if dia, ok := db.Dialector.(*postgres.Dialector); ok {
+		return dia.Config.DSN, nil
+	}
+	return "", fmt.Errorf("dialector is not *postgres.Dialector")
+}
+
+func NewEngine(db *gorm.DB) *Engine {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 	tracker := reactivity.NewTracker()
+	dbType := db.Dialector.Name()
 	if dbType != "sqlite" && dbType != "postgres" {
 		panic("Invalid database type")
 	}
@@ -337,6 +347,15 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	e.CreateTable("_tether_tasks", []TetherTask{}) // Create the internal table for the scheduled tasks
 	e.startScheduler(context.Background())
 
+	if e.dbType == "postgres" {
+		dsn, err := getPostgresDSN(db)
+		if err != nil {
+			slog.Error("Failed to get PostgreSQL DSN", "error", err)
+			return nil
+		}
+		e.startPostgresListener(context.Background(), dsn)
+	}
+
 	// profiler initialization
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
 		_, err := e.ExecuteMutationInternal(mutationName, map[string]interface{}{})
@@ -349,9 +368,6 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 		db.InstanceSet("tether:profiler_start", time.Now())
 	}
 	invalidate := func(tx *gorm.DB) {
-		if dbType == "postgres" {
-			return
-		}
 		tags := extractMutationTags(tx)
 		execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
 		actionName, _ := tx.Statement.Context.Value(ContextKeyActionName).(string)
@@ -368,15 +384,23 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 				})
 			}
 		}
+		if e.dbType == "postgres" {
+			joinedTags := strings.Join(tags, ",")
+			payload := fmt.Sprintf("%s|%s", e.EphemeralID, joinedTags)
+
+			if len(payload) < 8000 {
+				e.db.Exec("SELECT pg_notify('tether_sync', ?)", payload)
+			} else {
+				// TODO: send the payload in chunks
+				slog.Error("Payload too large to send via PostgreSQL notification", "payload", payload)
+			}
+		}
 		e.InvalidateTags(tags, execID, actionName)
 	}
 	// GORM callbacks only see the post-update Dest, so a Save that moves a
 	// tracked collection field would miss the old collection. Snapshot the
 	// matching rows before the UPDATE SQL runs.
 	snapshotOld := func(tx *gorm.DB) {
-		if dbType == "postgres" {
-			return
-		}
 		snapshotOldTrackedTags(tx)
 	}
 	db.Callback().Create().Before("gorm:create").Register("tether:before_create_profiler", beforeProfiler)
@@ -436,6 +460,50 @@ func NewEngine(db *gorm.DB, dbType string) *Engine {
 	return e
 }
 
+func (e *Engine) startPostgresListener(ctx context.Context, dsn string) {
+	go func() {
+		for {
+			conn, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				slog.Error("Failed to connect to PostgreSQL", "error", err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			_, err = conn.Exec(ctx, "LISTEN tether_sync")
+			if err != nil {
+				slog.Error("Failed to listen to PostgreSQL", "error", err)
+				conn.Close(ctx)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+
+			slog.Info("Connected to Postgres pub/sub channel")
+
+			for {
+				notification, err := conn.WaitForNotification(ctx)
+				if err != nil {
+					slog.Error("Postgres notification error, reconnecting", "error", err)
+					conn.Close(ctx)
+					break
+				}
+
+				parts := strings.SplitN(notification.Payload, "|", 2)
+				if len(parts) != 2 {
+					slog.Error("Invalid payload format", "payload", notification.Payload)
+					continue
+				}
+				senderID, tags := parts[0], parts[1]
+
+				if senderID != e.EphemeralID {
+					remoteTags := strings.Split(tags, ",")
+					uniqueID := uuid.New().String()
+					e.InvalidateTags(remoteTags, senderID+"|"+uniqueID, "remote_update") // TODO: forward execID and actionName from the sender for better profiling
+				}
+			}
+		}
+	}()
+}
+
 func (e *Engine) startScheduler(ctx context.Context) {
 	slog.Debug("Starting scheduler")
 	ticker := time.NewTicker(SCHEDULE_LOOP_INTERVAL)
@@ -457,7 +525,12 @@ func (e *Engine) pollScheduledTasks() {
 	now := time.Now()
 
 	var tasks []TetherTask
-	err := e.db.Where("execute_at <= ? AND (claimed_by IS NULL or locked_until IS NULL or locked_until <= ?)", lookAhead, now).Find(&tasks).Error
+	q := e.db.Where("execute_at <= ? AND (claimed_by IS NULL or locked_until IS NULL or locked_until <= ?)", lookAhead, now)
+
+	if e.dbType == "postgres" {
+		q = q.Clauses(clause.Locking{Strength: "UPDATE", Options: "SKIP LOCKED"})
+	}
+	err := q.Find(&tasks).Error
 	if err != nil {
 		slog.Error("Failed to poll scheduled tasks", "error", err)
 		return

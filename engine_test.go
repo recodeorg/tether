@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,9 +26,18 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
 	"github.com/recodeorg/tether/utilities"
+	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
+
+// postgresTestDSN is the server used when tests are run with -postgres.
+const postgresTestDSN = "host=cheetah user=postgres password=secret dbname=mydb port=5432 sslmode=disable"
+
+// usePostgres swaps the engine test suite from in-memory SQLite to Postgres.
+var usePostgres = flag.Bool("postgres", false, "run the engine test suite against Postgres instead of SQLite")
+
+var postgresSchemaSeq atomic.Uint64
 
 func TestMain(m *testing.M) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -68,6 +78,9 @@ func (a *stubAuth) VerifyToken(db *gorm.DB, token string) (string, time.Time, er
 
 func newTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	if *usePostgres {
+		return newPostgresTestDB(t)
+	}
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -82,14 +95,61 @@ func newTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-func newTestEngine(t *testing.T) *Engine {
+// newPostgresTestDB opens the shared Postgres server and isolates this test in
+// its own schema. search_path is a startup parameter, so every pooled connection
+// sees the schema.
+func newPostgresTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	return newTestEngineWithType(t, "sqlite")
+	schema := fmt.Sprintf("tether_%d_%d", os.Getpid(), postgresSchemaSeq.Add(1))
+	db, err := gorm.Open(postgres.Open(postgresTestDSN+" search_path="+schema), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		t.Fatalf("open postgres: %v", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	if err := db.Exec("CREATE SCHEMA " + schema).Error; err != nil {
+		_ = sqlDB.Close()
+		t.Fatalf("create schema %s: %v", schema, err)
+	}
+	// database/sql's default pool is unbounded. A fresh Postgres often allows
+	// about 100 clients, and the concurrent websocket tests will open one
+	// connection per in-flight query unless this is capped.
+	sqlDB.SetMaxOpenConns(64)
+	sqlDB.SetMaxIdleConns(20)
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+		dropPostgresSchema(schema)
+	})
+	return db
 }
 
-func newTestEngineWithType(t *testing.T, dbType string) *Engine {
+func dropPostgresSchema(schema string) {
+	db, err := gorm.Open(postgres.Open(postgresTestDSN), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Silent),
+	})
+	if err != nil {
+		return
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return
+	}
+	defer sqlDB.Close()
+	_ = db.Exec("DROP SCHEMA IF EXISTS " + schema + " CASCADE").Error
+}
+
+func newTestEngine(t *testing.T) *Engine {
 	t.Helper()
-	e := NewEngine(newTestDB(t), dbType)
+	return newTestEngineWithType(t)
+}
+
+func newTestEngineWithType(t *testing.T) *Engine {
+	t.Helper()
+	e := NewEngine(newTestDB(t))
 	e.CreateTable("messages", &testMessage{})
 	return e
 }
@@ -373,15 +433,6 @@ func captureMutationTags(t *testing.T, db *gorm.DB) *[]string {
 	return &tags
 }
 
-func TestNewEngineRejectsInvalidDBType(t *testing.T) {
-	defer func() {
-		if recover() == nil {
-			t.Fatal("NewEngine(\"mysql\") did not panic")
-		}
-	}()
-	NewEngine(newTestDB(t), "mysql")
-}
-
 func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 	for _, dbType := range []string{"sqlite", "postgres"} {
 		t.Run(dbType, func(t *testing.T) {
@@ -390,7 +441,7 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 					t.Fatalf("NewEngine(%q) panicked: %v", dbType, r)
 				}
 			}()
-			_ = NewEngine(newTestDB(t), dbType)
+			_ = NewEngine(newTestDB(t))
 		})
 	}
 }
@@ -892,28 +943,6 @@ func TestTrackTableIsInvalidatedByMutations(t *testing.T) {
 	}
 	if got := runs.Load(); got != 2 {
 		t.Errorf("TrackTable query runs after Create = %d, want 2", got)
-	}
-}
-
-func TestPostgresEngineDoesNotInvalidateOnSQLiteCallbacks(t *testing.T) {
-	e := newTestEngineWithType(t, "postgres")
-	client := trackClient(t, e)
-
-	var runs atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
-		runs.Add(1)
-		ctx.TrackCollection("messages", "room_id", "lobby")
-		var msgs []testMessage
-		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
-		return msgs
-	}, nil)
-	subscribe(t, e, client, "getMessages", "lobby", nil)
-
-	if err := e.db.Create(&testMessage{Body: "hi", RoomID: "lobby"}).Error; err != nil {
-		t.Fatalf("Create: %v", err)
-	}
-	if got := runs.Load(); got != 1 {
-		t.Errorf("postgres-typed engine query runs after Create = %d, want 1 (callbacks should no-op)", got)
 	}
 }
 
@@ -1815,23 +1844,29 @@ func TestDefaultAuthVerifyToken(t *testing.T) {
 
 func newConcurrentTestEngine(t *testing.T) *Engine {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "tether.db")
-	dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Silent),
-	})
-	if err != nil {
-		t.Fatalf("open sqlite: %v", err)
+	var db *gorm.DB
+	if *usePostgres {
+		db = newPostgresTestDB(t)
+	} else {
+		path := filepath.Join(t.TempDir(), "tether.db")
+		dsn := path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+		var err error
+		db, err = gorm.Open(sqlite.Open(dsn), &gorm.Config{
+			Logger: logger.Default.LogMode(logger.Silent),
+		})
+		if err != nil {
+			t.Fatalf("open sqlite: %v", err)
+		}
+		sqlDB, err := db.DB()
+		if err != nil {
+			t.Fatalf("sql db: %v", err)
+		}
+		sqlDB.SetMaxOpenConns(1)
+		sqlDB.SetMaxIdleConns(1)
+		t.Cleanup(func() { _ = sqlDB.Close() })
 	}
-	sqlDB, err := db.DB()
-	if err != nil {
-		t.Fatalf("sql db: %v", err)
-	}
-	sqlDB.SetMaxOpenConns(1)
-	sqlDB.SetMaxIdleConns(1)
-	t.Cleanup(func() { _ = sqlDB.Close() })
 
-	e := NewEngine(db, "sqlite")
+	e := NewEngine(db)
 	e.CreateTable("messages", &testMessage{})
 	e.SetCheckOrigin(func(*http.Request) bool { return true })
 	return e
