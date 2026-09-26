@@ -365,7 +365,7 @@ func NewEngine(db *gorm.DB) *Engine {
 		EphemeralID:     uuid.New().String(),
 	}
 	// scheduler initialization
-	e.CreateTable("_tether_tasks", []TetherTask{}) // Create the internal table for the scheduled tasks
+	e.CreateTable([]TetherTask{}) // Create the internal table for the scheduled tasks
 	e.startScheduler(context.Background())
 
 	if e.dbType == "postgres" {
@@ -543,8 +543,8 @@ func (e *Engine) startScheduler(ctx context.Context) {
 
 func (e *Engine) UseStorage(storage storage.StorageAdapter) {
 	e.storage = storage
-	e.CreateTable("_tether_storage", []TetherStorage{})
-	e.CreateTable("_tether_download_tokens", []TetherDownloadToken{})
+	e.CreateTable([]TetherStorage{})
+	e.CreateTable([]TetherDownloadToken{})
 }
 
 func (e *Engine) pollScheduledTasks() {
