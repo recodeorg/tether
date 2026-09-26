@@ -155,13 +155,7 @@ func (e *Engine) bindGuardAuth(guardCtx *GuardCtx, authID string) {
 		},
 	}
 	authCtx.ExecuteGuard = func(name string, params map[string]interface{}) (interface{}, error) {
-		nested := &GuardCtx{
-			DB:       e.db,
-			Auth:     authCtx,
-			Params:   params,
-			Profiler: e.Profiler,
-		}
-		return executeGuard(e, nested, name)
+		return nil, fmt.Errorf("Guards cannot execute other guards")
 	}
 	guardCtx.Auth = authCtx
 }
@@ -1641,9 +1635,15 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	authCtx.ExecuteGuard = func(guardName string, params map[string]interface{}) (interface{}, error) {
 		// Execute the guard and return the result
 		// Mutations are single-fire, so no caching is needed
+		guardAuth := &AuthCtx{
+			GetIdentity: func() (string, error) { return authID, nil },
+			ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
+				return nil, fmt.Errorf("guards cannot execute other guards")
+			},
+		}
 		guardCtx := &GuardCtx{
 			DB:       e.db,
-			Auth:     authCtx,
+			Auth:     guardAuth,
 			Params:   params,
 			Profiler: e.Profiler,
 		}
