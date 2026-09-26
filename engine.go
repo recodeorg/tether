@@ -1089,7 +1089,7 @@ func (e *Engine) RegisterMutation(name string, mutation func(ctx *MutationCtx) i
 	slog.Debug("Registered mutation", "name", name)
 }
 
-func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, dependencies []string, opts ...QueryOptions) {
+func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, opts ...QueryOptions) {
 	options := QueryOptions{
 		Internal: false,
 	}
@@ -1097,9 +1097,6 @@ func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{
 		options = opts[0]
 	}
 	e.queries[name] = Query{Func: query, Internal: options.Internal} // stores the query in the list of valid queries
-	for _, dependency := range dependencies {
-		e.dependencies[dependency] = append(e.dependencies[dependency], name)
-	}
 	slog.Debug("Registered query", "name", name)
 }
 
@@ -1352,10 +1349,6 @@ func (e *Engine) OnDisconnect(clientID string) error {
 	slog.Debug("Disconnected from websocket", "client", clientID)
 	// TODO: implement the logic to handle the disconnection
 	return nil
-}
-
-func (e *Engine) GetDependentQueries(tableName string) []string {
-	return e.dependencies[tableName]
 }
 
 func (e *Engine) InvalidateTag(tag string) {
