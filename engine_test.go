@@ -25,6 +25,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/storage/local"
 	"github.com/recodeorg/tether/utilities"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
@@ -1798,6 +1799,197 @@ func TestSetCheckOrigin(t *testing.T) {
 	if !e.websocketHelper.CheckOrigin(&http.Request{Header: http.Header{"Origin": []string{"ok"}}}) {
 		t.Error("custom CheckOrigin rejected a valid origin")
 	}
+}
+
+func TestStorageRoutesUseCheckOrigin(t *testing.T) {
+	e := newTestEngine(t)
+	store := local.NewLocalStorage(t.TempDir(), "http://api.example")
+	e.UseStorage(store)
+	e.SetAllowedOrigins([]string{"https://app.example"})
+
+	fileID, uploadURL, _, err := store.GenerateUpload()
+	if err != nil {
+		t.Fatalf("GenerateUpload: %v", err)
+	}
+	uploadPath := strings.TrimPrefix(uploadURL, "http://api.example")
+
+	t.Run("preflight allowed", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
+			"Origin":                         "https://app.example",
+			"Access-Control-Request-Method":  "PUT",
+			"Access-Control-Request-Headers": "content-type",
+		})
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+			t.Fatalf("Allow-Origin = %q", got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "PUT") {
+			t.Fatalf("Allow-Methods = %q", got)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Headers"); got != "content-type" {
+			t.Fatalf("Allow-Headers = %q", got)
+		}
+	})
+
+	t.Run("preflight denied", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
+			"Origin": "https://evil.example",
+		})
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("denied origin received Allow-Origin %q", got)
+		}
+	})
+
+	t.Run("put denied keeps token", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodPut, uploadPath, strings.NewReader("no"), map[string]string{
+			"Origin":       "https://evil.example",
+			"Content-Type": "text/plain",
+		})
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+
+	t.Run("put allowed", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodPut, uploadPath, strings.NewReader("hello"), map[string]string{
+			"Origin":       "https://app.example",
+			"Content-Type": "text/plain",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+			t.Fatalf("Allow-Origin = %q", got)
+		}
+		body, err := os.ReadFile(filepath.Join(store.UploadDir, fileID))
+		if err != nil {
+			t.Fatalf("read upload: %v", err)
+		}
+		if string(body) != "hello" {
+			t.Fatalf("uploaded body = %q", body)
+		}
+	})
+
+	t.Run("put without origin", func(t *testing.T) {
+		_, nextURL, _, err := store.GenerateUpload()
+		if err != nil {
+			t.Fatalf("GenerateUpload: %v", err)
+		}
+		path := strings.TrimPrefix(nextURL, "http://api.example")
+		rec := serveStorage(e, http.MethodPut, path, strings.NewReader("server"), map[string]string{
+			"Content-Type": "text/plain",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("missing origin received Allow-Origin %q", got)
+		}
+	})
+
+	downloadURL, err := store.GenerateDownload(fileID)
+	if err != nil {
+		t.Fatalf("GenerateDownload: %v", err)
+	}
+	downloadPath := strings.TrimPrefix(downloadURL, "http://api.example")
+
+	t.Run("download allowed", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodGet, downloadPath, nil, map[string]string{
+			"Origin": "https://app.example",
+		})
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
+			t.Fatalf("Allow-Origin = %q", got)
+		}
+		if rec.Body.String() != "hello" {
+			t.Fatalf("download body = %q", rec.Body.String())
+		}
+	})
+
+	t.Run("download denied", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodGet, downloadPath, nil, map[string]string{
+			"Origin": "https://evil.example",
+		})
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+	})
+}
+
+func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
+	e := newTestEngine(t)
+	store := local.NewLocalStorage(t.TempDir(), "http://api.example")
+	e.UseStorage(store)
+
+	_, uploadURL, _, err := store.GenerateUpload()
+	if err != nil {
+		t.Fatalf("GenerateUpload: %v", err)
+	}
+	uploadPath := strings.TrimPrefix(uploadURL, "http://api.example")
+
+	denied := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
+		"Origin": "https://app.example",
+	})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin status = %d, want %d", denied.Code, http.StatusForbidden)
+	}
+
+	allowed := serveStorage(e, http.MethodPut, uploadPath, strings.NewReader("same"), map[string]string{
+		"Origin":       "https://example.com",
+		"Content-Type": "text/plain",
+	})
+	if allowed.Code != http.StatusOK {
+		t.Fatalf("same-origin status = %d, body %s", allowed.Code, allowed.Body.String())
+	}
+	if got := allowed.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Fatalf("Allow-Origin = %q", got)
+	}
+}
+
+func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
+	e := newTestEngine(t)
+	store := local.NewLocalStorage(t.TempDir(), "http://api.example")
+	e.UseStorage(store)
+	e.SetCheckOrigin(func(r *http.Request) bool {
+		return strings.HasSuffix(r.Header.Get("Origin"), ".example")
+	})
+
+	_, uploadURL, _, err := store.GenerateUpload()
+	if err != nil {
+		t.Fatalf("GenerateUpload: %v", err)
+	}
+	uploadPath := strings.TrimPrefix(uploadURL, "http://api.example")
+
+	allowed := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
+		"Origin": "https://app.example",
+	})
+	if allowed.Code != http.StatusNoContent {
+		t.Fatalf("allowed status = %d, want %d", allowed.Code, http.StatusNoContent)
+	}
+
+	denied := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
+		"Origin": "https://app.other",
+	})
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("denied status = %d, want %d", denied.Code, http.StatusForbidden)
+	}
+}
+
+func serveStorage(e *Engine, method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, body)
+	for key, value := range headers {
+		req.Header.Set(key, value)
+	}
+	rec := httptest.NewRecorder()
+	e.StorageHandle(rec, req)
+	return rec
 }
 
 func TestSubscribeUnknownQueryViaMessageDoesNotPanic(t *testing.T) {

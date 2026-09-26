@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"reflect"
 	"slices"
 	"strconv"
@@ -520,6 +521,10 @@ func (e *Engine) startScheduler(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (e *Engine) UseStorage(storage storage.StorageAdapter) {
+	e.storage = storage
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -1089,19 +1094,96 @@ func (e *Engine) CreateTable(name string, schema interface{}) {
 }
 
 func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
+	reactivity.Handle(w, r, e, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
+}
+
+func (e *Engine) StorageHandle(w http.ResponseWriter, r *http.Request) {
 	if e.storage != nil {
+		if matcher, ok := e.storage.(storage.Matcher); ok && matcher.Matches(r) {
+			if !e.allowStorageOrigin(w, r) {
+				return
+			}
+			// Adapters accept only the method their route serves. A browser
+			// preflight must be answered here so it never reaches them.
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+		}
 		if handled := e.storage.ServeHTTP(w, r); handled {
 			return // this request was handled by the storage adapter
 		}
 	}
-	reactivity.Handle(w, r, e, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
+	http.Error(w, "Not found", http.StatusNotFound)
 }
 
+// allowStorageOrigin applies the WebSocket origin policy to browser calls against
+// storage routes. Requests with no Origin header are allowed so non-browser
+// clients can still use an upload or download token. An allowed browser origin
+// receives the CORS headers a cross-origin upload or download needs.
+func (e *Engine) allowStorageOrigin(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if !originHeaderOK(origin) || !e.originPermitted(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return false
+	}
+	header := w.Header()
+	header.Set("Access-Control-Allow-Origin", origin)
+	header.Add("Vary", "Origin")
+	header.Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+	if requested := r.Header.Get("Access-Control-Request-Headers"); requested != "" {
+		header.Set("Access-Control-Allow-Headers", requested)
+	} else {
+		header.Set("Access-Control-Allow-Headers", "Content-Type")
+	}
+	header.Set("Access-Control-Max-Age", "600")
+	return true
+}
+
+func (e *Engine) originPermitted(r *http.Request) bool {
+	if e.websocketHelper != nil && e.websocketHelper.CheckOrigin != nil {
+		return e.websocketHelper.CheckOrigin(r)
+	}
+	return sameOrigin(r)
+}
+
+func originHeaderOK(origin string) bool {
+	if strings.ContainsAny(origin, "\r\n") {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	return parsed.Path == "" || parsed.Path == "/"
+}
+
+func sameOrigin(r *http.Request) bool {
+	parsed, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+// SetCheckOrigin sets the function that accepts or rejects browser origins.
+// It applies to WebSocket upgrades and to storage routes served by the engine.
 func (e *Engine) SetCheckOrigin(checkOrigin func(r *http.Request) bool) {
 	e.websocketHelper.CheckOrigin = checkOrigin
 }
 
-// Simple helper to set the allowed origins for the websocket connection
+// SetAllowedOrigins allows the listed origins for WebSocket upgrades and storage
+// routes. Browsers calling those storage routes from an allowed origin receive
+// the CORS headers the request needs.
 func (e *Engine) SetAllowedOrigins(allowedOrigins []string) {
 	e.websocketHelper.CheckOrigin = func(r *http.Request) bool {
 		return slices.Contains(allowedOrigins, r.Header.Get("Origin"))

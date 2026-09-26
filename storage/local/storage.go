@@ -76,7 +76,7 @@ func (l *LocalStorage) GenerateUpload(opts ...storage.UploadOptions) (fileID str
 	l.mu.Lock()
 	l.uploadTokens[fileID] = uploadToken
 	l.mu.Unlock()
-	uploadUrl := fmt.Sprintf("%s/tether/storage/upload/%s", l.BaseURL, fileID)
+	uploadUrl := fmt.Sprintf("%s/storage/upload/%s", l.BaseURL, fileID)
 	return fileID, uploadUrl, nil, nil
 }
 
@@ -89,7 +89,7 @@ func (l *LocalStorage) GenerateDownload(fileID string) (url string, err error) {
 	l.mu.Lock()
 	l.downloadTokens[downloadID] = downloadToken
 	l.mu.Unlock()
-	downloadUrl := fmt.Sprintf("%s/tether/storage/file/%s", l.BaseURL, downloadID)
+	downloadUrl := fmt.Sprintf("%s/storage/file/%s", l.BaseURL, downloadID)
 	return downloadUrl, nil
 }
 
@@ -190,14 +190,33 @@ func (l *LocalStorage) handleDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, filePath)
 }
 
+func storageRoute(path string) string {
+	switch {
+	case strings.HasPrefix(path, "/storage/upload/"):
+		return "upload"
+	case strings.HasPrefix(path, "/storage/file/"):
+		return "download"
+	default:
+		return ""
+	}
+}
+
+func (l *LocalStorage) Matches(r *http.Request) bool {
+	if r == nil || r.URL == nil {
+		return false
+	}
+	return storageRoute(r.URL.Path) != ""
+}
+
 func (l *LocalStorage) ServeHTTP(w http.ResponseWriter, r *http.Request) bool {
-	if strings.HasPrefix(r.URL.Path, "/tether/storage/upload/") {
+	switch storageRoute(r.URL.Path) {
+	case "upload":
 		l.handleUpload(w, r)
 		return true
-	}
-	if strings.HasPrefix(r.URL.Path, "/tether/storage/file/") {
+	case "download":
 		l.handleDownload(w, r)
 		return true
+	default:
+		return false
 	}
-	return false
 }
