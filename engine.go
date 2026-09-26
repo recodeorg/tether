@@ -597,6 +597,9 @@ func (e *Engine) pollScheduledTasks() {
 					})
 				} else {
 					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
+					e.timerMutex.Lock()
+					defer e.timerMutex.Unlock()
+					delete(e.taskToTimer, t.ID)
 				}
 			}()
 			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
