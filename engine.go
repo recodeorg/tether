@@ -1105,9 +1105,8 @@ func (e *Engine) RegisterGuard(name string, guard func(ctx *GuardCtx) interface{
 	slog.Debug("Registered guard", "name", name)
 }
 
-func (e *Engine) CreateTable(name string, schema interface{}) {
+func (e *Engine) CreateTable(schema interface{}) {
 	e.db.AutoMigrate(schema)
-	slog.Debug("Created table", "name", name)
 }
 
 func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
