@@ -623,6 +623,7 @@ func (e *Engine) cancelTask(taskID string) bool {
 		return false
 	}
 	e.timerMutex.Lock()
+	defer e.timerMutex.Unlock()
 	if timer, ok := e.taskToTimer[taskID]; ok {
 		stopped := timer.Stop()
 		delete(e.taskToTimer, taskID)
@@ -630,7 +631,6 @@ func (e *Engine) cancelTask(taskID string) bool {
 			return false
 		}
 	}
-	e.timerMutex.Unlock()
 	return true
 }
 
