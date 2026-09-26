@@ -1179,6 +1179,12 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if record.MimeType != "" {
 			w.Header().Set("Content-Type", record.MimeType)
+
+			if !isSafeInlineMime(record.MimeType) {
+				w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
+			} else {
+				w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
+			}
 		}
 
 		err = e.storage.ServeFile(dlToken.FileID, w, r)
@@ -1187,6 +1193,18 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+}
+
+// Checks if the mime type is safe to inline in the browser.
+func isSafeInlineMime(mime string) bool {
+	safePrefixes := []string{"image/", "video/", "audio/", "text/plain"}
+	for _, p := range safePrefixes {
+		if strings.HasPrefix(mime, p) {
+			// Block SVG because it can contain embedded JavaScript
+			return mime != "image/svg+xml"
+		}
+	}
+	return mime == "application/pdf"
 }
 
 func (e *Engine) getUploadURL(opts storage.UploadOptions) (storage.UploadInfo, error) {
