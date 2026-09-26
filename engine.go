@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -155,13 +156,7 @@ func (e *Engine) bindGuardAuth(guardCtx *GuardCtx, authID string) {
 		},
 	}
 	authCtx.ExecuteGuard = func(name string, params map[string]interface{}) (interface{}, error) {
-		nested := &GuardCtx{
-			DB:       e.db,
-			Auth:     authCtx,
-			Params:   params,
-			Profiler: e.Profiler,
-		}
-		return executeGuard(e, nested, name)
+		return nil, fmt.Errorf("Guards cannot execute other guards")
 	}
 	guardCtx.Auth = authCtx
 }
@@ -251,14 +246,21 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			return "", err
 		}
 
+		// Hold the mutex across AfterFunc so a zero-delay callback cannot
+		// remove the entry before it is stored.
+		e.timerMutex.Lock()
 		timer := time.AfterFunc(time.Until(timestamp), func() {
-			defer e.db.Delete(&TetherTask{}, "id = ?", taskID)
+			defer func() {
+				e.db.Delete(&TetherTask{}, "id = ?", taskID)
+				e.timerMutex.Lock()
+				delete(e.taskToTimer, taskID)
+				e.timerMutex.Unlock()
+			}()
 			_, err := e.ExecuteMutationInternal(functionName, params)
 			if err != nil {
 				slog.Error("Failed to execute mutation internally", "error", err)
 			}
 		})
-		e.timerMutex.Lock()
 		e.taskToTimer[taskID] = timer
 		e.timerMutex.Unlock()
 	} else {
@@ -365,7 +367,7 @@ func NewEngine(db *gorm.DB) *Engine {
 		EphemeralID:     uuid.New().String(),
 	}
 	// scheduler initialization
-	e.CreateTable("_tether_tasks", []TetherTask{}) // Create the internal table for the scheduled tasks
+	e.CreateTable([]TetherTask{}) // Create the internal table for the scheduled tasks
 	e.startScheduler(context.Background())
 
 	if e.dbType == "postgres" {
@@ -543,8 +545,8 @@ func (e *Engine) startScheduler(ctx context.Context) {
 
 func (e *Engine) UseStorage(storage storage.StorageAdapter) {
 	e.storage = storage
-	e.CreateTable("_tether_storage", []TetherStorage{})
-	e.CreateTable("_tether_download_tokens", []TetherDownloadToken{})
+	e.CreateTable([]TetherStorage{})
+	e.CreateTable([]TetherDownloadToken{})
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -588,6 +590,9 @@ func (e *Engine) pollScheduledTasks() {
 		var params map[string]interface{}
 		_ = json.Unmarshal([]byte(t.ParamsJSON), &params)
 
+		// Hold the mutex across AfterFunc so a zero-delay callback cannot
+		// remove the entry before it is stored.
+		e.timerMutex.Lock()
 		timer := time.AfterFunc(delay, func() {
 			defer func() {
 				if err := recover(); err != nil {
@@ -603,6 +608,9 @@ func (e *Engine) pollScheduledTasks() {
 					})
 				} else {
 					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
+					e.timerMutex.Lock()
+					delete(e.taskToTimer, t.ID)
+					e.timerMutex.Unlock()
 				}
 			}()
 			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
@@ -610,7 +618,6 @@ func (e *Engine) pollScheduledTasks() {
 				slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
 			}
 		})
-		e.timerMutex.Lock()
 		e.taskToTimer[t.ID] = timer
 		e.timerMutex.Unlock()
 	}
@@ -623,6 +630,7 @@ func (e *Engine) cancelTask(taskID string) bool {
 		return false
 	}
 	e.timerMutex.Lock()
+	defer e.timerMutex.Unlock()
 	if timer, ok := e.taskToTimer[taskID]; ok {
 		stopped := timer.Stop()
 		delete(e.taskToTimer, taskID)
@@ -630,7 +638,6 @@ func (e *Engine) cancelTask(taskID string) bool {
 			return false
 		}
 	}
-	e.timerMutex.Unlock()
 	return true
 }
 
@@ -1089,7 +1096,7 @@ func (e *Engine) RegisterMutation(name string, mutation func(ctx *MutationCtx) i
 	slog.Debug("Registered mutation", "name", name)
 }
 
-func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, dependencies []string, opts ...QueryOptions) {
+func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{}, opts ...QueryOptions) {
 	options := QueryOptions{
 		Internal: false,
 	}
@@ -1097,9 +1104,6 @@ func (e *Engine) RegisterQuery(name string, query func(ctx *QueryCtx) interface{
 		options = opts[0]
 	}
 	e.queries[name] = Query{Func: query, Internal: options.Internal} // stores the query in the list of valid queries
-	for _, dependency := range dependencies {
-		e.dependencies[dependency] = append(e.dependencies[dependency], name)
-	}
 	slog.Debug("Registered query", "name", name)
 }
 
@@ -1108,9 +1112,8 @@ func (e *Engine) RegisterGuard(name string, guard func(ctx *GuardCtx) interface{
 	slog.Debug("Registered guard", "name", name)
 }
 
-func (e *Engine) CreateTable(name string, schema interface{}) {
+func (e *Engine) CreateTable(schema interface{}) {
 	e.db.AutoMigrate(schema)
-	slog.Debug("Created table", "name", name)
 }
 
 func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
@@ -1179,6 +1182,12 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		if record.MimeType != "" {
 			w.Header().Set("Content-Type", record.MimeType)
+
+			if !isSafeInlineMime(record.MimeType) {
+				w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
+			} else {
+				w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
+			}
 		}
 
 		err = e.storage.ServeFile(dlToken.FileID, w, r)
@@ -1187,6 +1196,22 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+}
+
+// Checks if the mime type is safe to inline in the browser.
+func isSafeInlineMime(mimeType string) bool {
+	safePrefixes := []string{"image/", "video/", "audio/", "text/plain"}
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return false
+	}
+	for _, p := range safePrefixes {
+		if strings.HasPrefix(mediaType, p) {
+			// Block SVG because it can contain embedded JavaScript
+			return !strings.Contains(mediaType, "svg")
+		}
+	}
+	return mediaType == "application/pdf"
 }
 
 func (e *Engine) getUploadURL(opts storage.UploadOptions) (storage.UploadInfo, error) {
@@ -1244,11 +1269,14 @@ func (e *Engine) deleteFile(fileID string) error {
 	if e.storage == nil {
 		return fmt.Errorf("storage not configured")
 	}
-	err := e.db.Where("id = ?", fileID).Delete(&TetherStorage{}).Error
-	if err != nil {
+	var record TetherStorage
+	if err := e.db.Where("id = ?", fileID).First(&record).Error; err != nil {
 		return err
 	}
-	return e.storage.Delete(fileID)
+	if err := e.storage.Delete(record.ID); err != nil {
+		return err
+	}
+	return e.db.Where("id = ?", record.ID).Delete(&TetherStorage{}).Error
 }
 
 // allowStorageOrigin applies the WebSocket origin policy to browser calls against
@@ -1336,10 +1364,6 @@ func (e *Engine) OnDisconnect(clientID string) error {
 	return nil
 }
 
-func (e *Engine) GetDependentQueries(tableName string) []string {
-	return e.dependencies[tableName]
-}
-
 func (e *Engine) InvalidateTag(tag string) {
 	e.InvalidateTags([]string{tag}, "legacy", "legacy_invalidate_tag")
 }
@@ -1349,7 +1373,10 @@ func (e *Engine) InvalidateTag(tag string) {
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
 // cause the same mutation to fire the query a second time. Matching
 // subscriptions (same query, params, and auth fingerprint) share one execution
-// and are fanned out with each client's own query_key.
+// and are fanned out with each client's own query_key. If that execution
+// records an auth tag the batch was not partitioned on, the result is delivered
+// only to the representative and every other subscription is executed under its
+// own identity.
 func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
 	start := time.Now()
 	seen := make(map[string]struct{})
@@ -1401,6 +1428,22 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 				slog.Error("Failed to execute query", "error", err)
 				return
 			}
+			// Batch membership was chosen from the previous execution's auth tags.
+			// A query can start calling GetIdentity (or a guard) only on this run.
+			// Sharing that result would leak the representative's identity-specific
+			// data and copy their new auth tag onto every other client.
+			if len(subscriptions) > 1 && queryDepsIntroduceAuthTag(e.tracker, representative.SubID, deps) {
+				e.publishQueryResult(representative, result, deps, cacheKey)
+				for _, subscription := range subscriptions[1:] {
+					result, deps, cacheKey, err := e.runQuery(subscription.Query, subscription.Params, subscription)
+					if err != nil {
+						slog.Error("Failed to execute query", "error", err)
+						continue
+					}
+					e.publishQueryResult(subscription, result, deps, cacheKey)
+				}
+				return
+			}
 			e.Profiler.Add(utilities.Metric{
 				ID:       execID,
 				Name:     "batch_execution:" + representative.Query,
@@ -1413,18 +1456,11 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 			// auto-tracked tags (e.g. new primary keys) stay in sync even though
 			// the query function ran only once.
 			for _, subscription := range subscriptions {
-				e.tracker.UpdateTags(subscription.SubID, deps)
-				responseJSON, err := marshalQueryMessage(representative.Query, result, subscription.QueryKey)
-				if err != nil {
-					slog.Error("Failed to encode query result", "error", err)
-					continue
+				key := ""
+				if subscription.SubID == representative.SubID {
+					key = cacheKey
 				}
-				e.tracker.SendMessage(subscription.Client.ID, responseJSON)
-			}
-			if dataJSON, err := json.Marshal(result); err == nil {
-				e.hashMu.Lock()
-				e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
-				e.hashMu.Unlock()
+				e.publishQueryResult(subscription, result, deps, key)
 			}
 		}(subscriptions)
 	}
@@ -1441,6 +1477,44 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 
 func marshalQueryMessage(query string, result interface{}, queryKey string) ([]byte, error) {
 	return json.Marshal(map[string]interface{}{"type": "query", "location": query, "data": result, "query_key": queryKey})
+}
+
+// queryDepsIntroduceAuthTag reports whether deps contain a permanent auth tag
+// (prefix "*") that subID was not already tracking. Those tags partition
+// batches, so a newly recorded one means this result is not safe to share.
+func queryDepsIntroduceAuthTag(tracker *reactivity.Tracker, subID string, deps []string) bool {
+	for _, dep := range deps {
+		if !strings.HasPrefix(dep, "*") {
+			continue
+		}
+		if !tracker.SubscriptionHasTag(subID, dep) {
+			return true
+		}
+	}
+	return false
+}
+
+// publishQueryResult records deps on one subscription and pushes result to its
+// client. An empty cacheKey skips the result hash, which the shared batch path
+// uses for every client other than the representative.
+func (e *Engine) publishQueryResult(subscription *reactivity.Subscription, result interface{}, deps []string, cacheKey string) {
+	e.tracker.UpdateTags(subscription.SubID, deps)
+	responseJSON, err := marshalQueryMessage(subscription.Query, result, subscription.QueryKey)
+	if err != nil {
+		slog.Error("Failed to encode query result", "error", err)
+		return
+	}
+	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+	if cacheKey == "" {
+		return
+	}
+	dataJSON, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+	e.hashMu.Lock()
+	e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
+	e.hashMu.Unlock()
 }
 
 // runQuery executes the query function and returns the result plus the
@@ -1631,9 +1705,15 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	authCtx.ExecuteGuard = func(guardName string, params map[string]interface{}) (interface{}, error) {
 		// Execute the guard and return the result
 		// Mutations are single-fire, so no caching is needed
+		guardAuth := &AuthCtx{
+			GetIdentity: func() (string, error) { return authID, nil },
+			ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
+				return nil, fmt.Errorf("guards cannot execute other guards")
+			},
+		}
 		guardCtx := &GuardCtx{
 			DB:       e.db,
-			Auth:     authCtx,
+			Auth:     guardAuth,
 			Params:   params,
 			Profiler: e.Profiler,
 		}
@@ -1674,6 +1754,16 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	}
 	e.tracker.SendMessage(clientID, responseJSON)
 	return result, nil
+}
+
+// rerunSubscriptions force-pushes fresh results for subscriptions whose
+// authorization state was reset by an identity change.
+func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
+	for _, subscription := range subscriptions {
+		if _, err := e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true); err != nil {
+			slog.Error("Failed to re-run query after auth change", "query", subscription.Query, "error", err)
+		}
+	}
 }
 
 func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) error {
@@ -1747,21 +1837,15 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			Duration: time.Since(start),
 			Tags:     []string{},
 		})
-		time.AfterFunc(time.Until(expiresAt), func() {
-			auth, ok := e.tracker.GetAuth(clientID)
-			if !ok {
-				return
-			}
-			if time.Time.Equal(auth.ExpiresAt, expiresAt) {
-				e.tracker.SetAuth(clientID, "", time.Time{})
-			}
-		})
 		if err != nil {
 			slog.Error("Failed to get user ID", "error", err)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to get user ID"}`))
 			return err
 		}
-		e.tracker.SetAuth(clientID, userID, expiresAt)
+		e.rerunSubscriptions(e.tracker.SetAuth(clientID, userID, expiresAt))
+		time.AfterFunc(time.Until(expiresAt), func() {
+			e.rerunSubscriptions(e.tracker.ExpireAuth(clientID, expiresAt))
+		})
 		message := map[string]interface{}{"type": "auth", "success": true, "data": map[string]interface{}{"user_id": userID}}
 		messageJSON, err := json.Marshal(message)
 		if err != nil {

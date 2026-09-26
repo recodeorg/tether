@@ -152,7 +152,7 @@ func newTestEngine(t *testing.T) *Engine {
 func newTestEngineWithType(t *testing.T) *Engine {
 	t.Helper()
 	e := NewEngine(newTestDB(t))
-	e.CreateTable("messages", &testMessage{})
+	e.CreateTable(&testMessage{})
 	return e
 }
 
@@ -317,6 +317,77 @@ func TestRegisterCronKeepsExecuteAtWhenClaimedOrOverdue(t *testing.T) {
 	}
 }
 
+// Completed one-shot tasks must drop their taskToTimer entries. The map is the
+// only thing keeping each fired time.Timer reachable, so a leftover entry leaks
+// the timer and the callback that closed over the task.
+func TestCompletedOneShotTasksReleaseTaskTimers(t *testing.T) {
+	// Timers fire on other goroutines. A shared file keeps every connection on
+	// the same database; :memory: would give each connection an empty schema.
+	e := newConcurrentTestEngine(t)
+	var ran atomic.Int32
+	e.RegisterMutation("scheduledTick", func(ctx *MutationCtx) interface{} {
+		ran.Add(1)
+		return nil
+	})
+
+	const n = 25
+	var want int32
+
+	// Due immediately: scheduleTask arms the timer itself.
+	for i := 0; i < n; i++ {
+		if _, err := e.scheduleTask(time.Now(), "scheduledTick", nil); err != nil {
+			t.Fatalf("schedule immediate task: %v", err)
+		}
+		want++
+	}
+
+	// Due later, then pulled overdue so pollScheduledTasks arms a zero-delay timer.
+	overdueIDs := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		id, err := e.scheduleTask(time.Now().Add(time.Hour), "scheduledTick", nil)
+		if err != nil {
+			t.Fatalf("schedule overdue task: %v", err)
+		}
+		overdueIDs = append(overdueIDs, id)
+		want++
+	}
+	if err := e.db.Model(&TetherTask{}).Where("id IN ?", overdueIDs).Update("execute_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatalf("backdate overdue tasks: %v", err)
+	}
+
+	// Still ahead of now, but inside the poll lookahead, so the timer waits out a real delay.
+	delayedID, err := e.scheduleTask(time.Now().Add(time.Hour), "scheduledTick", nil)
+	if err != nil {
+		t.Fatalf("schedule delayed task: %v", err)
+	}
+	want++
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", delayedID).Update("execute_at", time.Now().Add(150*time.Millisecond)).Error; err != nil {
+		t.Fatalf("set delayed execute_at: %v", err)
+	}
+
+	e.pollScheduledTasks()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		e.timerMutex.RLock()
+		left := len(e.taskToTimer)
+		e.timerMutex.RUnlock()
+		if ran.Load() >= want && left == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.timerMutex.RLock()
+			ids := make([]string, 0, len(e.taskToTimer))
+			for id := range e.taskToTimer {
+				ids = append(ids, id)
+			}
+			e.timerMutex.RUnlock()
+			t.Fatalf("one-shot timers still tracked after tasks finished: ran %d/%d, remaining %v", ran.Load(), want, ids)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func loadCron(t *testing.T, e *Engine, id string) TetherTask {
 	t.Helper()
 	var got TetherTask
@@ -447,25 +518,6 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 		})
 	}
 }
-
-func TestRegisterQueryAndGetDependentQueries(t *testing.T) {
-	e := newTestEngine(t)
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} { return nil }, []string{"messages"})
-	e.RegisterQuery("countMessages", func(ctx *QueryCtx) interface{} { return nil }, []string{"messages", "rooms"})
-
-	got := e.GetDependentQueries("messages")
-	if !slices.Contains(got, "getMessages") || !slices.Contains(got, "countMessages") {
-		t.Errorf("GetDependentQueries(messages) = %v, want both registered queries", got)
-	}
-	gotRooms := e.GetDependentQueries("rooms")
-	if !slices.Contains(gotRooms, "countMessages") {
-		t.Errorf("GetDependentQueries(rooms) = %v, want [countMessages]", gotRooms)
-	}
-	if got := e.GetDependentQueries("missing"); len(got) != 0 {
-		t.Errorf("GetDependentQueries(missing) = %v, want empty", got)
-	}
-}
-
 func TestTrackCollectionAndTrackTableTagFormat(t *testing.T) {
 	ctx := &QueryCtx{}
 	ctx.TrackCollection("messages", "room_id", "lobby")
@@ -606,7 +658,7 @@ func TestCreateInvalidatesTrackCollection(t *testing.T) {
 			return map[string]interface{}{"error": err.Error()}
 		}
 		return msgs
-	}, nil)
+	})
 
 	subscribe(t, e, client, "getMessages", "lobby", map[string]interface{}{"room": "lobby"})
 	if got := runs.Load(); got != 1 {
@@ -644,14 +696,14 @@ func TestCreateDoesNotInvalidateOtherCollections(t *testing.T) {
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
 		return msgs
-	}, nil)
+	})
 	e.RegisterQuery("getOther", func(ctx *QueryCtx) interface{} {
 		otherRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "other")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "other").Find(&msgs)
 		return msgs
-	}, nil)
+	})
 
 	subscribe(t, e, client, "getLobby", "lobby", nil)
 	subscribe(t, e, client, "getOther", "other", nil)
@@ -685,21 +737,21 @@ func TestUpdateInvalidatesPrimaryKeyAndCollectionTags(t *testing.T) {
 		var got testMessage
 		ctx.DB.First(&got, msg.ID)
 		return got
-	}, nil)
+	})
 	e.RegisterQuery("byRoom", func(ctx *QueryCtx) interface{} {
 		colRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
 		return msgs
-	}, nil)
+	})
 	e.RegisterQuery("otherRoom", func(ctx *QueryCtx) interface{} {
 		otherRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "other")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "other").Find(&msgs)
 		return msgs
-	}, nil)
+	})
 
 	subscribe(t, e, client, "byID", "id", nil)
 	subscribe(t, e, client, "byRoom", "room", nil)
@@ -739,7 +791,7 @@ func TestDeleteInvalidatesTrackedTags(t *testing.T) {
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
 		return msgs
-	}, nil)
+	})
 	subscribe(t, e, client, "getMessages", "lobby", nil)
 	if runs.Load() != 1 {
 		t.Fatalf("runs after subscribe = %d, want 1", runs.Load())
@@ -769,12 +821,12 @@ func TestMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
 		oldRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "old")
 		return "old"
-	}, nil)
+	})
 	e.RegisterQuery("newRoom", func(ctx *QueryCtx) interface{} {
 		newRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "new")
 		return "new"
-	}, nil)
+	})
 	subscribe(t, e, client, "oldRoom", "old", nil)
 	subscribe(t, e, client, "newRoom", "new", nil)
 
@@ -805,12 +857,12 @@ func TestMapUpdatesMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
 		oldRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "old")
 		return "old"
-	}, nil)
+	})
 	e.RegisterQuery("newRoom", func(ctx *QueryCtx) interface{} {
 		newRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "new")
 		return "new"
-	}, nil)
+	})
 	subscribe(t, e, client, "oldRoom", "old", nil)
 	subscribe(t, e, client, "newRoom", "new", nil)
 
@@ -841,7 +893,7 @@ func TestMapUpdatesInvalidateLoadedRecord(t *testing.T) {
 		var got testMessage
 		ctx.DB.First(&got, msg.ID)
 		return got
-	}, nil)
+	})
 	subscribe(t, e, client, "byID", "id", nil)
 
 	if err := e.db.Model(&testMessage{}).Where("id = ?", msg.ID).Updates(map[string]interface{}{"body": "patched"}).Error; err != nil {
@@ -865,7 +917,7 @@ func TestAutoTrackRecordsLoadedIDs(t *testing.T) {
 		var got testMessage
 		ctx.DB.First(&got, msg.ID)
 		return got
-	}, nil)
+	})
 	sub := subscribe(t, e, client, "getOne", "one", nil)
 
 	tag := fmt.Sprintf("messages:%v", msg.ID)
@@ -890,7 +942,7 @@ func TestAutoTrackSliceLoadsEveryID(t *testing.T) {
 		var got []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&got)
 		return got
-	}, nil)
+	})
 	sub := subscribe(t, e, client, "getAll", "all", nil)
 
 	for _, msg := range msgs {
@@ -917,7 +969,7 @@ func TestAutoTrackRequiresExportedIDField(t *testing.T) {
 		var got testNote
 		ctx.DB.First(&got, note.NoteID)
 		return got
-	}, nil)
+	})
 	sub := subscribe(t, e, client, "getNote", "note", nil)
 
 	tag := fmt.Sprintf("notes:%v", note.NoteID)
@@ -937,7 +989,7 @@ func TestTrackTableIsInvalidatedByMutations(t *testing.T) {
 		var msgs []testMessage
 		ctx.DB.Find(&msgs)
 		return msgs
-	}, nil)
+	})
 	subscribe(t, e, client, "allMessages", "all", nil)
 
 	if err := e.db.Create(&testMessage{Body: "x", RoomID: "r"}).Error; err != nil {
@@ -958,7 +1010,7 @@ func TestInvalidateTagRerunsEverySubscriber(t *testing.T) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		return []testMessage{}
-	}, nil)
+	})
 	subscribe(t, e, a, "getMessages", "a", map[string]interface{}{"who": "a"})
 	subscribe(t, e, b, "getMessages", "b", map[string]interface{}{"who": "b"})
 	drain(a)
@@ -993,7 +1045,7 @@ func TestMutationOnOneClientPushesQueryToSubscribersOnly(t *testing.T) {
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
 		return len(msgs)
-	}, nil)
+	})
 	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
 		msg := testMessage{Body: "hi", RoomID: "lobby"}
 		ctx.DB.Create(&msg)
@@ -1054,7 +1106,7 @@ func TestQueryFailureDoesNotPanicAndStillTracksCollections(t *testing.T) {
 			t.Error("expected GORM error from invalid column")
 		}
 		return map[string]interface{}{"error": err.Error()}
-	}, nil)
+	})
 
 	mustNoPanic(t, "failing query subscribe", func() {
 		subscribe(t, e, client, "brokenFind", "broken", nil)
@@ -1085,7 +1137,7 @@ func TestMutationFailureDoesNotPanicOrInvalidate(t *testing.T) {
 		var msgs []testMessage
 		ctx.DB.Find(&msgs)
 		return msgs
-	}, nil)
+	})
 	subscribe(t, e, client, "getMessages", "lobby", nil)
 	drain(client)
 
@@ -1117,7 +1169,7 @@ func TestMutationFailureDoesNotPanicOrInvalidate(t *testing.T) {
 func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("noop", func(ctx *QueryCtx) interface{} { return "ok" }, nil)
+	e.RegisterQuery("noop", func(ctx *QueryCtx) interface{} { return "ok" })
 	sub := e.tracker.SubscribeToQuery(client.ID, "noop", "k", map[string]interface{}{})
 
 	var err error
@@ -1132,7 +1184,7 @@ func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 func TestExecuteQueryUnserializableResultDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("bad", func(ctx *QueryCtx) interface{} { return make(chan int) }, nil)
+	e.RegisterQuery("bad", func(ctx *QueryCtx) interface{} { return make(chan int) })
 	sub := e.tracker.SubscribeToQuery(client.ID, "bad", "k", map[string]interface{}{})
 
 	var err error
@@ -1210,7 +1262,7 @@ func TestQueryHashSkipsUnchangedPushUnlessForced(t *testing.T) {
 
 	e.RegisterQuery("const", func(ctx *QueryCtx) interface{} {
 		return map[string]interface{}{"n": 1}
-	}, nil)
+	})
 	sub := subscribe(t, e, client, "const", "k", map[string]interface{}{"p": 1})
 	drain(client)
 
@@ -1234,7 +1286,7 @@ func TestQueryResultIncludesLocationAndQueryKey(t *testing.T) {
 	client := trackClient(t, e)
 	e.RegisterQuery("getThing", func(ctx *QueryCtx) interface{} {
 		return map[string]interface{}{"ok": true, "p": ctx.Params["id"]}
-	}, nil)
+	})
 	subscribe(t, e, client, "getThing", "thing-7", map[string]interface{}{"id": 7})
 
 	msgs := queryMessages(t, drain(client))
@@ -1317,7 +1369,7 @@ func TestQueryExposesIdentityOfTheSubscribedClient(t *testing.T) {
 			return map[string]interface{}{"error": err.Error()}
 		}
 		return map[string]interface{}{"id": id}
-	}, nil)
+	})
 
 	subscribe(t, e, alice, "me", "alice", nil)
 	subscribe(t, e, bob, "me", "bob", nil)
@@ -1347,7 +1399,7 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
 		id, _ := ctx.Auth.GetIdentity()
 		return id
-	}, nil)
+	})
 	sub := subscribe(t, e, client, "me", "me", nil)
 
 	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:user-7"), sub.SubID) {
@@ -1381,7 +1433,7 @@ func TestGuardIdentityDoesNotFingerprintTheQuery(t *testing.T) {
 		}
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		return res
-	}, nil)
+	})
 	sub := subscribe(t, e, client, "getMessages", "lobby", nil)
 
 	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:user-7"), sub.SubID) {
@@ -1428,7 +1480,7 @@ func TestGuardsBatchQueriesOnInvalidation(t *testing.T) {
 		}
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		return map[string]interface{}{"ok": true}
-	}, nil)
+	})
 	subscribe(t, e, a, "getMessages", "a", map[string]interface{}{"room": "lobby"})
 	subscribe(t, e, b, "getMessages", "b", map[string]interface{}{"room": "lobby"})
 	if got, want := queryRuns.Load(), int64(2); got != want {
@@ -1447,9 +1499,105 @@ func TestGuardsBatchQueriesOnInvalidation(t *testing.T) {
 	}
 }
 
+func TestInvalidateTagStillBatchesClientsWithTheSameIdentity(t *testing.T) {
+	e := newTestEngine(t)
+	a := trackClient(t, e)
+	b := trackClient(t, e)
+	e.tracker.SetAuth(a.ID, "alice", time.Now().Add(time.Hour))
+	e.tracker.SetAuth(b.ID, "alice", time.Now().Add(time.Hour))
+
+	var runs atomic.Int64
+	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		ctx.TrackCollection("settings", "key", "me")
+		id, _ := ctx.Auth.GetIdentity()
+		return id
+	})
+	subscribe(t, e, a, "me", "a", map[string]interface{}{})
+	subscribe(t, e, b, "me", "b", map[string]interface{}{})
+	drain(a)
+	drain(b)
+	if got, want := runs.Load(), int64(2); got != want {
+		t.Fatalf("initial runs = %d, want %d", got, want)
+	}
+
+	e.InvalidateTag("settings_key:me")
+	if got, want := runs.Load(), int64(3); got != want {
+		t.Errorf("runs after invalidate = %d, want %d (one batched execution)", got, want)
+	}
+	if data, n := lastQueryData(t, a); n != 1 || data != "alice" {
+		t.Errorf("client a got %d pushes, data = %v; want one push of alice", n, data)
+	}
+	if data, n := lastQueryData(t, b); n != 1 || data != "alice" {
+		t.Errorf("client b got %d pushes, data = %v; want one push of alice", n, data)
+	}
+}
+
+func TestInvalidateTagSplitsBatchWhenQueryBecomesIdentityDependent(t *testing.T) {
+	e := newTestEngine(t)
+	alice := trackClient(t, e)
+	bob := trackClient(t, e)
+	e.tracker.SetAuth(alice.ID, "alice", time.Now().Add(time.Hour))
+	e.tracker.SetAuth(bob.ID, "bob", time.Now().Add(time.Hour))
+
+	var private atomic.Bool
+	e.RegisterQuery("visibility", func(ctx *QueryCtx) interface{} {
+		ctx.TrackCollection("settings", "key", "visibility")
+		if !private.Load() {
+			return "public"
+		}
+		id, _ := ctx.Auth.GetIdentity()
+		return "private:" + id
+	})
+	params := map[string]interface{}{"k": "visibility"}
+	aliceSub := subscribe(t, e, alice, "visibility", "alice", params)
+	bobSub := subscribe(t, e, bob, "visibility", "bob", params)
+	if data, _ := lastQueryData(t, alice); data != "public" {
+		t.Fatalf("alice initial data = %v, want public", data)
+	}
+	if data, _ := lastQueryData(t, bob); data != "public" {
+		t.Fatalf("bob initial data = %v, want public", data)
+	}
+	if fp := e.tracker.GetAuthFingerprint(aliceSub); fp != "" {
+		t.Fatalf("alice auth fingerprint = %q, want empty before the private branch", fp)
+	}
+	if fp := e.tracker.GetAuthFingerprint(bobSub); fp != "" {
+		t.Fatalf("bob auth fingerprint = %q, want empty before the private branch", fp)
+	}
+
+	private.Store(true)
+	e.InvalidateTag("settings_key:visibility")
+
+	assertPrivate := func(client *reactivity.Client, want string) {
+		t.Helper()
+		msgs := queryMessages(t, drain(client))
+		if len(msgs) != 1 {
+			t.Fatalf("got %d query pushes, want 1: %v", len(msgs), msgs)
+		}
+		if msgs[0]["data"] != want {
+			t.Errorf("data = %v, want %q", msgs[0]["data"], want)
+		}
+	}
+	assertPrivate(alice, "private:alice")
+	assertPrivate(bob, "private:bob")
+
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:alice"), aliceSub.SubID) {
+		t.Error("alice is missing *user_identity:alice")
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:bob"), aliceSub.SubID) {
+		t.Error("alice tracked bob's identity tag")
+	}
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:bob"), bobSub.SubID) {
+		t.Error("bob is missing *user_identity:bob")
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:alice"), bobSub.SubID) {
+		t.Error("bob tracked alice's identity tag")
+	}
+}
+
 func TestGuardInvalidationRerunsAttachedQuery(t *testing.T) {
 	e := newTestEngine(t)
-	e.CreateTable("room_members", &testRoomMember{})
+	e.CreateTable(&testRoomMember{})
 	client := trackClient(t, e)
 	e.tracker.SetAuth(client.ID, "user-7", time.Now().Add(time.Hour))
 	if err := e.db.Create(&testRoomMember{UserID: "user-7", RoomID: "lobby"}).Error; err != nil {
@@ -1475,7 +1623,7 @@ func TestGuardInvalidationRerunsAttachedQuery(t *testing.T) {
 			return map[string]interface{}{"error": errMsg}
 		}
 		return map[string]interface{}{"ok": true}
-	}, nil)
+	})
 	subscribe(t, e, client, "getMessages", "lobby", nil)
 	drain(client)
 
@@ -1621,6 +1769,172 @@ func TestAuthExpiryClearsOnlyThatClient(t *testing.T) {
 	}
 }
 
+// registerSecretQuery wires up a query guarded by an identity check. The guard
+// allows only allowedUser; the query tracks table_refresh:mutated so tests can
+// force re-runs.
+func registerSecretQuery(e *Engine, allowedUser string, guardRuns *atomic.Int64) {
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+		guardRuns.Add(1)
+		id, _ := ctx.Auth.GetIdentity()
+		return id != "" && id == allowedUser
+	})
+	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+		ctx.TrackCollection("table", "refresh", "mutated")
+		allowed, err := ctx.Auth.ExecuteGuard("isAllowed", map[string]interface{}{})
+		if err != nil {
+			return "ERROR"
+		}
+		if ok, _ := allowed.(bool); ok {
+			return "SECRET"
+		}
+		return "DENIED"
+	})
+}
+
+func emptyParamsHash() string {
+	paramsJSON, _ := json.Marshal(map[string]interface{}{})
+	return strconv.FormatUint(xxhash.Sum64(paramsJSON), 10)
+}
+
+func lastQueryData(t *testing.T, client *reactivity.Client) (interface{}, int) {
+	t.Helper()
+	msgs := queryMessages(t, drain(client))
+	if len(msgs) == 0 {
+		return nil, 0
+	}
+	return msgs[len(msgs)-1]["data"], len(msgs)
+}
+
+func waitForQueryData(t *testing.T, client *reactivity.Client, want interface{}) bool {
+	t.Helper()
+	return waitUntil(t, time.Second, func() bool {
+		data, n := lastQueryData(t, client)
+		return n > 0 && data == want
+	})
+}
+
+func TestAuthExpiryRevokesGuardedSubscription(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	var guardRuns atomic.Int64
+	registerSecretQuery(e, "alice", &guardRuns)
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(100 * time.Millisecond)})
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	subscribe(t, e, client, "secret", "secret", nil)
+	if data, _ := lastQueryData(t, client); data != "SECRET" {
+		t.Fatalf("initial data = %v, want SECRET", data)
+	}
+
+	if !waitForQueryData(t, client, "DENIED") {
+		t.Fatal("expiry did not push DENIED to the guarded subscription")
+	}
+	if auth, _ := e.tracker.GetAuth(client.ID); auth.UserID != "" {
+		t.Fatalf("auth after expiry = %+v, want cleared", auth)
+	}
+
+	e.InvalidateTag("table_refresh:mutated")
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != "DENIED" {
+		t.Errorf("after mutation got %d pushes, last = %v; want 1 push of DENIED", n, data)
+	}
+	if got := guardRuns.Load(); got < 2 {
+		t.Errorf("guard runs = %d, want the guard re-executed after expiry", got)
+	}
+}
+
+func TestReauthAsDifferentUserRevokesGuardedSubscription(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	var guardRuns atomic.Int64
+	registerSecretQuery(e, "alice", &guardRuns)
+
+	auth := &stubAuth{userID: "alice", expiresAt: time.Now().Add(time.Hour)}
+	e.SetAuth(auth)
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "alice"}); err != nil {
+		t.Fatalf("auth alice: %v", err)
+	}
+	sub := subscribe(t, e, client, "secret", "secret", nil)
+	if data, _ := lastQueryData(t, client); data != "SECRET" {
+		t.Fatalf("initial data = %v, want SECRET", data)
+	}
+
+	auth.userID = "bob"
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "bob"}); err != nil {
+		t.Fatalf("auth bob: %v", err)
+	}
+	if data, n := lastQueryData(t, client); n == 0 || data != "DENIED" {
+		t.Fatalf("after reauth as bob last push = %v (%d pushes), want DENIED", data, n)
+	}
+
+	e.InvalidateTag("table_refresh:mutated")
+	if data, n := lastQueryData(t, client); n != 1 || data != "DENIED" {
+		t.Errorf("after mutation got %d pushes, last = %v; want 1 push of DENIED", n, data)
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*guard_isAllowed_"+emptyParamsHash()+":true"), sub.SubID) {
+		t.Error("alice's cached guard fingerprint survived reauth")
+	}
+}
+
+func TestTokenRefreshForSameUserKeepsGuardedSubscription(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	var guardRuns atomic.Int64
+	registerSecretQuery(e, "alice", &guardRuns)
+
+	auth := &stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)}
+	e.SetAuth(auth)
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "first"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	subscribe(t, e, client, "secret", "secret", nil)
+	drain(client)
+
+	auth.expiresAt = time.Now().Add(time.Hour)
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "refreshed"}); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	if got, _ := e.tracker.GetAuth(client.ID); got.UserID != "alice" {
+		t.Fatalf("first token's expiry cleared the refreshed auth: %+v", got)
+	}
+	e.InvalidateTag("table_refresh:mutated")
+	if data, n := lastQueryData(t, client); n == 0 || data != "SECRET" {
+		t.Errorf("after refresh last push = %v (%d pushes), want SECRET", data, n)
+	}
+	if got := guardRuns.Load(); got != 1 {
+		t.Errorf("guard runs = %d, want 1 (same identity keeps the cached decision)", got)
+	}
+}
+
+func TestAuthExpiryRerunsIdentityQuery(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+		id, _ := ctx.Auth.GetIdentity()
+		return id
+	})
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)})
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	sub := subscribe(t, e, client, "me", "me", nil)
+	if data, _ := lastQueryData(t, client); data != "alice" {
+		t.Fatalf("initial data = %v, want alice", data)
+	}
+
+	if !waitForQueryData(t, client, "") {
+		t.Fatal("expiry did not re-run the identity query")
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:alice"), sub.SubID) {
+		t.Error("stale *user_identity:alice tag survived expiry")
+	}
+}
+
 func TestAuthExpiryAfterDisconnectDoesNotPanic(t *testing.T) {
 	if os.Getenv("TETHER_TEST_CHILD") == "1" {
 		e := newTestEngine(t)
@@ -1655,7 +1969,7 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", room).Find(&msgs)
 		return len(msgs)
-	}, nil)
+	})
 	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
 		msg := testMessage{Body: ctx.Params["body"].(string), RoomID: ctx.Params["room"].(string)}
 		if err := ctx.DB.Create(&msg).Error; err != nil {
@@ -1723,7 +2037,7 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
 		return room
-	}, nil)
+	})
 
 	params := map[string]interface{}{"room": "lobby"}
 	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
@@ -1983,6 +2297,137 @@ func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
 	}
 }
 
+func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
+	e := newTestEngine(t)
+	root := t.TempDir()
+	uploadDir := filepath.Join(root, "uploads")
+	store := local.NewLocalStorage(uploadDir)
+	recorder := &recordingStorage{local: store}
+	e.UseStorage(recorder)
+
+	sibling := filepath.Join(root, "outside.txt")
+	if err := os.WriteFile(sibling, []byte("sibling"), 0o644); err != nil {
+		t.Fatalf("write sibling: %v", err)
+	}
+	absTarget := filepath.Join(root, "absolute.txt")
+	if err := os.WriteFile(absTarget, []byte("absolute"), 0o644); err != nil {
+		t.Fatalf("write absolute target: %v", err)
+	}
+
+	storageCtx := &StorageCtx{DeleteFile: e.deleteFile}
+
+	t.Run("parent path without metadata", func(t *testing.T) {
+		err := storageCtx.DeleteFile("../outside.txt")
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("DeleteFile: %v, want record not found", err)
+		}
+		if len(recorder.deleted) != 0 {
+			t.Fatalf("adapter Delete called with %v", recorder.deleted)
+		}
+		if _, err := os.Stat(sibling); err != nil {
+			t.Fatalf("sibling file was removed: %v", err)
+		}
+	})
+
+	t.Run("absolute path without metadata", func(t *testing.T) {
+		err := storageCtx.DeleteFile(absTarget)
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("DeleteFile: %v, want record not found", err)
+		}
+		if len(recorder.deleted) != 0 {
+			t.Fatalf("adapter Delete called with %v", recorder.deleted)
+		}
+		if _, err := os.Stat(absTarget); err != nil {
+			t.Fatalf("absolute target was removed: %v", err)
+		}
+	})
+
+	t.Run("nonexistent metadata", func(t *testing.T) {
+		err := storageCtx.DeleteFile("missing-file")
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("DeleteFile: %v, want record not found", err)
+		}
+		if len(recorder.deleted) != 0 {
+			t.Fatalf("adapter Delete called with %v", recorder.deleted)
+		}
+	})
+
+	t.Run("stored parent path stays contained", func(t *testing.T) {
+		if err := e.db.Create(&TetherStorage{
+			ID:        "../outside.txt",
+			Token:     "parent-token",
+			Status:    "active",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatalf("create storage row: %v", err)
+		}
+		err := storageCtx.DeleteFile("../outside.txt")
+		if err == nil {
+			t.Fatal("stored parent path delete returned nil")
+		}
+		if _, statErr := os.Stat(sibling); statErr != nil {
+			t.Fatalf("sibling file was removed: %v", statErr)
+		}
+		var remaining int64
+		if err := e.db.Model(&TetherStorage{}).Where("id = ?", "../outside.txt").Count(&remaining).Error; err != nil {
+			t.Fatalf("count storage row: %v", err)
+		}
+		if remaining != 1 {
+			t.Fatalf("storage rows = %d, want 1 after rejected delete", remaining)
+		}
+	})
+}
+
+func TestDeleteFileRemovesStoredObject(t *testing.T) {
+	e := newTestEngine(t)
+	store := local.NewLocalStorage(t.TempDir())
+	e.UseStorage(store)
+
+	upload, err := e.getUploadURL(storage.UploadOptions{})
+	if err != nil {
+		t.Fatalf("getUploadURL: %v", err)
+	}
+	path := filepath.Join(store.UploadDir, upload.FileID)
+	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.WriteFile(path+".mime", []byte("text/plain"), 0o644); err != nil {
+		t.Fatalf("write mime: %v", err)
+	}
+
+	if err := (&StorageCtx{DeleteFile: e.deleteFile}).DeleteFile(upload.FileID); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stored file still present: %v", err)
+	}
+	var remaining int64
+	if err := e.db.Model(&TetherStorage{}).Where("id = ?", upload.FileID).Count(&remaining).Error; err != nil {
+		t.Fatalf("count storage row: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("storage rows = %d, want 0", remaining)
+	}
+}
+
+type recordingStorage struct {
+	local   *local.LocalStorage
+	deleted []string
+}
+
+func (r *recordingStorage) UploadStream(ctx context.Context, fileID string, contentType string, req *http.Request) error {
+	return r.local.UploadStream(ctx, fileID, contentType, req)
+}
+
+func (r *recordingStorage) ServeFile(fileID string, w http.ResponseWriter, req *http.Request) error {
+	return r.local.ServeFile(fileID, w, req)
+}
+
+func (r *recordingStorage) Delete(fileID string) error {
+	r.deleted = append(r.deleted, fileID)
+	return r.local.Delete(fileID)
+}
+
 func serveStorage(e *Engine, method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, body)
 	for key, value := range headers {
@@ -2008,7 +2453,7 @@ func TestSubscribeUnknownQueryViaMessageDoesNotPanic(t *testing.T) {
 
 func TestExecuteQueryWithoutTrackedClientDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
-	e.RegisterQuery("q", func(ctx *QueryCtx) interface{} { return "ok" }, nil)
+	e.RegisterQuery("q", func(ctx *QueryCtx) interface{} { return "ok" })
 	ghost := &reactivity.Subscription{
 		SubID:    "ghost",
 		Client:   &reactivity.Client{ID: "missing", Send: make(chan []byte, 1)},
@@ -2060,7 +2505,7 @@ func newConcurrentTestEngine(t *testing.T) *Engine {
 	}
 
 	e := NewEngine(db)
-	e.CreateTable("messages", &testMessage{})
+	e.CreateTable(&testMessage{})
 	e.SetCheckOrigin(func(*http.Request) bool { return true })
 	return e
 }
@@ -2355,7 +2800,7 @@ func TestConcurrentWebsocketClientsEndToEnd(t *testing.T) {
 			return map[string]interface{}{"error": err.Error()}
 		}
 		return msgs
-	}, nil)
+	})
 	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
 		msg := testMessage{
 			Body:   ctx.Params["body"].(string),
@@ -2521,10 +2966,10 @@ func (accessTokenAuth) VerifyToken(db *gorm.DB, token string) (string, time.Time
 func newConcurrentAuthTestEngine(t *testing.T) *Engine {
 	t.Helper()
 	e := newConcurrentTestEngine(t)
-	e.CreateTable("users", &testUser{})
-	e.CreateTable("access_tokens", &testAccessToken{})
-	e.CreateTable("room_members", &testRoomMember{})
-	e.CreateTable("messages", &testAuthoredMessage{})
+	e.CreateTable(&testUser{})
+	e.CreateTable(&testAccessToken{})
+	e.CreateTable(&testRoomMember{})
+	e.CreateTable(&testAuthoredMessage{})
 	e.SetAuth(accessTokenAuth{})
 	return e
 }
@@ -3009,7 +3454,7 @@ func TestConcurrentWebsocketAuthGetIdentityEndToEnd(t *testing.T) {
 			"user_name": user.Name,
 			"messages":  msgs,
 		}
-	}, nil)
+	})
 	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
@@ -3264,7 +3709,7 @@ func TestConcurrentWebsocketAuthGuardsEndToEnd(t *testing.T) {
 		return map[string]interface{}{
 			"messages": msgs,
 		}
-	}, nil)
+	})
 	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
