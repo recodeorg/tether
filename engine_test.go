@@ -25,6 +25,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/gorilla/websocket"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/storage"
 	"github.com/recodeorg/tether/storage/local"
 	"github.com/recodeorg/tether/utilities"
 	"gorm.io/driver/postgres"
@@ -1803,15 +1804,16 @@ func TestSetCheckOrigin(t *testing.T) {
 
 func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir(), "http://api.example")
+	store := local.NewLocalStorage(t.TempDir())
 	e.UseStorage(store)
 	e.SetAllowedOrigins([]string{"https://app.example"})
 
-	fileID, uploadURL, _, err := store.GenerateUpload()
+	upload, err := e.getUploadURL(storage.UploadOptions{})
 	if err != nil {
-		t.Fatalf("GenerateUpload: %v", err)
+		t.Fatalf("getUploadURL: %v", err)
 	}
-	uploadPath := strings.TrimPrefix(uploadURL, "http://api.example")
+	fileID := upload.FileID
+	uploadPath := upload.UploadURL
 
 	t.Run("preflight allowed", func(t *testing.T) {
 		rec := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
@@ -1876,11 +1878,11 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 	})
 
 	t.Run("put without origin", func(t *testing.T) {
-		_, nextURL, _, err := store.GenerateUpload()
+		next, err := e.getUploadURL(storage.UploadOptions{})
 		if err != nil {
-			t.Fatalf("GenerateUpload: %v", err)
+			t.Fatalf("getUploadURL: %v", err)
 		}
-		path := strings.TrimPrefix(nextURL, "http://api.example")
+		path := next.UploadURL
 		rec := serveStorage(e, http.MethodPut, path, strings.NewReader("server"), map[string]string{
 			"Content-Type": "text/plain",
 		})
@@ -1892,11 +1894,10 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 		}
 	})
 
-	downloadURL, err := store.GenerateDownload(fileID)
+	downloadPath, err := e.getDownloadURL(fileID)
 	if err != nil {
-		t.Fatalf("GenerateDownload: %v", err)
+		t.Fatalf("getDownloadURL: %v", err)
 	}
-	downloadPath := strings.TrimPrefix(downloadURL, "http://api.example")
 
 	t.Run("download allowed", func(t *testing.T) {
 		rec := serveStorage(e, http.MethodGet, downloadPath, nil, map[string]string{
@@ -1925,14 +1926,14 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 
 func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir(), "http://api.example")
+	store := local.NewLocalStorage(t.TempDir())
 	e.UseStorage(store)
 
-	_, uploadURL, _, err := store.GenerateUpload()
+	upload, err := e.getUploadURL(storage.UploadOptions{})
 	if err != nil {
-		t.Fatalf("GenerateUpload: %v", err)
+		t.Fatalf("getUploadURL: %v", err)
 	}
-	uploadPath := strings.TrimPrefix(uploadURL, "http://api.example")
+	uploadPath := upload.UploadURL
 
 	denied := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
 		"Origin": "https://app.example",
@@ -1955,17 +1956,17 @@ func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 
 func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir(), "http://api.example")
+	store := local.NewLocalStorage(t.TempDir())
 	e.UseStorage(store)
 	e.SetCheckOrigin(func(r *http.Request) bool {
 		return strings.HasSuffix(r.Header.Get("Origin"), ".example")
 	})
 
-	_, uploadURL, _, err := store.GenerateUpload()
+	upload, err := e.getUploadURL(storage.UploadOptions{})
 	if err != nil {
-		t.Fatalf("GenerateUpload: %v", err)
+		t.Fatalf("getUploadURL: %v", err)
 	}
-	uploadPath := strings.TrimPrefix(uploadURL, "http://api.example")
+	uploadPath := upload.UploadURL
 
 	allowed := serveStorage(e, http.MethodOptions, uploadPath, nil, map[string]string{
 		"Origin": "https://app.example",
@@ -1988,7 +1989,7 @@ func serveStorage(e *Engine, method, path string, body io.Reader, headers map[st
 		req.Header.Set(key, value)
 	}
 	rec := httptest.NewRecorder()
-	e.StorageHandle(rec, req)
+	e.StorageHandler(rec, req)
 	return rec
 }
 
