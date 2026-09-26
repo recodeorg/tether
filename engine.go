@@ -245,14 +245,21 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			return "", err
 		}
 
+		// Hold the mutex across AfterFunc so a zero-delay callback cannot
+		// remove the entry before it is stored.
+		e.timerMutex.Lock()
 		timer := time.AfterFunc(time.Until(timestamp), func() {
-			defer e.db.Delete(&TetherTask{}, "id = ?", taskID)
+			defer func() {
+				e.db.Delete(&TetherTask{}, "id = ?", taskID)
+				e.timerMutex.Lock()
+				delete(e.taskToTimer, taskID)
+				e.timerMutex.Unlock()
+			}()
 			_, err := e.ExecuteMutationInternal(functionName, params)
 			if err != nil {
 				slog.Error("Failed to execute mutation internally", "error", err)
 			}
 		})
-		e.timerMutex.Lock()
 		e.taskToTimer[taskID] = timer
 		e.timerMutex.Unlock()
 	} else {
@@ -582,6 +589,9 @@ func (e *Engine) pollScheduledTasks() {
 		var params map[string]interface{}
 		_ = json.Unmarshal([]byte(t.ParamsJSON), &params)
 
+		// Hold the mutex across AfterFunc so a zero-delay callback cannot
+		// remove the entry before it is stored.
+		e.timerMutex.Lock()
 		timer := time.AfterFunc(delay, func() {
 			defer func() {
 				if err := recover(); err != nil {
@@ -598,8 +608,8 @@ func (e *Engine) pollScheduledTasks() {
 				} else {
 					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
 					e.timerMutex.Lock()
-					defer e.timerMutex.Unlock()
 					delete(e.taskToTimer, t.ID)
+					e.timerMutex.Unlock()
 				}
 			}()
 			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
@@ -607,7 +617,6 @@ func (e *Engine) pollScheduledTasks() {
 				slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
 			}
 		})
-		e.timerMutex.Lock()
 		e.taskToTimer[t.ID] = timer
 		e.timerMutex.Unlock()
 	}

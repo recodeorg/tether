@@ -317,6 +317,77 @@ func TestRegisterCronKeepsExecuteAtWhenClaimedOrOverdue(t *testing.T) {
 	}
 }
 
+// Completed one-shot tasks must drop their taskToTimer entries. The map is the
+// only thing keeping each fired time.Timer reachable, so a leftover entry leaks
+// the timer and the callback that closed over the task.
+func TestCompletedOneShotTasksReleaseTaskTimers(t *testing.T) {
+	// Timers fire on other goroutines. A shared file keeps every connection on
+	// the same database; :memory: would give each connection an empty schema.
+	e := newConcurrentTestEngine(t)
+	var ran atomic.Int32
+	e.RegisterMutation("scheduledTick", func(ctx *MutationCtx) interface{} {
+		ran.Add(1)
+		return nil
+	})
+
+	const n = 25
+	var want int32
+
+	// Due immediately: scheduleTask arms the timer itself.
+	for i := 0; i < n; i++ {
+		if _, err := e.scheduleTask(time.Now(), "scheduledTick", nil); err != nil {
+			t.Fatalf("schedule immediate task: %v", err)
+		}
+		want++
+	}
+
+	// Due later, then pulled overdue so pollScheduledTasks arms a zero-delay timer.
+	overdueIDs := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		id, err := e.scheduleTask(time.Now().Add(time.Hour), "scheduledTick", nil)
+		if err != nil {
+			t.Fatalf("schedule overdue task: %v", err)
+		}
+		overdueIDs = append(overdueIDs, id)
+		want++
+	}
+	if err := e.db.Model(&TetherTask{}).Where("id IN ?", overdueIDs).Update("execute_at", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatalf("backdate overdue tasks: %v", err)
+	}
+
+	// Still ahead of now, but inside the poll lookahead, so the timer waits out a real delay.
+	delayedID, err := e.scheduleTask(time.Now().Add(time.Hour), "scheduledTick", nil)
+	if err != nil {
+		t.Fatalf("schedule delayed task: %v", err)
+	}
+	want++
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", delayedID).Update("execute_at", time.Now().Add(150*time.Millisecond)).Error; err != nil {
+		t.Fatalf("set delayed execute_at: %v", err)
+	}
+
+	e.pollScheduledTasks()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		e.timerMutex.RLock()
+		left := len(e.taskToTimer)
+		e.timerMutex.RUnlock()
+		if ran.Load() >= want && left == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			e.timerMutex.RLock()
+			ids := make([]string, 0, len(e.taskToTimer))
+			for id := range e.taskToTimer {
+				ids = append(ids, id)
+			}
+			e.timerMutex.RUnlock()
+			t.Fatalf("one-shot timers still tracked after tasks finished: ran %d/%d, remaining %v", ran.Load(), want, ids)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func loadCron(t *testing.T, e *Engine, id string) TetherTask {
 	t.Helper()
 	var got TetherTask
