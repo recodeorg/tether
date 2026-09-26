@@ -2297,6 +2297,137 @@ func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
 	}
 }
 
+func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
+	e := newTestEngine(t)
+	root := t.TempDir()
+	uploadDir := filepath.Join(root, "uploads")
+	store := local.NewLocalStorage(uploadDir)
+	recorder := &recordingStorage{local: store}
+	e.UseStorage(recorder)
+
+	sibling := filepath.Join(root, "outside.txt")
+	if err := os.WriteFile(sibling, []byte("sibling"), 0o644); err != nil {
+		t.Fatalf("write sibling: %v", err)
+	}
+	absTarget := filepath.Join(root, "absolute.txt")
+	if err := os.WriteFile(absTarget, []byte("absolute"), 0o644); err != nil {
+		t.Fatalf("write absolute target: %v", err)
+	}
+
+	storageCtx := &StorageCtx{DeleteFile: e.deleteFile}
+
+	t.Run("parent path without metadata", func(t *testing.T) {
+		err := storageCtx.DeleteFile("../outside.txt")
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("DeleteFile: %v, want record not found", err)
+		}
+		if len(recorder.deleted) != 0 {
+			t.Fatalf("adapter Delete called with %v", recorder.deleted)
+		}
+		if _, err := os.Stat(sibling); err != nil {
+			t.Fatalf("sibling file was removed: %v", err)
+		}
+	})
+
+	t.Run("absolute path without metadata", func(t *testing.T) {
+		err := storageCtx.DeleteFile(absTarget)
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("DeleteFile: %v, want record not found", err)
+		}
+		if len(recorder.deleted) != 0 {
+			t.Fatalf("adapter Delete called with %v", recorder.deleted)
+		}
+		if _, err := os.Stat(absTarget); err != nil {
+			t.Fatalf("absolute target was removed: %v", err)
+		}
+	})
+
+	t.Run("nonexistent metadata", func(t *testing.T) {
+		err := storageCtx.DeleteFile("missing-file")
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			t.Fatalf("DeleteFile: %v, want record not found", err)
+		}
+		if len(recorder.deleted) != 0 {
+			t.Fatalf("adapter Delete called with %v", recorder.deleted)
+		}
+	})
+
+	t.Run("stored parent path stays contained", func(t *testing.T) {
+		if err := e.db.Create(&TetherStorage{
+			ID:        "../outside.txt",
+			Token:     "parent-token",
+			Status:    "active",
+			ExpiresAt: time.Now().Add(time.Hour),
+		}).Error; err != nil {
+			t.Fatalf("create storage row: %v", err)
+		}
+		err := storageCtx.DeleteFile("../outside.txt")
+		if err == nil {
+			t.Fatal("stored parent path delete returned nil")
+		}
+		if _, statErr := os.Stat(sibling); statErr != nil {
+			t.Fatalf("sibling file was removed: %v", statErr)
+		}
+		var remaining int64
+		if err := e.db.Model(&TetherStorage{}).Where("id = ?", "../outside.txt").Count(&remaining).Error; err != nil {
+			t.Fatalf("count storage row: %v", err)
+		}
+		if remaining != 1 {
+			t.Fatalf("storage rows = %d, want 1 after rejected delete", remaining)
+		}
+	})
+}
+
+func TestDeleteFileRemovesStoredObject(t *testing.T) {
+	e := newTestEngine(t)
+	store := local.NewLocalStorage(t.TempDir())
+	e.UseStorage(store)
+
+	upload, err := e.getUploadURL(storage.UploadOptions{})
+	if err != nil {
+		t.Fatalf("getUploadURL: %v", err)
+	}
+	path := filepath.Join(store.UploadDir, upload.FileID)
+	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	if err := os.WriteFile(path+".mime", []byte("text/plain"), 0o644); err != nil {
+		t.Fatalf("write mime: %v", err)
+	}
+
+	if err := (&StorageCtx{DeleteFile: e.deleteFile}).DeleteFile(upload.FileID); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stored file still present: %v", err)
+	}
+	var remaining int64
+	if err := e.db.Model(&TetherStorage{}).Where("id = ?", upload.FileID).Count(&remaining).Error; err != nil {
+		t.Fatalf("count storage row: %v", err)
+	}
+	if remaining != 0 {
+		t.Fatalf("storage rows = %d, want 0", remaining)
+	}
+}
+
+type recordingStorage struct {
+	local   *local.LocalStorage
+	deleted []string
+}
+
+func (r *recordingStorage) UploadStream(ctx context.Context, fileID string, contentType string, req *http.Request) error {
+	return r.local.UploadStream(ctx, fileID, contentType, req)
+}
+
+func (r *recordingStorage) ServeFile(fileID string, w http.ResponseWriter, req *http.Request) error {
+	return r.local.ServeFile(fileID, w, req)
+}
+
+func (r *recordingStorage) Delete(fileID string) error {
+	r.deleted = append(r.deleted, fileID)
+	return r.local.Delete(fileID)
+}
+
 func serveStorage(e *Engine, method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, body)
 	for key, value := range headers {

@@ -1269,11 +1269,14 @@ func (e *Engine) deleteFile(fileID string) error {
 	if e.storage == nil {
 		return fmt.Errorf("storage not configured")
 	}
-	err := e.db.Where("id = ?", fileID).Delete(&TetherStorage{}).Error
-	if err != nil {
+	var record TetherStorage
+	if err := e.db.Where("id = ?", fileID).First(&record).Error; err != nil {
 		return err
 	}
-	return e.storage.Delete(fileID)
+	if err := e.storage.Delete(record.ID); err != nil {
+		return err
+	}
+	return e.db.Where("id = ?", record.ID).Delete(&TetherStorage{}).Error
 }
 
 // allowStorageOrigin applies the WebSocket origin policy to browser calls against
