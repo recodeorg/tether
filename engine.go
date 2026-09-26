@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"mime"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -1198,15 +1199,19 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // Checks if the mime type is safe to inline in the browser.
-func isSafeInlineMime(mime string) bool {
+func isSafeInlineMime(mimeType string) bool {
 	safePrefixes := []string{"image/", "video/", "audio/", "text/plain"}
+	mediaType, _, err := mime.ParseMediaType(mimeType)
+	if err != nil {
+		return false
+	}
 	for _, p := range safePrefixes {
-		if strings.HasPrefix(mime, p) {
+		if strings.HasPrefix(mediaType, p) {
 			// Block SVG because it can contain embedded JavaScript
-			return mime != "image/svg+xml"
+			return !strings.Contains(mediaType, "svg")
 		}
 	}
-	return mime == "application/pdf"
+	return mediaType == "application/pdf"
 }
 
 func (e *Engine) getUploadURL(opts storage.UploadOptions) (storage.UploadInfo, error) {
