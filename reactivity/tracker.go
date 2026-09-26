@@ -316,6 +316,14 @@ func (t *Tracker) UpdateTags(subID string, newTags []string) {
 	}
 }
 
+// SubscriptionHasTag reports whether subID currently tracks tag.
+func (t *Tracker) SubscriptionHasTag(subID, tag string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.subToTags[subID][tag]
+	return ok
+}
+
 func (t *Tracker) GetAuthFingerprint(sub *Subscription) string {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

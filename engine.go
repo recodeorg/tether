@@ -1353,7 +1353,10 @@ func (e *Engine) InvalidateTag(tag string) {
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
 // cause the same mutation to fire the query a second time. Matching
 // subscriptions (same query, params, and auth fingerprint) share one execution
-// and are fanned out with each client's own query_key.
+// and are fanned out with each client's own query_key. If that execution
+// records an auth tag the batch was not partitioned on, the result is delivered
+// only to the representative and every other subscription is executed under its
+// own identity.
 func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
 	start := time.Now()
 	seen := make(map[string]struct{})
@@ -1405,6 +1408,22 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 				slog.Error("Failed to execute query", "error", err)
 				return
 			}
+			// Batch membership was chosen from the previous execution's auth tags.
+			// A query can start calling GetIdentity (or a guard) only on this run.
+			// Sharing that result would leak the representative's identity-specific
+			// data and copy their new auth tag onto every other client.
+			if len(subscriptions) > 1 && queryDepsIntroduceAuthTag(e.tracker, representative.SubID, deps) {
+				e.publishQueryResult(representative, result, deps, cacheKey)
+				for _, subscription := range subscriptions[1:] {
+					result, deps, cacheKey, err := e.runQuery(subscription.Query, subscription.Params, subscription)
+					if err != nil {
+						slog.Error("Failed to execute query", "error", err)
+						continue
+					}
+					e.publishQueryResult(subscription, result, deps, cacheKey)
+				}
+				return
+			}
 			e.Profiler.Add(utilities.Metric{
 				ID:       execID,
 				Name:     "batch_execution:" + representative.Query,
@@ -1417,18 +1436,11 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 			// auto-tracked tags (e.g. new primary keys) stay in sync even though
 			// the query function ran only once.
 			for _, subscription := range subscriptions {
-				e.tracker.UpdateTags(subscription.SubID, deps)
-				responseJSON, err := marshalQueryMessage(representative.Query, result, subscription.QueryKey)
-				if err != nil {
-					slog.Error("Failed to encode query result", "error", err)
-					continue
+				key := ""
+				if subscription.SubID == representative.SubID {
+					key = cacheKey
 				}
-				e.tracker.SendMessage(subscription.Client.ID, responseJSON)
-			}
-			if dataJSON, err := json.Marshal(result); err == nil {
-				e.hashMu.Lock()
-				e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
-				e.hashMu.Unlock()
+				e.publishQueryResult(subscription, result, deps, key)
 			}
 		}(subscriptions)
 	}
@@ -1445,6 +1457,44 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 
 func marshalQueryMessage(query string, result interface{}, queryKey string) ([]byte, error) {
 	return json.Marshal(map[string]interface{}{"type": "query", "location": query, "data": result, "query_key": queryKey})
+}
+
+// queryDepsIntroduceAuthTag reports whether deps contain a permanent auth tag
+// (prefix "*") that subID was not already tracking. Those tags partition
+// batches, so a newly recorded one means this result is not safe to share.
+func queryDepsIntroduceAuthTag(tracker *reactivity.Tracker, subID string, deps []string) bool {
+	for _, dep := range deps {
+		if !strings.HasPrefix(dep, "*") {
+			continue
+		}
+		if !tracker.SubscriptionHasTag(subID, dep) {
+			return true
+		}
+	}
+	return false
+}
+
+// publishQueryResult records deps on one subscription and pushes result to its
+// client. An empty cacheKey skips the result hash, which the shared batch path
+// uses for every client other than the representative.
+func (e *Engine) publishQueryResult(subscription *reactivity.Subscription, result interface{}, deps []string, cacheKey string) {
+	e.tracker.UpdateTags(subscription.SubID, deps)
+	responseJSON, err := marshalQueryMessage(subscription.Query, result, subscription.QueryKey)
+	if err != nil {
+		slog.Error("Failed to encode query result", "error", err)
+		return
+	}
+	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+	if cacheKey == "" {
+		return
+	}
+	dataJSON, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+	e.hashMu.Lock()
+	e.queryHashes[cacheKey] = xxhash.Sum64(dataJSON)
+	e.hashMu.Unlock()
 }
 
 // runQuery executes the query function and returns the result plus the

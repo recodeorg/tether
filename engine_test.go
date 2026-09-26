@@ -1428,6 +1428,102 @@ func TestGuardsBatchQueriesOnInvalidation(t *testing.T) {
 	}
 }
 
+func TestInvalidateTagStillBatchesClientsWithTheSameIdentity(t *testing.T) {
+	e := newTestEngine(t)
+	a := trackClient(t, e)
+	b := trackClient(t, e)
+	e.tracker.SetAuth(a.ID, "alice", time.Now().Add(time.Hour))
+	e.tracker.SetAuth(b.ID, "alice", time.Now().Add(time.Hour))
+
+	var runs atomic.Int64
+	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		ctx.TrackCollection("settings", "key", "me")
+		id, _ := ctx.Auth.GetIdentity()
+		return id
+	})
+	subscribe(t, e, a, "me", "a", map[string]interface{}{})
+	subscribe(t, e, b, "me", "b", map[string]interface{}{})
+	drain(a)
+	drain(b)
+	if got, want := runs.Load(), int64(2); got != want {
+		t.Fatalf("initial runs = %d, want %d", got, want)
+	}
+
+	e.InvalidateTag("settings_key:me")
+	if got, want := runs.Load(), int64(3); got != want {
+		t.Errorf("runs after invalidate = %d, want %d (one batched execution)", got, want)
+	}
+	if data, n := lastQueryData(t, a); n != 1 || data != "alice" {
+		t.Errorf("client a got %d pushes, data = %v; want one push of alice", n, data)
+	}
+	if data, n := lastQueryData(t, b); n != 1 || data != "alice" {
+		t.Errorf("client b got %d pushes, data = %v; want one push of alice", n, data)
+	}
+}
+
+func TestInvalidateTagSplitsBatchWhenQueryBecomesIdentityDependent(t *testing.T) {
+	e := newTestEngine(t)
+	alice := trackClient(t, e)
+	bob := trackClient(t, e)
+	e.tracker.SetAuth(alice.ID, "alice", time.Now().Add(time.Hour))
+	e.tracker.SetAuth(bob.ID, "bob", time.Now().Add(time.Hour))
+
+	var private atomic.Bool
+	e.RegisterQuery("visibility", func(ctx *QueryCtx) interface{} {
+		ctx.TrackCollection("settings", "key", "visibility")
+		if !private.Load() {
+			return "public"
+		}
+		id, _ := ctx.Auth.GetIdentity()
+		return "private:" + id
+	})
+	params := map[string]interface{}{"k": "visibility"}
+	aliceSub := subscribe(t, e, alice, "visibility", "alice", params)
+	bobSub := subscribe(t, e, bob, "visibility", "bob", params)
+	if data, _ := lastQueryData(t, alice); data != "public" {
+		t.Fatalf("alice initial data = %v, want public", data)
+	}
+	if data, _ := lastQueryData(t, bob); data != "public" {
+		t.Fatalf("bob initial data = %v, want public", data)
+	}
+	if fp := e.tracker.GetAuthFingerprint(aliceSub); fp != "" {
+		t.Fatalf("alice auth fingerprint = %q, want empty before the private branch", fp)
+	}
+	if fp := e.tracker.GetAuthFingerprint(bobSub); fp != "" {
+		t.Fatalf("bob auth fingerprint = %q, want empty before the private branch", fp)
+	}
+
+	private.Store(true)
+	e.InvalidateTag("settings_key:visibility")
+
+	assertPrivate := func(client *reactivity.Client, want string) {
+		t.Helper()
+		msgs := queryMessages(t, drain(client))
+		if len(msgs) != 1 {
+			t.Fatalf("got %d query pushes, want 1: %v", len(msgs), msgs)
+		}
+		if msgs[0]["data"] != want {
+			t.Errorf("data = %v, want %q", msgs[0]["data"], want)
+		}
+	}
+	assertPrivate(alice, "private:alice")
+	assertPrivate(bob, "private:bob")
+
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:alice"), aliceSub.SubID) {
+		t.Error("alice is missing *user_identity:alice")
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:bob"), aliceSub.SubID) {
+		t.Error("alice tracked bob's identity tag")
+	}
+	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:bob"), bobSub.SubID) {
+		t.Error("bob is missing *user_identity:bob")
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:alice"), bobSub.SubID) {
+		t.Error("bob tracked alice's identity tag")
+	}
+}
+
 func TestGuardInvalidationRerunsAttachedQuery(t *testing.T) {
 	e := newTestEngine(t)
 	e.CreateTable(&testRoomMember{})
