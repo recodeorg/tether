@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/recodeorg/tether/storage"
 	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 )
@@ -18,12 +19,19 @@ type SchedulerCtx struct {
 	Cancel   func(taskID string) bool
 }
 
+type StorageCtx struct {
+	GetUploadURL   func(opts storage.UploadOptions) (storage.UploadInfo, error)
+	GetDownloadURL func(fileID string) (string, error)
+	DeleteFile     func(fileID string) error
+}
+
 type QueryCtx struct {
 	DB           *gorm.DB
 	Auth         *AuthCtx
 	Scheduler    *SchedulerCtx
 	Params       map[string]interface{}
 	Dependencies []string
+	Storage      *StorageCtx
 }
 
 func (c *QueryCtx) TrackCollection(tableName string, columnName string, value interface{}) {
@@ -42,6 +50,7 @@ type MutationCtx struct {
 	Scheduler *SchedulerCtx
 	Params    map[string]interface{}
 	Profiler  *utilities.Profiler
+	Storage   *StorageCtx
 }
 
 type GuardCtx struct {

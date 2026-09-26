@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -17,6 +19,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/storage"
 	"github.com/recodeorg/tether/utilities"
 	"github.com/robfig/cron/v3"
 	"gorm.io/driver/postgres"
@@ -39,6 +42,23 @@ type TetherTask struct {
 	IsCron       bool
 }
 
+type TetherStorage struct {
+	ID        string `gorm:"primaryKey"`  // file ID
+	Token     string `gorm:"uniqueIndex"` // token used to upload the file
+	Status    string `gorm:"index"`       // status of the upload (pending, completed, failed)
+	FileSize  int64
+	MaxBytes  int64     // maximum size allowed at upload time
+	MimeType  string    // MIME type of the file
+	ExpiresAt time.Time // time when the upload token expires
+	CreatedAt time.Time // time when the upload token was created
+}
+
+type TetherDownloadToken struct {
+	Token     string    `gorm:"primaryKey"`
+	FileID    string    `gorm:"index"`
+	ExpiresAt time.Time // time when the download token expires
+}
+
 type Engine struct {
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
@@ -55,6 +75,7 @@ type Engine struct {
 	websocketHelper *reactivity.WebsocketHelper
 	Profiler        *utilities.Profiler
 	EphemeralID     string
+	storage         storage.StorageAdapter
 }
 
 type Mutation struct {
@@ -518,6 +539,12 @@ func (e *Engine) startScheduler(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+func (e *Engine) UseStorage(storage storage.StorageAdapter) {
+	e.storage = storage
+	e.CreateTable("_tether_storage", []TetherStorage{})
+	e.CreateTable("_tether_download_tokens", []TetherDownloadToken{})
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -1090,11 +1117,207 @@ func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
 	reactivity.Handle(w, r, e, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
 }
 
+func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
+	if e.storage == nil {
+		http.Error(w, "Storage not configured", http.StatusNotImplemented)
+		return
+	}
+	if !e.allowStorageOrigin(w, r) {
+		return
+	}
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/storage/upload/") {
+		token := filepath.Base(r.URL.Path)
+
+		var record TetherStorage
+		err := e.db.Where("token = ? AND status = 'pending' AND expires_at > ?", token, time.Now()).First(&record).Error
+		if err != nil {
+			http.Error(w, "Not found", http.StatusNotFound)
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, record.MaxBytes)
+		contentType := r.Header.Get("Content-Type")
+		if contentType == "" {
+			contentType = "application/octet-stream"
+		}
+
+		err = e.storage.UploadStream(r.Context(), record.ID, contentType, r)
+		if err != nil {
+			slog.Error("Failed to upload file", "error", err)
+			http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+			return
+		}
+		e.db.Model(&record).Updates(map[string]interface{}{
+			"status":    "active",
+			"mime_type": contentType,
+			"file_size": r.ContentLength,
+		})
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/storage/file/") {
+		token := filepath.Base(r.URL.Path)
+
+		var dlToken TetherDownloadToken
+		err := e.db.Where("token = ? AND expires_at > ?", token, time.Now()).First(&dlToken).Error
+		if err != nil {
+			http.Error(w, "Invalid or expired download link", http.StatusUnauthorized)
+			return
+		}
+
+		var record TetherStorage
+		err = e.db.Where("id = ? AND status = 'active'", dlToken.FileID).First(&record).Error
+		if err != nil {
+			slog.Error("Failed to serve file", "error", err)
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		if record.MimeType != "" {
+			w.Header().Set("Content-Type", record.MimeType)
+		}
+
+		err = e.storage.ServeFile(dlToken.FileID, w, r)
+		if err != nil {
+			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
+		}
+		return
+	}
+}
+
+func (e *Engine) getUploadURL(opts storage.UploadOptions) (storage.UploadInfo, error) {
+	if e.storage == nil {
+		return storage.UploadInfo{}, fmt.Errorf("storage not configured")
+	}
+
+	fileID := uuid.NewString()
+	token := uuid.NewString()
+	maxBytes := opts.MaxBytes
+	expiresIn := opts.ExpiresIn
+	if maxBytes == 0 {
+		maxBytes = 1024 * 1024 * 20 // 20MB
+	}
+	if expiresIn == 0 {
+		expiresIn = time.Minute * 15 // 15 minutes
+	}
+
+	err := e.db.Create(&TetherStorage{
+		ID:        fileID,
+		Token:     token,
+		Status:    "pending",
+		MaxBytes:  maxBytes,
+		ExpiresAt: time.Now().Add(expiresIn),
+	}).Error
+	if err != nil {
+		return storage.UploadInfo{}, err
+	}
+	return storage.UploadInfo{
+		FileID:    fileID,
+		UploadURL: "/storage/upload/" + token,
+	}, nil
+}
+
+func (e *Engine) getDownloadURL(fileID string) (string, error) {
+	if e.storage == nil {
+		return "", fmt.Errorf("storage not configured")
+	}
+
+	token := uuid.NewString()
+	expiresIn := time.Minute * 15 // 15 minutes
+
+	err := e.db.Create(&TetherDownloadToken{
+		Token:     token,
+		FileID:    fileID,
+		ExpiresAt: time.Now().Add(expiresIn),
+	}).Error
+	if err != nil {
+		return "", err
+	}
+	return "/storage/file/" + token, nil
+}
+
+func (e *Engine) deleteFile(fileID string) error {
+	if e.storage == nil {
+		return fmt.Errorf("storage not configured")
+	}
+	err := e.db.Where("id = ?", fileID).Delete(&TetherStorage{}).Error
+	if err != nil {
+		return err
+	}
+	return e.storage.Delete(fileID)
+}
+
+// allowStorageOrigin applies the WebSocket origin policy to browser calls against
+// storage routes. Requests with no Origin header are allowed so non-browser
+// clients can still use an upload or download token. An allowed browser origin
+// receives the CORS headers a cross-origin upload or download needs.
+func (e *Engine) allowStorageOrigin(w http.ResponseWriter, r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	if !originHeaderOK(origin) || !e.originPermitted(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return false
+	}
+	header := w.Header()
+	header.Set("Access-Control-Allow-Origin", origin)
+	header.Add("Vary", "Origin")
+	header.Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
+	if requested := r.Header.Get("Access-Control-Request-Headers"); requested != "" {
+		header.Set("Access-Control-Allow-Headers", requested)
+	} else {
+		header.Set("Access-Control-Allow-Headers", "Content-Type")
+	}
+	header.Set("Access-Control-Max-Age", "600")
+	return true
+}
+
+func (e *Engine) originPermitted(r *http.Request) bool {
+	if e.websocketHelper != nil && e.websocketHelper.CheckOrigin != nil {
+		return e.websocketHelper.CheckOrigin(r)
+	}
+	return sameOrigin(r)
+}
+
+func originHeaderOK(origin string) bool {
+	if strings.ContainsAny(origin, "\r\n") {
+		return false
+	}
+	parsed, err := url.Parse(origin)
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return false
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return false
+	}
+	return parsed.Path == "" || parsed.Path == "/"
+}
+
+func sameOrigin(r *http.Request) bool {
+	parsed, err := url.Parse(r.Header.Get("Origin"))
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(parsed.Host, r.Host)
+}
+
+// SetCheckOrigin sets the function that accepts or rejects browser origins.
+// It applies to WebSocket upgrades and to storage routes served by the engine.
 func (e *Engine) SetCheckOrigin(checkOrigin func(r *http.Request) bool) {
 	e.websocketHelper.CheckOrigin = checkOrigin
 }
 
-// Simple helper to set the allowed origins for the websocket connection
+// SetAllowedOrigins allows the listed origins for WebSocket upgrades and storage
+// routes. Browsers calling those storage routes from an allowed origin receive
+// the CORS headers the request needs.
 func (e *Engine) SetAllowedOrigins(allowedOrigins []string) {
 	e.websocketHelper.CheckOrigin = func(r *http.Request) bool {
 		return slices.Contains(allowedOrigins, r.Header.Get("Origin"))
@@ -1248,6 +1471,11 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		Params:       params,
 		Dependencies: []string{},
 	}
+	queryCtx.Storage = &StorageCtx{
+		GetUploadURL:   e.getUploadURL,
+		GetDownloadURL: e.getDownloadURL,
+		DeleteFile:     e.deleteFile,
+	}
 	queryCtx.Scheduler = &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
@@ -1351,7 +1579,11 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 			return nil, fmt.Errorf("guards cannot be executed internally")
 		},
 	}
-	mutationCtx := &MutationCtx{DB: e.db, Auth: authCtx, Params: params, Profiler: e.Profiler, Scheduler: &SchedulerCtx{
+	mutationCtx := &MutationCtx{DB: e.db, Storage: &StorageCtx{
+		GetUploadURL:   e.getUploadURL,
+		GetDownloadURL: e.getDownloadURL,
+		DeleteFile:     e.deleteFile,
+	}, Auth: authCtx, Params: params, Profiler: e.Profiler, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
 		},
@@ -1412,7 +1644,11 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 		return result, nil
 	}
 
-	mutationCtx := &MutationCtx{DB: scopedDB, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
+	mutationCtx := &MutationCtx{DB: scopedDB, Storage: &StorageCtx{
+		GetUploadURL:   e.getUploadURL,
+		GetDownloadURL: e.getDownloadURL,
+		DeleteFile:     e.deleteFile,
+	}, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
 		},

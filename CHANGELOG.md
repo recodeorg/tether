@@ -1,6 +1,8 @@
-## [Unreleased]
-
-- Easy file uploads
+## [0.7.0] - 2026-09-26
+### Added
+- Simple file upload API, provided through adapters
+- Official local file storage adapter
+- Official S3/S3-compatible adapter
 
 ## [0.6.0] - 2026-09-25
 ### Added
