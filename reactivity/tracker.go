@@ -46,6 +46,36 @@ func NewTracker() *Tracker {
 	}
 }
 
+// resetAuthorization drops the client's guard subscriptions and every
+// permanent (*) tag on its query subscriptions, since those encode decisions
+// made under the previous identity. It returns the query subscriptions so the
+// caller can re-run them. Callers must hold t.mu.
+func (t *Tracker) resetAuthorization(clientID string) []*Subscription {
+	subscriptions := make([]*Subscription, 0, len(t.clientToSubs[clientID]))
+	for subID := range t.clientToSubs[clientID] {
+		sub, ok := t.subscriptions[subID]
+		if !ok {
+			continue
+		}
+		for _, guardID := range sub.LinkedSubIDs {
+			t.removeSubscription(guardID)
+		}
+		sub.LinkedSubIDs = nil
+		for tag := range t.subToTags[subID] {
+			if !strings.HasPrefix(tag, "*") {
+				continue
+			}
+			delete(t.subToTags[subID], tag)
+			delete(t.tagsToSubs[tag], subID)
+			if len(t.tagsToSubs[tag]) == 0 {
+				delete(t.tagsToSubs, tag)
+			}
+		}
+		subscriptions = append(subscriptions, sub)
+	}
+	return subscriptions
+}
+
 func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardName string, params map[string]interface{}) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -126,14 +156,43 @@ func (t *Tracker) removeSubscription(subID string) {
 	delete(t.subscriptions, subID)
 }
 
-func (t *Tracker) SetAuth(clientID string, userID string, expiresAt time.Time) {
+// SetAuth updates the client's identity. When the user ID changes, cached
+// authorization state is reset and the client's query subscriptions are
+// returned so the caller can re-run them under the new identity.
+func (t *Tracker) SetAuth(clientID string, userID string, expiresAt time.Time) []*Subscription {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if client, exists := t.clients[clientID]; exists {
-		client.SetAuth(userID, expiresAt)
-	} else {
+	client, exists := t.clients[clientID]
+	if !exists {
 		slog.Error("Tracker: Client not found", "clientID", clientID)
+		return nil
 	}
+	changed := client.GetAuth().UserID != userID
+	client.SetAuth(userID, expiresAt)
+	if !changed {
+		return nil
+	}
+	return t.resetAuthorization(clientID)
+}
+
+// ExpireAuth clears the client's identity if it still holds the credential
+// expiring at expiresAt, resetting authorization state like SetAuth.
+func (t *Tracker) ExpireAuth(clientID string, expiresAt time.Time) []*Subscription {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	client, exists := t.clients[clientID]
+	if !exists {
+		return nil
+	}
+	auth := client.GetAuth()
+	if !auth.ExpiresAt.Equal(expiresAt) {
+		return nil
+	}
+	client.SetAuth("", time.Time{})
+	if auth.UserID == "" {
+		return nil
+	}
+	return t.resetAuthorization(clientID)
 }
 
 func (t *Tracker) GetAuth(clientID string) (AuthCtx, bool) {

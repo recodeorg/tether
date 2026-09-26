@@ -1621,6 +1621,172 @@ func TestAuthExpiryClearsOnlyThatClient(t *testing.T) {
 	}
 }
 
+// registerSecretQuery wires up a query guarded by an identity check. The guard
+// allows only allowedUser; the query tracks table_refresh:mutated so tests can
+// force re-runs.
+func registerSecretQuery(e *Engine, allowedUser string, guardRuns *atomic.Int64) {
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+		guardRuns.Add(1)
+		id, _ := ctx.Auth.GetIdentity()
+		return id != "" && id == allowedUser
+	})
+	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+		ctx.TrackCollection("table", "refresh", "mutated")
+		allowed, err := ctx.Auth.ExecuteGuard("isAllowed", map[string]interface{}{})
+		if err != nil {
+			return "ERROR"
+		}
+		if ok, _ := allowed.(bool); ok {
+			return "SECRET"
+		}
+		return "DENIED"
+	}, nil)
+}
+
+func emptyParamsHash() string {
+	paramsJSON, _ := json.Marshal(map[string]interface{}{})
+	return strconv.FormatUint(xxhash.Sum64(paramsJSON), 10)
+}
+
+func lastQueryData(t *testing.T, client *reactivity.Client) (interface{}, int) {
+	t.Helper()
+	msgs := queryMessages(t, drain(client))
+	if len(msgs) == 0 {
+		return nil, 0
+	}
+	return msgs[len(msgs)-1]["data"], len(msgs)
+}
+
+func waitForQueryData(t *testing.T, client *reactivity.Client, want interface{}) bool {
+	t.Helper()
+	return waitUntil(t, time.Second, func() bool {
+		data, n := lastQueryData(t, client)
+		return n > 0 && data == want
+	})
+}
+
+func TestAuthExpiryRevokesGuardedSubscription(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	var guardRuns atomic.Int64
+	registerSecretQuery(e, "alice", &guardRuns)
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(100 * time.Millisecond)})
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	subscribe(t, e, client, "secret", "secret", nil)
+	if data, _ := lastQueryData(t, client); data != "SECRET" {
+		t.Fatalf("initial data = %v, want SECRET", data)
+	}
+
+	if !waitForQueryData(t, client, "DENIED") {
+		t.Fatal("expiry did not push DENIED to the guarded subscription")
+	}
+	if auth, _ := e.tracker.GetAuth(client.ID); auth.UserID != "" {
+		t.Fatalf("auth after expiry = %+v, want cleared", auth)
+	}
+
+	e.InvalidateTag("table_refresh:mutated")
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != "DENIED" {
+		t.Errorf("after mutation got %d pushes, last = %v; want 1 push of DENIED", n, data)
+	}
+	if got := guardRuns.Load(); got < 2 {
+		t.Errorf("guard runs = %d, want the guard re-executed after expiry", got)
+	}
+}
+
+func TestReauthAsDifferentUserRevokesGuardedSubscription(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	var guardRuns atomic.Int64
+	registerSecretQuery(e, "alice", &guardRuns)
+
+	auth := &stubAuth{userID: "alice", expiresAt: time.Now().Add(time.Hour)}
+	e.SetAuth(auth)
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "alice"}); err != nil {
+		t.Fatalf("auth alice: %v", err)
+	}
+	sub := subscribe(t, e, client, "secret", "secret", nil)
+	if data, _ := lastQueryData(t, client); data != "SECRET" {
+		t.Fatalf("initial data = %v, want SECRET", data)
+	}
+
+	auth.userID = "bob"
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "bob"}); err != nil {
+		t.Fatalf("auth bob: %v", err)
+	}
+	if data, n := lastQueryData(t, client); n == 0 || data != "DENIED" {
+		t.Fatalf("after reauth as bob last push = %v (%d pushes), want DENIED", data, n)
+	}
+
+	e.InvalidateTag("table_refresh:mutated")
+	if data, n := lastQueryData(t, client); n != 1 || data != "DENIED" {
+		t.Errorf("after mutation got %d pushes, last = %v; want 1 push of DENIED", n, data)
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*guard_isAllowed_"+emptyParamsHash()+":true"), sub.SubID) {
+		t.Error("alice's cached guard fingerprint survived reauth")
+	}
+}
+
+func TestTokenRefreshForSameUserKeepsGuardedSubscription(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	var guardRuns atomic.Int64
+	registerSecretQuery(e, "alice", &guardRuns)
+
+	auth := &stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)}
+	e.SetAuth(auth)
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "first"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	subscribe(t, e, client, "secret", "secret", nil)
+	drain(client)
+
+	auth.expiresAt = time.Now().Add(time.Hour)
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "refreshed"}); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+
+	if got, _ := e.tracker.GetAuth(client.ID); got.UserID != "alice" {
+		t.Fatalf("first token's expiry cleared the refreshed auth: %+v", got)
+	}
+	e.InvalidateTag("table_refresh:mutated")
+	if data, n := lastQueryData(t, client); n == 0 || data != "SECRET" {
+		t.Errorf("after refresh last push = %v (%d pushes), want SECRET", data, n)
+	}
+	if got := guardRuns.Load(); got != 1 {
+		t.Errorf("guard runs = %d, want 1 (same identity keeps the cached decision)", got)
+	}
+}
+
+func TestAuthExpiryRerunsIdentityQuery(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+		id, _ := ctx.Auth.GetIdentity()
+		return id
+	}, nil)
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)})
+	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	sub := subscribe(t, e, client, "me", "me", nil)
+	if data, _ := lastQueryData(t, client); data != "alice" {
+		t.Fatalf("initial data = %v, want alice", data)
+	}
+
+	if !waitForQueryData(t, client, "") {
+		t.Fatal("expiry did not re-run the identity query")
+	}
+	if hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:alice"), sub.SubID) {
+		t.Error("stale *user_identity:alice tag survived expiry")
+	}
+}
+
 func TestAuthExpiryAfterDisconnectDoesNotPanic(t *testing.T) {
 	if os.Getenv("TETHER_TEST_CHILD") == "1" {
 		e := newTestEngine(t)

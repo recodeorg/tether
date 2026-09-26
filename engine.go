@@ -1676,6 +1676,16 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	return result, nil
 }
 
+// rerunSubscriptions force-pushes fresh results for subscriptions whose
+// authorization state was reset by an identity change.
+func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
+	for _, subscription := range subscriptions {
+		if _, err := e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true); err != nil {
+			slog.Error("Failed to re-run query after auth change", "query", subscription.Query, "error", err)
+		}
+	}
+}
+
 func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) error {
 	slog.Debug("Received message", "from", clientID, "message", msg)
 	switch msg["type"] {
@@ -1747,21 +1757,15 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			Duration: time.Since(start),
 			Tags:     []string{},
 		})
-		time.AfterFunc(time.Until(expiresAt), func() {
-			auth, ok := e.tracker.GetAuth(clientID)
-			if !ok {
-				return
-			}
-			if time.Time.Equal(auth.ExpiresAt, expiresAt) {
-				e.tracker.SetAuth(clientID, "", time.Time{})
-			}
-		})
 		if err != nil {
 			slog.Error("Failed to get user ID", "error", err)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to get user ID"}`))
 			return err
 		}
-		e.tracker.SetAuth(clientID, userID, expiresAt)
+		e.rerunSubscriptions(e.tracker.SetAuth(clientID, userID, expiresAt))
+		time.AfterFunc(time.Until(expiresAt), func() {
+			e.rerunSubscriptions(e.tracker.ExpireAuth(clientID, expiresAt))
+		})
 		message := map[string]interface{}{"type": "auth", "success": true, "data": map[string]interface{}{"user_id": userID}}
 		messageJSON, err := json.Marshal(message)
 		if err != nil {
