@@ -1863,18 +1863,31 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 		subscription := e.tracker.SubscribeToQuery(clientID, query, queryKey, params)
 		if subscription == nil {
 			slog.Error("Failed to subscribe to query", "query", query, "params", params)
+			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to subscribe to query"}`))
 			return nil
 		}
-		e.ExecuteQuery(query, params, subscription, true)
+		_, err := e.ExecuteQuery(query, params, subscription, true)
+		if err != nil {
+			slog.Error("Failed to execute query", "query", query, "params", params, "error", err)
+			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute query", "query_key": queryKey, "params": params})
+			if err != nil {
+				slog.Error("Failed to encode error message", "error", err)
+				return fmt.Errorf("failed to encode error message: %w", err)
+			}
+			e.tracker.SendMessage(clientID, responseJSON)
+			return err
+		}
 	case "unsubscribe":
 		query, ok := msg["location"].(string)
 		if !ok {
 			slog.Error("Invalid message", "message", msg)
+			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Invalid message"}`))
 			return nil
 		}
 		params, ok := msg["params"].(map[string]interface{})
 		if !ok {
 			slog.Error("Invalid message", "message", msg)
+			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Invalid message"}`))
 			return nil
 		}
 		e.tracker.UnsubscribeFromQuery(clientID, query, params)
@@ -1894,11 +1907,22 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			slog.Error("Invalid message", "message", msg)
 			return nil
 		}
-		e.ExecuteMutation(mutation, params, clientID, mutationID)
+		_, err := e.ExecuteMutation(mutation, params, clientID, mutationID)
+		if err != nil {
+			slog.Error("Failed to execute mutation", "mutation", mutation, "params", params, "error", err)
+			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute mutation", "mutation": mutation, "mutation_id": mutationID, "params": params})
+			if err != nil {
+				slog.Error("Failed to encode error message", "error", err)
+				return fmt.Errorf("failed to encode error message: %w", err)
+			}
+			e.tracker.SendMessage(clientID, responseJSON)
+			return fmt.Errorf("failed to execute mutation: %w", err)
+		}
 	case "auth":
 		token, ok := msg["token"].(string)
 		if !ok {
 			slog.Error("Invalid message", "message", msg)
+			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Invalid message"}`))
 			return nil
 		}
 		start := time.Now()
@@ -1915,7 +1939,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 		if err != nil {
 			slog.Error("Failed to get user ID", "error", err)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to get user ID"}`))
-			return err
+			return fmt.Errorf("failed to get user ID: %w", err)
 		}
 		e.rerunSubscriptions(e.tracker.SetAuth(clientID, userID, expiresAt))
 		time.AfterFunc(time.Until(expiresAt), func() {
@@ -1931,7 +1955,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 		if err != nil {
 			slog.Error("Failed to encode auth message", "error", err)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to encode auth message"}`))
-			return err
+			return fmt.Errorf("failed to encode auth message: %w", err)
 		}
 		e.tracker.SendMessage(clientID, messageJSON)
 		return nil
