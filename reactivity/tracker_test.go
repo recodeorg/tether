@@ -293,6 +293,46 @@ func TestUpdateTagsReplacesGuardResultWithSameNameAndParams(t *testing.T) {
 	assertTrackerConsistent(t, tr)
 }
 
+func TestDropGuardsClearsGuardResultsAndSubscriptions(t *testing.T) {
+	tr := NewTracker()
+	client := NewClient(nil)
+	tr.Track(client)
+	epoch := client.GetAuth().AuthEpoch
+
+	sub := tr.SubscribeToQuery(client.ID, "q", "k", nil)
+	tr.AttachGuardToSubscription(sub.SubID, "guard-a", "a", map[string]interface{}{}, []string{"perms-a"}, epoch)
+	tr.AttachGuardToSubscription(sub.SubID, "guard-b", "b", map[string]interface{}{}, []string{"perms-b"}, epoch)
+	identity := "*user_identity:alice"
+	tr.UpdateTags(sub.SubID, []string{"data", identity, "*guard_a_1:true", "*guard_b_1:true"})
+
+	tr.DropGuards("guard-a")
+
+	for _, guardID := range []string{"guard-a", "guard-b"} {
+		if _, ok := tr.GetSubscription(guardID); ok {
+			t.Errorf("guard subscription %q still tracked", guardID)
+		}
+	}
+	if len(sub.LinkedSubIDs) != 0 {
+		t.Errorf("query still links guards %v", sub.LinkedSubIDs)
+	}
+	for _, tag := range []string{"*guard_a_1:true", "*guard_b_1:true"} {
+		if tr.SubscriptionHasTag(sub.SubID, tag) {
+			t.Errorf("query kept guard result %q", tag)
+		}
+	}
+	for _, tag := range []string{"data", identity} {
+		if !tr.SubscriptionHasTag(sub.SubID, tag) {
+			t.Errorf("query lost non-guard tag %q", tag)
+		}
+	}
+	for _, tag := range []string{"perms-a", "perms-b"} {
+		if n := len(tr.GetSubscriptionsToTag(tag)); n != 0 {
+			t.Errorf("GetSubscriptionsToTag(%q) = %d subs, want 0", tag, n)
+		}
+	}
+	assertTrackerConsistent(t, tr)
+}
+
 func TestUntrackRemovesClientFromAllMaps(t *testing.T) {
 	tr := NewTracker()
 	client := NewClient(nil)

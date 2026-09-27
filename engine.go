@@ -183,7 +183,9 @@ func (e *Engine) prepareGuardCtx(params map[string]interface{}, authID, execID, 
 // reevaluateGuard runs a guard subscription after one of its data tags changed.
 // Identity and DB dependencies stay on the guard; the attached query only
 // stores the *guard_ fingerprint used for batching. Returns the attached
-// query subscription when that fingerprint actually changed.
+// query subscription when that fingerprint actually changed. If the guard
+// fails, the query's cached guard results are dropped so it cannot keep using
+// a grant that could not be revalidated.
 func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID string) (rerun *reactivity.Subscription) {
 	// Runs on the caller's goroutine, before InvalidateTags starts workers.
 	// A panicking guard would otherwise take down that caller: the postgres
@@ -191,6 +193,7 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("Recovered from panic", "error", r)
+			e.tracker.DropGuards(subscription.SubID)
 			rerun = nil
 		}
 	}()
@@ -212,6 +215,7 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 	guardResult, err := executeGuard(e, guardCtx, guardName)
 	if err != nil {
 		slog.Error("Failed to execute guard", "error", err)
+		e.tracker.DropGuards(subscription.SubID)
 		return nil
 	}
 	if !e.tracker.UpdateTagsAtEpoch(subscription.SubID, guardCtx.Dependencies, auth.AuthEpoch) {
@@ -220,11 +224,13 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 	guardResultJSON, err := json.Marshal(guardResult)
 	if err != nil {
 		slog.Error("Failed to marshal guard result", "error", err)
+		e.tracker.DropGuards(subscription.SubID)
 		return nil
 	}
 	paramsJSON, err := json.Marshal(subscription.Params)
 	if err != nil {
 		slog.Error("Failed to marshal params", "error", err)
+		e.tracker.DropGuards(subscription.SubID)
 		return nil
 	}
 	paramsHash := xxhash.Sum64(paramsJSON)

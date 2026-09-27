@@ -497,6 +497,37 @@ func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsH
 	return true
 }
 
+// DropGuards discards every cached guard result on the query attached to
+// guardID, along with its guard subscriptions, so the query's next run must
+// execute its guards again. It is a no-op if guardID is no longer tracked.
+func (t *Tracker) DropGuards(guardID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	guard, ok := t.subscriptions[guardID]
+	if !ok || len(guard.LinkedSubIDs) == 0 {
+		return
+	}
+	querySub, ok := t.subscriptions[guard.LinkedSubIDs[0]]
+	if !ok {
+		t.removeSubscription(guardID)
+		return
+	}
+	for _, linkedID := range querySub.LinkedSubIDs {
+		t.removeSubscription(linkedID)
+	}
+	querySub.LinkedSubIDs = nil
+	for tag := range t.subToTags[querySub.SubID] {
+		if !strings.HasPrefix(tag, "*guard_") {
+			continue
+		}
+		delete(t.subToTags[querySub.SubID], tag)
+		delete(t.tagsToSubs[tag], querySub.SubID)
+		if len(t.tagsToSubs[tag]) == 0 {
+			delete(t.tagsToSubs, tag)
+		}
+	}
+}
+
 func (t *Tracker) GetSubscriptionsToTag(tag string) []*Subscription {
 	t.mu.RLock()
 	defer t.mu.RUnlock()

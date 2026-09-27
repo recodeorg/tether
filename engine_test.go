@@ -2046,6 +2046,65 @@ func TestGuardPanicOnReevaluationDoesNotStopInvalidation(t *testing.T) {
 	}
 }
 
+func TestFailedGuardReevaluationRevokesCachedGrant(t *testing.T) {
+	cases := []struct {
+		name string
+		fail func() interface{}
+	}{
+		{"panic", func() interface{} { panic("guard boom") }},
+		{"unmarshalable result", func() interface{} { return func() {} }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEngine(t)
+			client := trackClient(t, e)
+			e.tracker.SetAuth(client.ID, "user-1", time.Now().Add(time.Hour))
+
+			var guardEvals atomic.Int64
+			e.RegisterGuard("canRead", func(ctx *GuardCtx) interface{} {
+				ctx.TrackTable("permissions")
+				if guardEvals.Add(1) > 1 {
+					return tc.fail()
+				}
+				return true
+			})
+			var secretVersion atomic.Int64
+			secretVersion.Store(1)
+			e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+				ctx.TrackTable("secrets")
+				allowed, err := ctx.Auth.ExecuteGuard("canRead", map[string]interface{}{})
+				if err != nil || allowed != true {
+					return "DENIED"
+				}
+				return fmt.Sprintf("SECRET-%d", secretVersion.Load())
+			})
+			sub := subscribe(t, e, client, "secret", "secret", nil)
+			if data, n := lastQueryData(t, client); n != 1 || data != "SECRET-1" {
+				t.Fatalf("initial push: %d pushes, data = %v; want one push of SECRET-1", n, data)
+			}
+
+			e.invalidateTag("table_permissions:mutated")
+			if guardEvals.Load() != 2 {
+				t.Fatalf("guard evals after permissions change = %d, want 2", guardEvals.Load())
+			}
+			if fp := e.tracker.GetAuthFingerprint(sub); strings.Contains(fp, "*guard_") {
+				t.Fatalf("query kept guard fingerprint after failed revalidation: %q", fp)
+			}
+
+			secretVersion.Store(2)
+			e.invalidateTag("table_secrets:mutated")
+			if guardEvals.Load() != 3 {
+				t.Errorf("guard evals after secrets change = %d, want 3 (query must revalidate)", guardEvals.Load())
+			}
+			for _, msg := range queryMessages(t, drain(client)) {
+				if msg["data"] == "SECRET-2" {
+					t.Fatalf("client received SECRET-2 after failed guard revalidation")
+				}
+			}
+		})
+	}
+}
+
 func TestFailedAuthDoesNotSetIdentityOrPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
