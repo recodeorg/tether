@@ -493,7 +493,7 @@ func subscribe(t *testing.T, e *Engine, client *reactivity.Client, query, queryK
 	if sub == nil {
 		t.Fatal("SubscribeToQuery returned nil")
 	}
-	if _, err := e.ExecuteQuery(query, params, sub, true); err != nil {
+	if _, err := e.ExecuteQuery(query, params, sub); err != nil {
 		t.Fatalf("ExecuteQuery(%q): %v", query, err)
 	}
 	return sub
@@ -1401,7 +1401,7 @@ func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 
 	var err error
 	mustNoPanic(t, "ExecuteQuery(bad params)", func() {
-		_, err = e.ExecuteQuery("noop", map[string]interface{}{"ch": make(chan int)}, sub, true)
+		_, err = e.ExecuteQuery("noop", map[string]interface{}{"ch": make(chan int)}, sub)
 	})
 	if err == nil {
 		t.Error("ExecuteQuery with unmarshalable params returned nil error")
@@ -1416,7 +1416,7 @@ func TestExecuteQueryUnserializableResultDoesNotPanic(t *testing.T) {
 
 	var err error
 	mustNoPanic(t, "ExecuteQuery(bad result)", func() {
-		_, err = e.ExecuteQuery("bad", map[string]interface{}{}, sub, true)
+		_, err = e.ExecuteQuery("bad", map[string]interface{}{}, sub)
 	})
 	if err == nil {
 		t.Error("ExecuteQuery with unmarshalable result returned nil error")
@@ -1429,7 +1429,7 @@ func TestUnknownQueryDoesNotPanic(t *testing.T) {
 	sub := e.tracker.SubscribeToQuery(client.ID, "missing", "k", map[string]interface{}{})
 
 	mustNoPanic(t, "ExecuteQuery(unknown)", func() {
-		_, err := e.ExecuteQuery("missing", map[string]interface{}{}, sub, true)
+		_, err := e.ExecuteQuery("missing", map[string]interface{}{}, sub)
 		if err == nil {
 			t.Error("ExecuteQuery(unknown) returned nil error")
 		}
@@ -1483,32 +1483,7 @@ func TestMalformedAuthDoesNotPanic(t *testing.T) {
 	})
 }
 
-func TestQueryHashSkipsUnchangedPushUnlessForced(t *testing.T) {
-	e := newTestEngine(t)
-	client := trackClient(t, e)
-
-	e.RegisterQuery("const", func(ctx *QueryCtx) interface{} {
-		return map[string]interface{}{"n": 1}
-	})
-	sub := subscribe(t, e, client, "const", "k", map[string]interface{}{"p": 1})
-	drain(client)
-
-	if _, err := e.ExecuteQuery("const", map[string]interface{}{"p": 1}, sub, false); err != nil {
-		t.Fatalf("ExecuteQuery: %v", err)
-	}
-	if got := drain(client); len(got) != 0 {
-		t.Errorf("unchanged query with forceSend=false pushed %d messages, want 0", len(got))
-	}
-
-	if _, err := e.ExecuteQuery("const", map[string]interface{}{"p": 1}, sub, true); err != nil {
-		t.Fatalf("ExecuteQuery force: %v", err)
-	}
-	if got := drain(client); len(got) != 1 {
-		t.Errorf("unchanged query with forceSend=true pushed %d messages, want 1", len(got))
-	}
-}
-
-func TestStaleInvalidationDoesNotRegressQueryResult(t *testing.T) {
+func TestStaleInvalidationOrdersTimestamps(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
 
@@ -1532,7 +1507,7 @@ func TestStaleInvalidationDoesNotRegressQueryResult(t *testing.T) {
 		return map[string]interface{}{"v": v}
 	})
 
-	sub := subscribe(t, e, client, "counter", "k", params)
+	subscribe(t, e, client, "counter", "k", params)
 	initial := queryMessages(t, drain(client))
 	if len(initial) != 1 {
 		t.Fatalf("initial messages = %d, want 1", len(initial))
@@ -1588,33 +1563,6 @@ func TestStaleInvalidationDoesNotRegressQueryResult(t *testing.T) {
 	tsOlder := timestampOf(msgs[1])
 	if !(initialTS < tsOlder && tsOlder < tsNewer) {
 		t.Fatalf("timestamps = subscribe %v, slow %v, fast %v; want subscribe < slow < fast", initialTS, tsOlder, tsNewer)
-	}
-
-	raw, err := json.Marshal(map[string]interface{}{"v": int64(2)})
-	if err != nil {
-		t.Fatalf("marshal version 2: %v", err)
-	}
-	wantHash := xxhash.Sum64(raw)
-	e.hashMu.Lock()
-	if len(e.queryHashes) != 1 {
-		t.Fatalf("stored hashes = %d, want 1", len(e.queryHashes))
-	}
-	for _, entry := range e.queryHashes {
-		if entry.hash != wantHash {
-			t.Errorf("stored hash belongs to a stale result")
-		}
-		if entry.ts != int64(tsNewer) {
-			t.Errorf("stored timestamp = %d, want %d", entry.ts, int64(tsNewer))
-		}
-	}
-	e.hashMu.Unlock()
-
-	// The stored hash is still version 2, so repeating that result is unchanged.
-	if _, err := e.ExecuteQuery("counter", params, sub, false); err != nil {
-		t.Fatalf("ExecuteQuery: %v", err)
-	}
-	if got := drain(client); len(got) != 0 {
-		t.Fatalf("unchanged version 2 pushed %d messages, want 0", len(got))
 	}
 }
 
@@ -1745,7 +1693,7 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 
 	// Permanent tags should survive a later query that does not call GetIdentity.
 	e.queries["me"] = Query{Func: func(ctx *QueryCtx) interface{} { return "no-auth-call" }, Internal: false}
-	if _, err := e.ExecuteQuery("me", map[string]interface{}{}, sub, true); err != nil {
+	if _, err := e.ExecuteQuery("me", map[string]interface{}{}, sub); err != nil {
 		t.Fatalf("ExecuteQuery: %v", err)
 	}
 	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:user-7"), sub.SubID) {
@@ -2879,7 +2827,7 @@ func TestExecuteQueryWithoutTrackedClientDoesNotPanic(t *testing.T) {
 		Params:   map[string]interface{}{},
 	}
 	mustNoPanic(t, "ExecuteQuery untracked client", func() {
-		_, _ = e.ExecuteQuery("q", map[string]interface{}{}, ghost, true)
+		_, _ = e.ExecuteQuery("q", map[string]interface{}{}, ghost)
 	})
 }
 

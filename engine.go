@@ -61,21 +61,12 @@ type TetherDownloadToken struct {
 	ExpiresAt time.Time // time when the download token expires
 }
 
-// queryCacheEntry is the newest result recorded for one query cache key.
-// ts is the execution timestamp captured immediately before that query ran.
-type queryCacheEntry struct {
-	hash uint64
-	ts   int64
-}
-
 type Engine struct {
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
 	mutations       map[string]Mutation
 	queries         map[string]Query
 	dependencies    map[string][]string
-	hashMu          sync.RWMutex
-	queryHashes     map[string]queryCacheEntry
 	queryClock      atomic.Int64
 	tracker         *reactivity.Tracker
 	auth            Auth
@@ -388,7 +379,6 @@ func NewEngine(db *gorm.DB) *Engine {
 		mutations:       make(map[string]Mutation),
 		queries:         make(map[string]Query),
 		dependencies:    make(map[string][]string),
-		queryHashes:     make(map[string]queryCacheEntry),
 		tracker:         tracker,
 		auth:            defaultAuth{},
 		guards:          make(map[string]Guard),
@@ -1470,7 +1460,7 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 				}
 			}()
 			representative := subscriptions[0]
-			result, deps, cacheKey, ts, err := e.runQuery(representative.Query, representative.Params, representative)
+			result, deps, ts, err := e.runQuery(representative.Query, representative.Params, representative)
 			if err != nil {
 				slog.Error("Failed to execute query", "error", err)
 				return
@@ -1480,14 +1470,14 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 			// Sharing that result would leak the representative's identity-specific
 			// data and copy their new auth tag onto every other client.
 			if len(subscriptions) > 1 && queryDepsIntroduceAuthTag(e.tracker, representative.SubID, deps) {
-				e.publishQueryResult(representative, result, deps, cacheKey, ts)
+				e.sendQueryResult(representative, result, deps, ts)
 				for _, subscription := range subscriptions[1:] {
-					result, deps, cacheKey, ts, err := e.runQuery(subscription.Query, subscription.Params, subscription)
+					result, deps, ts, err := e.runQuery(subscription.Query, subscription.Params, subscription)
 					if err != nil {
 						slog.Error("Failed to execute query", "error", err)
 						continue
 					}
-					e.publishQueryResult(subscription, result, deps, cacheKey, ts)
+					e.sendQueryResult(subscription, result, deps, ts)
 				}
 				return
 			}
@@ -1499,9 +1489,6 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 				Duration: time.Since(start),
 				Value:    len(subscriptions),
 			})
-			// One execution is shared, so the hash is recorded once. A slower
-			// earlier execution must not replace it.
-			e.rememberQueryResult(cacheKey, result, ts)
 			// Apply the same dependency set to every subscription in the batch so
 			// auto-tracked tags (e.g. new primary keys) stay in sync even though
 			// the query function ran only once.
@@ -1548,37 +1535,6 @@ func (e *Engine) nextQueryTimestamp() int64 {
 	}
 }
 
-// considerQueryResult stores hash for cacheKey when ts is not older than the
-// timestamp already recorded. stale reports that this execution lost that race
-// and left the stored hash untouched. unchanged reports that hash matches the
-// hash kept for cacheKey, including when this execution is stale.
-func (e *Engine) considerQueryResult(cacheKey string, hash uint64, ts int64) (stale, unchanged bool) {
-	e.hashMu.Lock()
-	defer e.hashMu.Unlock()
-	prev, ok := e.queryHashes[cacheKey]
-	if ok && ts < prev.ts {
-		return true, prev.hash == hash
-	}
-	unchanged = ok && prev.hash == hash
-	e.queryHashes[cacheKey] = queryCacheEntry{hash: hash, ts: ts}
-	return false, unchanged
-}
-
-// rememberQueryResult records the hash of result unless a newer execution
-// already did. An empty cacheKey is not recorded. Subscription tags are
-// independent of this decision: each subscriber still needs the deps from
-// the execution that served it.
-func (e *Engine) rememberQueryResult(cacheKey string, result interface{}, ts int64) {
-	if cacheKey == "" {
-		return
-	}
-	dataJSON, err := json.Marshal(result)
-	if err != nil {
-		return
-	}
-	e.considerQueryResult(cacheKey, xxhash.Sum64(dataJSON), ts)
-}
-
 // queryDepsIntroduceAuthTag reports whether deps contain a permanent auth tag
 // (prefix "*") that subID was not already tracking. Those tags partition
 // batches, so a newly recorded one means this result is not safe to share.
@@ -1592,15 +1548,6 @@ func queryDepsIntroduceAuthTag(tracker *reactivity.Tracker, subID string, deps [
 		}
 	}
 	return false
-}
-
-// publishQueryResult records deps and the result hash for one execution, then
-// pushes result to its client. A timestamp older than the one already stored
-// for cacheKey does not replace that hash. The message is still sent so the
-// client can drop it.
-func (e *Engine) publishQueryResult(subscription *reactivity.Subscription, result interface{}, deps []string, cacheKey string, ts int64) {
-	e.rememberQueryResult(cacheKey, result, ts)
-	e.sendQueryResult(subscription, result, deps, ts)
 }
 
 // sendQueryResult records deps on one subscription and pushes result to its client.
@@ -1617,23 +1564,21 @@ func (e *Engine) sendQueryResult(subscription *reactivity.Subscription, result i
 // runQuery executes the query function and returns the result plus the
 // dependency tags it collected. It does not push to clients or update
 // subscription tags; callers decide how to fan those out.
-func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) (interface{}, []string, string, int64, error) {
+func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) (interface{}, []string, int64, error) {
 	if _, exists := e.queries[query]; !exists {
-		return nil, nil, "", 0, fmt.Errorf("query not found")
+		return nil, nil, 0, fmt.Errorf("query not found")
 	}
 	if e.queries[query].Internal {
-		return nil, nil, "", 0, fmt.Errorf("query not found") // return non-descriptive error to prevent enumeration
+		return nil, nil, 0, fmt.Errorf("query not found") // return non-descriptive error to prevent enumeration
 	}
-	paramsJSON, err := json.Marshal(params)
-	if err != nil {
-		return nil, nil, "", 0, err
+	if _, err := json.Marshal(params); err != nil {
+		return nil, nil, 0, err
 	}
 	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
 	if !ok {
-		return nil, nil, "", 0, fmt.Errorf("client not found")
+		return nil, nil, 0, fmt.Errorf("client not found")
 	}
 	authID := auth.UserID
-	cacheKey := query + "?" + string(paramsJSON) + "?" + authID
 	slog.Debug("Executing query", "query", query, "params", params)
 
 	// Create the query context first so GetIdentity can append dependency tags.
@@ -1698,9 +1643,8 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, query)
 	queryCtx.DB = e.db.WithContext(gormCtx)
 
-	// Stamp the execution before the query reads anything. A later invalidation
-	// that finishes first keeps its hash, and the client can drop this message
-	// if it arrives afterwards.
+	// Stamp the execution before the query reads anything so the client can drop
+	// this message if a later invalidation arrives first.
 	ts := e.nextQueryTimestamp()
 	start := time.Now()
 	result := e.queries[query].Func(queryCtx)
@@ -1712,11 +1656,11 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		Duration: time.Since(start),
 		Tags:     []string{},
 	})
-	return result, queryCtx.Dependencies, cacheKey, ts, nil
+	return result, queryCtx.Dependencies, ts, nil
 }
 
-func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, forceSend bool) ([]byte, error) {
-	result, deps, cacheKey, ts, err := e.runQuery(query, params, subscription)
+func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) ([]byte, error) {
+	result, deps, ts, err := e.runQuery(query, params, subscription)
 	if err != nil {
 		return nil, err
 	}
@@ -1725,17 +1669,8 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	if err != nil {
 		return nil, err
 	}
-	dataJSON, err := json.Marshal(result)
-	if err != nil {
-		return nil, err
-	}
-	_, unchanged := e.considerQueryResult(cacheKey, xxhash.Sum64(dataJSON), ts)
 	e.tracker.UpdateTags(subscription.SubID, deps)
 	slog.Debug("Updated dependencies on subscription", "subID", subscription.SubID, "dependencies", deps)
-	if unchanged && !forceSend { // we want to force send on first subscription, regardless of if the query hasn't changed
-		return responseJSON, nil
-	}
-
 	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
 	return responseJSON, nil
 }
@@ -1853,11 +1788,11 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 	return result, nil
 }
 
-// rerunSubscriptions force-pushes fresh results for subscriptions whose
+// rerunSubscriptions re-runs and pushes fresh results for subscriptions whose
 // authorization state was reset by an identity change.
 func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
 	for _, subscription := range subscriptions {
-		if _, err := e.ExecuteQuery(subscription.Query, subscription.Params, subscription, true); err != nil {
+		if _, err := e.ExecuteQuery(subscription.Query, subscription.Params, subscription); err != nil {
 			slog.Error("Failed to re-run query after auth change", "query", subscription.Query, "error", err)
 		}
 	}
@@ -1888,7 +1823,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to subscribe to query"}`))
 			return nil
 		}
-		_, err := e.ExecuteQuery(query, params, subscription, true)
+		_, err := e.ExecuteQuery(query, params, subscription)
 		if err != nil {
 			slog.Error("Failed to execute query", "query", query, "params", params, "error", err)
 			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute query", "query_key": queryKey, "params": params})
