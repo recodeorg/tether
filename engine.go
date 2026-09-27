@@ -378,6 +378,7 @@ func NewEngine(db *gorm.DB) *Engine {
 		websocketHelper: &reactivity.WebsocketHelper{},
 		EphemeralID:     uuid.New().String(),
 	}
+	trackTransactions(db)
 	// scheduler initialization
 	e.CreateTable([]TetherTask{}) // Create the internal table for the scheduled tasks
 	e.startScheduler(context.Background())
@@ -419,17 +420,13 @@ func NewEngine(db *gorm.DB) *Engine {
 				})
 			}
 		}
-		if e.dbType == "postgres" {
-			joinedTags := strings.Join(tags, ",")
-			payload := fmt.Sprintf("%s|%s", e.EphemeralID, joinedTags)
-
-			if len(payload) < 8000 {
-				e.db.Exec("SELECT pg_notify('tether_sync', ?)", payload)
-			} else {
-				// TODO: send the payload in chunks
-				slog.Error("Payload too large to send via PostgreSQL notification", "payload", payload)
-			}
+		// Subscriptions re-run on other pooled connections, so writes inside a
+		// transaction are only published once it commits.
+		if pending := trackedTxOf(tx.Statement.ConnPool); pending != nil {
+			pending.queue(e, tags, execID, actionName)
+			return
 		}
+		e.notifyRemote(tx.Statement.Context, tx.Statement.ConnPool, tags)
 		e.InvalidateTags(tags, execID, actionName)
 	}
 	// GORM callbacks only see the post-update Dest, so a Save that moves a

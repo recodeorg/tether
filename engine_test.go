@@ -120,8 +120,8 @@ func newPostgresTestDB(t *testing.T) *gorm.DB {
 	// database/sql's default pool is unbounded. A fresh Postgres often allows
 	// about 100 clients, and the concurrent websocket tests will open one
 	// connection per in-flight query unless this is capped.
-	sqlDB.SetMaxOpenConns(64)
-	sqlDB.SetMaxIdleConns(20)
+	sqlDB.SetMaxOpenConns(20)
+	sqlDB.SetMaxIdleConns(4)
 	t.Cleanup(func() {
 		_ = sqlDB.Close()
 		dropPostgresSchema(schema)
