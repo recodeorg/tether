@@ -1330,6 +1330,116 @@ func TestQueryHashSkipsUnchangedPushUnlessForced(t *testing.T) {
 	}
 }
 
+func TestStaleInvalidationDoesNotRegressQueryResult(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	var version atomic.Int64
+	version.Store(1)
+	var pause atomic.Bool
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseQuery := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseQuery()
+
+	params := map[string]interface{}{}
+	e.RegisterQuery("counter", func(ctx *QueryCtx) interface{} {
+		ctx.TrackCollection("widgets", "id", "1")
+		v := version.Load()
+		if pause.CompareAndSwap(true, false) {
+			close(started)
+			<-release
+		}
+		return map[string]interface{}{"v": v}
+	})
+
+	sub := subscribe(t, e, client, "counter", "k", params)
+	initial := queryMessages(t, drain(client))
+	if len(initial) != 1 {
+		t.Fatalf("initial messages = %d, want 1", len(initial))
+	}
+	initialTS, ok := initial[0]["timestamp"].(float64)
+	if !ok || initialTS == 0 {
+		t.Fatalf("initial timestamp = %#v", initial[0]["timestamp"])
+	}
+
+	pause.Store(true)
+	done := make(chan struct{})
+	go func() {
+		e.InvalidateTags([]string{"widgets_id:1"}, "slow", "slow")
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow invalidation did not reach the query")
+	}
+
+	version.Store(2)
+	e.InvalidateTags([]string{"widgets_id:1"}, "fast", "fast")
+	releaseQuery()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow invalidation did not finish")
+	}
+
+	msgs := queryMessages(t, drain(client))
+	if len(msgs) != 2 {
+		t.Fatalf("invalidation messages = %d, want 2: %v", len(msgs), msgs)
+	}
+	versionOf := func(msg map[string]interface{}) float64 {
+		t.Helper()
+		data, _ := msg["data"].(map[string]interface{})
+		got, _ := data["v"].(float64)
+		return got
+	}
+	timestampOf := func(msg map[string]interface{}) float64 {
+		t.Helper()
+		ts, ok := msg["timestamp"].(float64)
+		if !ok {
+			t.Fatalf("timestamp = %#v", msg["timestamp"])
+		}
+		return ts
+	}
+	if versionOf(msgs[0]) != 2 || versionOf(msgs[1]) != 1 {
+		t.Fatalf("arrival order = [%v, %v], want [2, 1]", versionOf(msgs[0]), versionOf(msgs[1]))
+	}
+	tsNewer := timestampOf(msgs[0])
+	tsOlder := timestampOf(msgs[1])
+	if !(initialTS < tsOlder && tsOlder < tsNewer) {
+		t.Fatalf("timestamps = subscribe %v, slow %v, fast %v; want subscribe < slow < fast", initialTS, tsOlder, tsNewer)
+	}
+
+	raw, err := json.Marshal(map[string]interface{}{"v": int64(2)})
+	if err != nil {
+		t.Fatalf("marshal version 2: %v", err)
+	}
+	wantHash := xxhash.Sum64(raw)
+	e.hashMu.Lock()
+	if len(e.queryHashes) != 1 {
+		t.Fatalf("stored hashes = %d, want 1", len(e.queryHashes))
+	}
+	for _, entry := range e.queryHashes {
+		if entry.hash != wantHash {
+			t.Errorf("stored hash belongs to a stale result")
+		}
+		if entry.ts != int64(tsNewer) {
+			t.Errorf("stored timestamp = %d, want %d", entry.ts, int64(tsNewer))
+		}
+	}
+	e.hashMu.Unlock()
+
+	// The stored hash is still version 2, so repeating that result is unchanged.
+	if _, err := e.ExecuteQuery("counter", params, sub, false); err != nil {
+		t.Fatalf("ExecuteQuery: %v", err)
+	}
+	if got := drain(client); len(got) != 0 {
+		t.Fatalf("unchanged version 2 pushed %d messages, want 0", len(got))
+	}
+}
+
 func TestQueryResultIncludesLocationAndQueryKey(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
