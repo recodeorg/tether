@@ -2,7 +2,9 @@ package s3
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -29,6 +31,10 @@ func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
 
 	if cfg.Endpoint != "" {
 		opts = append(opts, config.WithBaseEndpoint(cfg.Endpoint))
+	}
+
+	if strings.HasPrefix(cfg.Endpoint, "http://") {
+		return nil, errors.New("tether: S3 custom endpoints must use HTTPS to support streaming uploads without memory buffering")
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
