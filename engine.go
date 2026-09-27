@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"mime"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -1325,11 +1325,16 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			e.db.Model(&TetherStorage{}).Where("id = ?", record.ID).Update("status", "pending")
 			return
 		}
-		e.db.Model(&record).Updates(map[string]interface{}{
+		result = e.db.Model(&record).Updates(map[string]interface{}{
 			"status":    "active",
 			"mime_type": contentType,
 			"file_size": r.ContentLength,
 		})
+		if result.Error != nil {
+			slog.Error("Failed to update upload status", "error", result.Error)
+			http.Error(w, "Failed to update upload status", http.StatusInternalServerError)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 		return
 	}
