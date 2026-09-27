@@ -3,9 +3,11 @@ package tether
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -312,7 +314,7 @@ func TestPostgresNotifyIsSentInsideTheTransaction(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	want := []string{"SELECT pg_notify('tether_sync', $1)[sender|messages:1,messages_room_id:lobby]", "commit"}
+	want := []string{`SELECT pg_notify('tether_sync', $1)[{"sender":"sender","tags":["messages:1","messages_room_id:lobby"]}]`, "commit"}
 	if strings.Join(committed.calls, "\n") != strings.Join(want, "\n") {
 		t.Errorf("commit calls = %q, want %q", committed.calls, want)
 	}
@@ -331,7 +333,7 @@ func TestPostgresNotifyIsSentInsideTheTransaction(t *testing.T) {
 func TestNotifyPayloadsChunkUnderLimit(t *testing.T) {
 	var tags []string
 	for i := 0; i < 2000; i++ {
-		tags = append(tags, fmt.Sprintf("messages:%d", i))
+		tags = append(tags, fmt.Sprintf("messages_room_id:a,b|\"%d\"<>", i))
 	}
 	oversized := strings.Repeat("x", maxNotifyPayload)
 	payloads := notifyPayloads("sender", append(tags, oversized))
@@ -343,13 +345,16 @@ func TestNotifyPayloadsChunkUnderLimit(t *testing.T) {
 		if len(payload) >= maxNotifyPayload {
 			t.Errorf("payload length %d, want < %d", len(payload), maxNotifyPayload)
 		}
-		sender, joined, ok := strings.Cut(payload, "|")
-		if !ok || sender != "sender" {
-			t.Fatalf("payload %q missing sender prefix", payload[:20])
+		var msg notifyMessage
+		if err := json.Unmarshal([]byte(payload), &msg); err != nil {
+			t.Fatalf("payload is not valid JSON: %v", err)
 		}
-		got = append(got, strings.Split(joined, ",")...)
+		if msg.Sender != "sender" {
+			t.Fatalf("payload sender = %q, want %q", msg.Sender, "sender")
+		}
+		got = append(got, msg.Tags...)
 	}
-	if strings.Join(got, ",") != strings.Join(tags, ",") {
+	if !slices.Equal(got, tags) {
 		t.Errorf("payloads carried %d tags, want the %d input tags in order without the oversized one", len(got), len(tags))
 	}
 	if payloads := notifyPayloads("sender", nil); len(payloads) != 0 {
@@ -384,7 +389,8 @@ func TestPostgresNotifyDeliveredOnlyOnCommit(t *testing.T) {
 			if err != nil {
 				return "", false
 			}
-			if strings.HasPrefix(n.Payload, e.EphemeralID+"|") {
+			var msg notifyMessage
+			if json.Unmarshal([]byte(n.Payload), &msg) == nil && msg.Sender == e.EphemeralID {
 				return n.Payload, true
 			}
 		}

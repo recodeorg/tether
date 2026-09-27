@@ -3,6 +3,7 @@ package tether
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"sync"
@@ -174,18 +175,30 @@ func (e *Engine) notifyRemote(ctx context.Context, conn execer, tags []string) {
 	}
 }
 
-// notifyPayloads packs tags into "sender|tag,tag" payloads that each fit in a
-// single NOTIFY.
+// notifyMessage is the JSON body of a tether_sync notification.
+type notifyMessage struct {
+	Sender string   `json:"sender"`
+	Tags   []string `json:"tags"`
+}
+
+// notifyPayloads encodes tags as notifyMessage JSON, split across as many
+// payloads as needed for each to fit in a single NOTIFY.
 func notifyPayloads(senderID string, tags []string) []string {
-	prefix := senderID + "|"
+	// Assembled from individually encoded pieces so each chunk's exact size
+	// is known before a tag is added; must stay in sync with notifyMessage.
+	sender, _ := json.Marshal(senderID)
+	prefix := `{"sender":` + string(sender) + `,"tags":[`
+	const suffix = "]}"
 	var payloads []string
 	var b strings.Builder
 	for _, tag := range tags {
-		if len(prefix)+len(tag) >= maxNotifyPayload {
+		encoded, _ := json.Marshal(tag)
+		if len(prefix)+len(encoded)+len(suffix) >= maxNotifyPayload {
 			slog.Error("Tag too large to send via PostgreSQL notification", "tag", tag)
 			continue
 		}
-		if b.Len() > 0 && b.Len()+1+len(tag) >= maxNotifyPayload {
+		if b.Len() > 0 && b.Len()+1+len(encoded)+len(suffix) >= maxNotifyPayload {
+			b.WriteString(suffix)
 			payloads = append(payloads, b.String())
 			b.Reset()
 		}
@@ -194,9 +207,10 @@ func notifyPayloads(senderID string, tags []string) []string {
 		} else {
 			b.WriteByte(',')
 		}
-		b.WriteString(tag)
+		b.Write(encoded)
 	}
 	if b.Len() > 0 {
+		b.WriteString(suffix)
 		payloads = append(payloads, b.String())
 	}
 	return payloads

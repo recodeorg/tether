@@ -613,17 +613,15 @@ func (e *Engine) startPostgresListener(dsn string) {
 					break
 				}
 
-				parts := strings.SplitN(notification.Payload, "|", 2)
-				if len(parts) != 2 {
-					slog.Error("Invalid payload format", "payload", notification.Payload)
+				var msg notifyMessage
+				if err := json.Unmarshal([]byte(notification.Payload), &msg); err != nil || msg.Sender == "" {
+					slog.Error("Invalid payload format", "payload", notification.Payload, "error", err)
 					continue
 				}
-				senderID, tags := parts[0], parts[1]
 
-				if senderID != e.EphemeralID {
-					remoteTags := strings.Split(tags, ",")
+				if msg.Sender != e.EphemeralID && len(msg.Tags) > 0 {
 					uniqueID := uuid.New().String()
-					e.invalidateTags(remoteTags, senderID+"|"+uniqueID, "remote_update") // TODO: forward execID and actionName from the sender for better profiling
+					e.invalidateTags(msg.Tags, msg.Sender+"|"+uniqueID, "remote_update") // TODO: forward execID and actionName from the sender for better profiling
 				}
 			}
 		}
