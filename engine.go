@@ -1174,6 +1174,17 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		result := e.db.Model(&TetherStorage{}).Where("id = ? AND status = 'pending'", record.ID).Update("status", "uploading")
+		if result.Error != nil {
+			slog.Error("Failed to update status", "error", err)
+			http.Error(w, "Failed to update status", http.StatusInternalServerError)
+			return
+		}
+		if result.RowsAffected == 0 {
+			http.Error(w, "Upload already in progress", http.StatusConflict)
+			return
+		}
+
 		r.Body = http.MaxBytesReader(w, r.Body, record.MaxBytes)
 		contentType := r.Header.Get("Content-Type")
 		if contentType == "" {
@@ -1184,6 +1195,7 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			slog.Error("Failed to upload file", "error", err)
 			http.Error(w, "Failed to upload file", http.StatusInternalServerError)
+			e.db.Model(&TetherStorage{}).Where("id = ?", record.ID).Update("status", "pending")
 			return
 		}
 		e.db.Model(&record).Updates(map[string]interface{}{
