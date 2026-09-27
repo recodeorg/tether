@@ -565,6 +565,16 @@ func (e *Engine) UseStorage(storage storage.StorageAdapter) {
 	e.storage = storage
 	e.CreateTable([]TetherStorage{})
 	e.CreateTable([]TetherDownloadToken{})
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for range ticker.C {
+			e.db.Where("expires_at < ?", time.Now()).Delete(&TetherDownloadToken{})
+
+			abandonedThreshold := time.Now().Add(-24 * time.Hour)
+			e.db.Where("status IN ? AND created_at < ?", []string{"pending", "uploading"}, abandonedThreshold).Delete(&TetherStorage{})
+		}
+	}()
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -1320,6 +1330,7 @@ func (e *Engine) deleteFile(fileID string) error {
 	if err := e.storage.Delete(record.ID); err != nil {
 		return err
 	}
+	e.db.Where("file_id = ?", fileID).Delete(&TetherDownloadToken{})
 	return e.db.Where("id = ?", record.ID).Delete(&TetherStorage{}).Error
 }
 
