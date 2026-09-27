@@ -311,12 +311,17 @@ func (e *Engine) RegisterCron(cronName string, cronString string, functionName s
 		return "", err
 	}
 	now := time.Now()
+	nextTime, err := calculateNextCronTime(cronString, now)
+	if err != nil {
+		slog.Error("Failed to calculate next cron time", "error", err)
+		return "", err
+	}
 	task := TetherTask{
 		ID:           uuid.New().String(),
 		Name:         cronName,
 		FunctionName: functionName,
 		ParamsJSON:   string(paramsJSON),
-		ExecuteAt:    calculateNextCronTime(cronString, now),
+		ExecuteAt:    nextTime,
 		IsCron:       true,
 		CronString:   &cronString,
 	}
@@ -353,14 +358,14 @@ func (e *Engine) RegisterCron(cronName string, cronString string, functionName s
 	return id, nil
 }
 
-func calculateNextCronTime(cronString string, fromTime time.Time) time.Time {
+func calculateNextCronTime(cronString string, fromTime time.Time) (time.Time, error) {
 	cron := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 	schedule, err := cron.Parse(cronString)
 	if err != nil {
 		slog.Error("Failed to parse cron string", "error", err)
-		return time.Time{}
+		return time.Time{}, err
 	}
-	return schedule.Next(fromTime)
+	return schedule.Next(fromTime), nil
 }
 
 func getPostgresDSN(db *gorm.DB) (string, error) {
@@ -622,13 +627,21 @@ func (e *Engine) pollScheduledTasks() {
 					slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
 				}
 				if t.IsCron && t.CronString != nil && *t.CronString != "" {
-					nextTime := calculateNextCronTime(*t.CronString, time.Now())
-					e.db.Model(&TetherTask{}).Where("id = ?", t.ID).Updates(map[string]interface{}{
+					nextTime, err := calculateNextCronTime(*t.CronString, time.Now())
+					if err != nil {
+						slog.Error("Failed to calculate next cron time", "error", err)
+						return
+					}
+					err = e.db.Model(&TetherTask{}).Where("id = ?", t.ID).Updates(map[string]interface{}{
 						"execute_at":    nextTime,
 						"claimed_by":    nil,
 						"locked_until":  nil,
 						"last_executed": time.Now(),
-					})
+					}).Error
+					if err != nil {
+						slog.Error("Failed to update scheduled task", "error", err)
+						return
+					}
 				} else {
 					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
 					e.timerMutex.Lock()
