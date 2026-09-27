@@ -437,6 +437,33 @@ func TestNearTermScheduledTaskPanicIsRecovered(t *testing.T) {
 	}
 }
 
+// A failed insert must not hand back the id scheduleTask generated locally.
+// Tasks inside the lookahead are inserted and armed here; later tasks wait for
+// the schedule loop. Both paths have to fail when the database is closed.
+func TestScheduleTaskClosedDatabaseReturnsNoID(t *testing.T) {
+	e := newTestEngine(t)
+	sqlDB, err := e.db.DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	for _, when := range []time.Time{
+		time.Now(),
+		time.Now().Add(time.Hour),
+	} {
+		id, err := e.scheduleTask(when, "later", nil)
+		if err == nil {
+			t.Fatalf("schedule at %s with closed db returned nil error", when.Format(time.RFC3339))
+		}
+		if id != "" {
+			t.Fatalf("schedule at %s with closed db returned task id %q", when.Format(time.RFC3339), id)
+		}
+	}
+}
+
 func loadCron(t *testing.T, e *Engine, id string) TetherTask {
 	t.Helper()
 	var got TetherTask

@@ -294,7 +294,11 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			ExecuteAt:    timestamp,
 			IsCron:       false,
 		}
-		e.db.Create(&task)
+		err = e.db.Create(&task).Error
+		if err != nil {
+			slog.Error("Failed to create scheduled task", "error", err)
+			return "", err
+		}
 	}
 
 	return taskID, nil
