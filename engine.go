@@ -3,8 +3,10 @@ package tether
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"mime"
 	"net/http"
 	"net/url"
@@ -51,14 +53,14 @@ type TetherStorage struct {
 	FileSize  int64
 	MaxBytes  int64     // maximum size allowed at upload time
 	MimeType  string    // MIME type of the file
-	ExpiresAt time.Time // time when the upload token expires
+	ExpiresAt time.Time `gorm:"index"` // time when the upload token expires
 	CreatedAt time.Time // time when the upload token was created
 }
 
 type TetherDownloadToken struct {
 	Token     string    `gorm:"primaryKey"`
 	FileID    string    `gorm:"index"`
-	ExpiresAt time.Time // time when the download token expires
+	ExpiresAt time.Time `gorm:"index"` // time when the download token expires
 }
 
 type Engine struct {
@@ -660,14 +662,36 @@ func (e *Engine) UseStorage(storage storage.StorageAdapter) {
 			select {
 			case <-e.ctx.Done():
 				return
-			case <-ticker.C:
-				e.db.Where("expires_at < ?", time.Now()).Delete(&TetherDownloadToken{})
-
-				abandonedThreshold := time.Now().Add(-24 * time.Hour)
-				e.db.Where("status IN ? AND created_at < ?", []string{"pending", "uploading"}, abandonedThreshold).Delete(&TetherStorage{})
+			case now := <-ticker.C:
+				e.cleanStorage(now)
 			}
 		}
 	}()
+}
+
+// cleanStorage removes expired download tokens and upload rows that expired
+// before they became active. Those rows stay until ExpiresAt, so a longer
+// ExpiresIn remains usable. Object bytes are deleted before that metadata.
+// A missing object is fine; any other delete error keeps the row for retry.
+func (e *Engine) cleanStorage(now time.Time) {
+	e.db.Where("expires_at < ?", now).Delete(&TetherDownloadToken{})
+
+	var abandonedFiles []TetherStorage
+	e.db.Where("status IN ? AND expires_at < ?", []string{"pending", "uploading"}, now).Find(&abandonedFiles)
+
+	var ids []string
+	for _, file := range abandonedFiles {
+		err := e.storage.Delete(file.ID)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Error("Failed to delete abandoned upload", "fileID", file.ID, "error", err)
+			continue
+		}
+		ids = append(ids, file.ID)
+	}
+	if len(ids) == 0 {
+		return
+	}
+	e.db.Where("id IN ?", ids).Delete(&TetherStorage{})
 }
 
 func (e *Engine) pollScheduledTasks() {

@@ -3232,6 +3232,166 @@ func (r *recordingStorage) Delete(fileID string) error {
 	return r.local.Delete(fileID)
 }
 
+// cleanupStorage records whether upload metadata still existed when Delete ran,
+// and can fail a chosen id without touching its bytes.
+type cleanupStorage struct {
+	local    *local.LocalStorage
+	db       *gorm.DB
+	fail     map[string]error
+	deleted  []string
+	rowAlive []bool
+}
+
+func (c *cleanupStorage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
+	return c.local.UploadStream(ctx, fileID, contentType, r)
+}
+
+func (c *cleanupStorage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
+	return c.local.ServeFile(fileID, w, r)
+}
+
+func (c *cleanupStorage) Delete(fileID string) error {
+	c.deleted = append(c.deleted, fileID)
+	var n int64
+	if err := c.db.Model(&TetherStorage{}).Where("id = ?", fileID).Count(&n).Error; err != nil {
+		return err
+	}
+	c.rowAlive = append(c.rowAlive, n == 1)
+	if err, ok := c.fail[fileID]; ok {
+		return err
+	}
+	return c.local.Delete(fileID)
+}
+
+func TestCleanStorage(t *testing.T) {
+	e := newTestEngine(t)
+	store := local.NewLocalStorage(t.TempDir())
+	adapter := &cleanupStorage{
+		local: store,
+		db:    e.db,
+		fail:  map[string]error{"delete-fail": errors.New("disk full")},
+	}
+	e.UseStorage(adapter)
+
+	if !e.db.Migrator().HasIndex(&TetherStorage{}, "ExpiresAt") {
+		t.Fatal("TetherStorage.ExpiresAt has no cleanup index")
+	}
+	if !e.db.Migrator().HasIndex(&TetherDownloadToken{}, "ExpiresAt") {
+		t.Fatal("TetherDownloadToken.ExpiresAt has no cleanup index")
+	}
+
+	now := time.Date(2026, 9, 27, 17, 0, 0, 0, time.UTC)
+	// Issued 30h ago with a 48h lifetime, so the old created_at < now-24h sweep would delete it.
+	issued := now.Add(-30 * time.Hour)
+	expires := now.Add(18 * time.Hour)
+
+	type fixture struct {
+		id         string
+		status     string
+		createdAt  time.Time
+		expiresAt  time.Time
+		bytes      bool
+		wantRow    bool
+		wantBytes  bool
+		wantDelete bool
+	}
+	fixtures := []fixture{
+		{id: "valid-pending", status: "pending", createdAt: issued, expiresAt: expires, wantRow: true},
+		{id: "expired-pending", status: "pending", createdAt: now.Add(-2 * time.Hour), expiresAt: now.Add(-time.Hour), wantDelete: true},
+		{id: "expired-pending-bytes", status: "pending", createdAt: now.Add(-2 * time.Hour), expiresAt: now.Add(-time.Hour), bytes: true, wantDelete: true},
+		{id: "expired-uploading", status: "uploading", createdAt: now.Add(-2 * time.Hour), expiresAt: now.Add(-time.Hour), bytes: true, wantDelete: true},
+		{id: "valid-uploading", status: "uploading", createdAt: issued, expiresAt: expires, bytes: true, wantRow: true, wantBytes: true},
+		{id: "active-file", status: "active", createdAt: now.Add(-48 * time.Hour), expiresAt: now.Add(-24 * time.Hour), bytes: true, wantRow: true, wantBytes: true},
+		{id: "delete-fail", status: "uploading", createdAt: now.Add(-2 * time.Hour), expiresAt: now.Add(-time.Hour), bytes: true, wantRow: true, wantBytes: true, wantDelete: true},
+	}
+
+	for _, fx := range fixtures {
+		row := TetherStorage{
+			ID:        fx.id,
+			Token:     fx.id + "-token",
+			Status:    fx.status,
+			ExpiresAt: fx.expiresAt,
+			CreatedAt: fx.createdAt,
+		}
+		if err := e.db.Create(&row).Error; err != nil {
+			t.Fatalf("create %s: %v", fx.id, err)
+		}
+		if err := e.db.Model(&TetherStorage{}).Where("id = ?", fx.id).UpdateColumn("created_at", fx.createdAt).Error; err != nil {
+			t.Fatalf("set created_at %s: %v", fx.id, err)
+		}
+		if fx.bytes {
+			path := filepath.Join(store.UploadDir, fx.id)
+			if err := os.WriteFile(path, []byte("partial"), 0o644); err != nil {
+				t.Fatalf("write %s: %v", fx.id, err)
+			}
+		}
+	}
+
+	var aged TetherStorage
+	if err := e.db.Where("id = ?", "valid-pending").First(&aged).Error; err != nil {
+		t.Fatalf("load valid-pending: %v", err)
+	}
+	if !aged.CreatedAt.Before(now.Add(-24 * time.Hour)) {
+		t.Fatalf("created_at = %v, want older than 24h", aged.CreatedAt)
+	}
+
+	if err := e.db.Create(&TetherDownloadToken{Token: "expired-download", FileID: "active-file", ExpiresAt: now.Add(-time.Hour)}).Error; err != nil {
+		t.Fatalf("create expired download token: %v", err)
+	}
+	if err := e.db.Create(&TetherDownloadToken{Token: "live-download", FileID: "active-file", ExpiresAt: now.Add(time.Hour)}).Error; err != nil {
+		t.Fatalf("create live download token: %v", err)
+	}
+
+	e.cleanStorage(now)
+
+	for _, fx := range fixtures {
+		var n int64
+		if err := e.db.Model(&TetherStorage{}).Where("id = ?", fx.id).Count(&n).Error; err != nil {
+			t.Fatalf("count %s: %v", fx.id, err)
+		}
+		if fx.wantRow && n != 1 {
+			t.Errorf("%s rows = %d, want 1", fx.id, n)
+		}
+		if !fx.wantRow && n != 0 {
+			t.Errorf("%s rows = %d, want 0", fx.id, n)
+		}
+		_, statErr := os.Stat(filepath.Join(store.UploadDir, fx.id))
+		exists := statErr == nil
+		if fx.wantBytes && !exists {
+			t.Errorf("%s bytes were removed", fx.id)
+		}
+		if !fx.wantBytes && fx.bytes && exists {
+			t.Errorf("%s bytes are still present", fx.id)
+		}
+		if !fx.wantBytes && !fx.bytes && exists {
+			t.Errorf("%s unexpectedly has bytes", fx.id)
+		}
+		sawDelete := slices.Contains(adapter.deleted, fx.id)
+		if sawDelete != fx.wantDelete {
+			t.Errorf("%s adapter delete = %v, want %v", fx.id, sawDelete, fx.wantDelete)
+		}
+	}
+	for i, alive := range adapter.rowAlive {
+		if !alive {
+			t.Errorf("adapter delete %s ran after metadata was removed", adapter.deleted[i])
+		}
+	}
+
+	var expiredTokens, liveTokens int64
+	if err := e.db.Model(&TetherDownloadToken{}).Where("token = ?", "expired-download").Count(&expiredTokens).Error; err != nil {
+		t.Fatalf("count expired token: %v", err)
+	}
+	if expiredTokens != 0 {
+		t.Errorf("expired download tokens = %d, want 0", expiredTokens)
+	}
+	if err := e.db.Model(&TetherDownloadToken{}).Where("token = ?", "live-download").Count(&liveTokens).Error; err != nil {
+		t.Fatalf("count live token: %v", err)
+	}
+	if liveTokens != 1 {
+		t.Errorf("live download tokens = %d, want 1", liveTokens)
+	}
+}
+
 func serveStorage(e *Engine, method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, body)
 	for key, value := range headers {
