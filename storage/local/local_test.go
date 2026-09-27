@@ -61,9 +61,6 @@ func TestDeleteRemovesStoredObject(t *testing.T) {
 	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
-	if err := os.WriteFile(path+".mime", []byte("text/plain"), 0o644); err != nil {
-		t.Fatalf("write mime: %v", err)
-	}
 
 	if err := store.Delete(fileID); err != nil {
 		t.Fatalf("delete: %v", err)

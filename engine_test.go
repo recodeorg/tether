@@ -2109,10 +2109,29 @@ func TestAuthSuccessEncodesUserIDAsJSON(t *testing.T) {
 	}
 }
 
+// syncBuffer is a bytes.Buffer safe for concurrent use; websocket handler
+// goroutines keep logging while the test reads the captured output.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestAuthFrameDoesNotLeakToken(t *testing.T) {
 	const secret = "audit-fake-secret"
 
-	var logs bytes.Buffer
+	var logs syncBuffer
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
