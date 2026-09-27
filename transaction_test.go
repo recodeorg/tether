@@ -109,6 +109,96 @@ func TestTransactionCommitPublishesCommittedData(t *testing.T) {
 	}
 }
 
+func TestTransactionDeleteByIDPublishesCollectionCountOnCommit(t *testing.T) {
+	e := newPooledEngine(t, 4)
+	client := trackClient(t, e)
+
+	msg := testMessage{Body: "bye", RoomID: "r"}
+	if err := e.db.Create(&msg).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var runs atomic.Int64
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		ctx.TrackCollection("messages", "room_id", "r")
+		var n int64
+		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return n
+	})
+	subscribe(t, e, client, "countRoom", "count", nil)
+	drain(client)
+
+	err := e.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&testMessage{}, msg.ID).Error; err != nil {
+			return err
+		}
+		if got := runs.Load(); got != 1 {
+			t.Errorf("count runs before commit = %d, want 1", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Transaction: %v", err)
+	}
+	if got := runs.Load(); got != 2 {
+		t.Errorf("count runs after commit = %d, want 2", got)
+	}
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != float64(0) {
+		t.Errorf("count push after commit = %v (%d messages), want one push of 0", data, n)
+	}
+}
+
+func TestTransactionDeleteByIDRollbackDoesNotPublish(t *testing.T) {
+	e := newPooledEngine(t, 4)
+	client := trackClient(t, e)
+
+	msg := testMessage{Body: "bye", RoomID: "r"}
+	if err := e.db.Create(&msg).Error; err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var runs atomic.Int64
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		ctx.TrackCollection("messages", "room_id", "r")
+		var n int64
+		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return n
+	})
+	subscribe(t, e, client, "countRoom", "count", nil)
+	drain(client)
+
+	abort := errors.New("abort")
+	err := e.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Delete(&testMessage{}, msg.ID).Error; err != nil {
+			return err
+		}
+		return abort
+	})
+	if !errors.Is(err, abort) {
+		t.Fatalf("Transaction error = %v, want %v", err, abort)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("count runs after rollback = %d, want 1", got)
+	}
+	if _, n := lastQueryData(t, client); n != 0 {
+		t.Errorf("count pushes after rollback = %d, want 0", n)
+	}
+	var left int64
+	if err := e.db.Model(&testMessage{}).Where("id = ?", msg.ID).Count(&left).Error; err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if left != 1 {
+		t.Fatalf("row count after rollback = %d, want 1", left)
+	}
+}
+
 func TestTransactionRollbackDiscardsInvalidation(t *testing.T) {
 	e := newPooledEngine(t, 4)
 	client, msg, runs := subscribeToBody(t, e)

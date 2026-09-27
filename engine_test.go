@@ -856,6 +856,155 @@ func TestDeleteInvalidatesTrackedTags(t *testing.T) {
 	}
 }
 
+// Count does not load rows, so auto-tracked primary keys cannot mask a delete
+// that omitted the row's collection tag.
+func TestDeleteByIDInvalidatesCollectionCount(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	msg := testMessage{Body: "bye", RoomID: "r"}
+	if err := e.db.Create(&msg).Error; err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	var roomRuns, otherRuns atomic.Int64
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+		roomRuns.Add(1)
+		ctx.TrackCollection("messages", "room_id", "r")
+		var n int64
+		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return n
+	})
+	e.RegisterQuery("countOther", func(ctx *QueryCtx) interface{} {
+		otherRuns.Add(1)
+		ctx.TrackCollection("messages", "room_id", "other")
+		var n int64
+		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "other").Count(&n).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return n
+	})
+	subscribe(t, e, client, "countRoom", "room", nil)
+	subscribe(t, e, client, "countOther", "other", nil)
+	drain(client)
+	if roomRuns.Load() != 1 || otherRuns.Load() != 1 {
+		t.Fatalf("subscribe runs room=%d other=%d, want 1/1", roomRuns.Load(), otherRuns.Load())
+	}
+
+	if err := e.db.Delete(&testMessage{}, msg.ID).Error; err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	var left int64
+	if err := e.db.Model(&testMessage{}).Where("id = ?", msg.ID).Count(&left).Error; err != nil {
+		t.Fatalf("count remaining: %v", err)
+	}
+	if left != 0 {
+		t.Fatalf("row still present after Delete, count = %d", left)
+	}
+	if got := roomRuns.Load(); got != 2 {
+		t.Errorf("collection count runs after Delete by id = %d, want 2", got)
+	}
+	if got := otherRuns.Load(); got != 1 {
+		t.Errorf("unrelated collection count runs after Delete by id = %d, want 1", got)
+	}
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != float64(0) {
+		t.Errorf("count push after Delete by id = %v (%d messages), want one push of 0", data, n)
+	}
+}
+
+func TestBatchDeleteByIDsInvalidatesCollectionCount(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	msgs := []testMessage{
+		{Body: "a", RoomID: "r"},
+		{Body: "b", RoomID: "r"},
+		{Body: "c", RoomID: "other"},
+	}
+	if err := e.db.Create(&msgs).Error; err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	var runs atomic.Int64
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		ctx.TrackCollection("messages", "room_id", "r")
+		var n int64
+		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return n
+	})
+	subscribe(t, e, client, "countRoom", "room", nil)
+	drain(client)
+
+	if err := e.db.Delete(&testMessage{}, []uint{msgs[0].ID, msgs[1].ID}).Error; err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := runs.Load(); got != 2 {
+		t.Errorf("collection count runs after batch Delete = %d, want 2", got)
+	}
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != float64(0) {
+		t.Errorf("count push after batch Delete = %v (%d messages), want one push of 0", data, n)
+	}
+}
+
+func TestPredicateDeleteInvalidatesCollectionCounts(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	msgs := []testMessage{
+		{Body: "drop", RoomID: "r"},
+		{Body: "drop", RoomID: "other"},
+		{Body: "keep", RoomID: "r"},
+	}
+	if err := e.db.Create(&msgs).Error; err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	var roomRuns, otherRuns atomic.Int64
+	registerCount := func(name, room string, runs *atomic.Int64) {
+		e.RegisterQuery(name, func(ctx *QueryCtx) interface{} {
+			runs.Add(1)
+			ctx.TrackCollection("messages", "room_id", room)
+			var n int64
+			if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", room).Count(&n).Error; err != nil {
+				return map[string]interface{}{"error": err.Error()}
+			}
+			return n
+		})
+	}
+	registerCount("countRoom", "r", &roomRuns)
+	registerCount("countOther", "other", &otherRuns)
+	subscribe(t, e, client, "countRoom", "room", nil)
+	subscribe(t, e, client, "countOther", "other", nil)
+	drain(client)
+
+	// The predicate is not the tracked column, so collection tags have to come
+	// from the rows that match, not from the WHERE clause.
+	if err := e.db.Where("body = ?", "drop").Delete(&testMessage{}).Error; err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got := roomRuns.Load(); got != 2 {
+		t.Errorf("room count runs after predicate Delete = %d, want 2", got)
+	}
+	if got := otherRuns.Load(); got != 2 {
+		t.Errorf("other count runs after predicate Delete = %d, want 2", got)
+	}
+	got := map[string]interface{}{}
+	for _, msg := range queryMessages(t, drain(client)) {
+		key, _ := msg["query_key"].(string)
+		got[key] = msg["data"]
+	}
+	if got["room"] != float64(1) || got["other"] != float64(0) {
+		t.Errorf("count pushes after predicate Delete = %v, want room 1 and other 0", got)
+	}
+}
+
 func TestMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)

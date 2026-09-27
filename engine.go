@@ -438,9 +438,9 @@ func NewEngine(db *gorm.DB) *Engine {
 		e.notifyRemote(tx.Statement.Context, tx.Statement.ConnPool, tags)
 		e.InvalidateTags(tags, execID, actionName)
 	}
-	// GORM callbacks only see the post-update Dest, so a Save that moves a
-	// tracked collection field would miss the old collection. Snapshot the
-	// matching rows before the UPDATE SQL runs.
+	// Updates only expose the post-write Dest, and Delete(&Model{}, id) leaves
+	// collection fields zero. Snapshot matching rows before either write so a
+	// collection move or a delete still invalidates the values that disappear.
 	snapshotOld := func(tx *gorm.DB) {
 		snapshotOldTrackedTags(tx)
 	}
@@ -453,6 +453,7 @@ func NewEngine(db *gorm.DB) *Engine {
 	db.Callback().Create().After("gorm:create").Register("tether:after_create", invalidate)
 	db.Callback().Update().Before("gorm:update").Register("tether:before_update", snapshotOld)
 	db.Callback().Update().After("gorm:update").Register("tether:after_update", invalidate)
+	db.Callback().Delete().Before("gorm:delete").Register("tether:before_delete", snapshotOld)
 	db.Callback().Delete().After("gorm:delete").Register("tether:after_delete", invalidate)
 
 	db.Callback().Query().After("gorm:query").Register("tether:after_query_profiler", func(tx *gorm.DB) {
@@ -733,10 +734,11 @@ func hasTrackedFields(tx *gorm.DB) bool {
 	return false
 }
 
-// snapshotOldTrackedTags loads the rows about to be updated and stashes their
-// tracked-field tags on the statement. GORM does not expose a before-image in
-// update callbacks, so this extra SELECT (same transaction, hooks skipped) is
-// what lets a collection move invalidate both the old and new collections.
+// snapshotOldTrackedTags loads the rows about to be updated or deleted and
+// stashes their tracked-field tags on the statement. GORM does not expose a
+// before-image, so this extra SELECT (same transaction, hooks skipped) is what
+// lets a collection move invalidate both sides and a delete of an unloaded
+// struct invalidate the deleted row's collections.
 func snapshotOldTrackedTags(tx *gorm.DB) {
 	if tx.Error != nil || tx.DryRun || tx.Statement == nil || tx.Statement.Schema == nil {
 		return
@@ -783,10 +785,10 @@ func snapshotOldTrackedTags(tx *gorm.DB) {
 	}
 }
 
-// restrictToUpdatingRows copies the update's WHERE and/or primary keys onto q.
-// Save() does not attach the PK to WHERE until gorm:update itself, so we also
-// read PKs from Dest and Model. Returns false if we cannot identify rows
-// without scanning the whole table.
+// restrictToUpdatingRows copies the write's WHERE and/or primary keys onto q.
+// Save() and Delete(model) do not attach the primary key to WHERE until GORM's
+// own callback, so we also read primary keys from Dest and Model. Returns
+// false if we cannot identify rows without scanning the whole table.
 func restrictToUpdatingRows(updateTx, queryTx *gorm.DB) bool {
 	identified := false
 	if where, ok := updateTx.Statement.Clauses["WHERE"]; ok && where.Expression != nil {
