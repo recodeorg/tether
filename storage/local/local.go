@@ -36,8 +36,6 @@ func (l *LocalStorage) UploadStream(ctx context.Context, fileID string, contentT
 		os.Remove(dstPath)
 		return err
 	}
-
-	os.WriteFile(dstPath+".mime", []byte(contentType), 0644)
 	return nil
 }
 
@@ -59,9 +57,6 @@ func (l *LocalStorage) Delete(fileID string) error {
 		return err
 	}
 	if err := os.Remove(path); err != nil {
-		return err
-	}
-	if err := os.Remove(path + ".mime"); err != nil {
 		return err
 	}
 	return nil

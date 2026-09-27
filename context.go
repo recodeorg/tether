@@ -28,7 +28,6 @@ type StorageCtx struct {
 type QueryCtx struct {
 	DB           *gorm.DB
 	Auth         *AuthCtx
-	Scheduler    *SchedulerCtx
 	Params       map[string]interface{}
 	Dependencies []string
 	Storage      *StorageCtx
@@ -57,7 +56,6 @@ type GuardCtx struct {
 	DB           *gorm.DB
 	Auth         *AuthCtx
 	Params       map[string]interface{}
-	Profiler     *utilities.Profiler
 	Dependencies []string
 }
 

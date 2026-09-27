@@ -1206,6 +1206,58 @@ func TestAutoTrackRequiresExportedIDField(t *testing.T) {
 	}
 }
 
+func TestQueryWriteDoesNotMutateOrRetrigger(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	var runs atomic.Int64
+	var writeErr atomic.Value
+	e.RegisterQuery("returnCount", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		var msgs []testMessage
+		if err := ctx.DB.Table("messages").Select("*").Find(&msgs).Error; err != nil {
+			t.Errorf("find: %v", err)
+		}
+		ctx.TrackTable("messages")
+		err := ctx.DB.Table("messages").Create(&testMessage{Body: "from-query", RoomID: "lobby"}).Error
+		if err != nil {
+			writeErr.Store(err.Error())
+		} else {
+			writeErr.Store("")
+		}
+		return len(msgs)
+	})
+	subscribe(t, e, client, "returnCount", "k", nil)
+	if got := runs.Load(); got != 1 {
+		t.Fatalf("subscribe runs = %d, want 1", got)
+	}
+	if got, _ := writeErr.Load().(string); got == "" {
+		t.Fatal("query Create returned nil error")
+	}
+
+	var before int64
+	if err := e.db.Table("messages").Count(&before).Error; err != nil {
+		t.Fatal(err)
+	}
+	if before != 0 {
+		t.Fatalf("rows after subscribe = %d, want 0", before)
+	}
+
+	if err := e.db.Create(&testMessage{Body: "real", RoomID: "lobby"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got := runs.Load(); got != 2 {
+		t.Fatalf("runs after external create = %d, want 2", got)
+	}
+	var rows []testMessage
+	if err := e.db.Order("id").Find(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Body != "real" {
+		t.Fatalf("rows = %+v, want one real message", rows)
+	}
+}
+
 func TestTrackTableIsInvalidatedByMutations(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)

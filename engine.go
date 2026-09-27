@@ -66,7 +66,6 @@ type Engine struct {
 	dbType          string // sqlite or postgres
 	mutations       map[string]Mutation
 	queries         map[string]Query
-	dependencies    map[string][]string
 	queryClock      atomic.Int64
 	tracker         *reactivity.Tracker
 	auth            Auth
@@ -101,7 +100,10 @@ type defaultAuth struct{}
 
 type contextKey string
 
-const tetherCtxKey contextKey = "tether_query_ctx"
+const (
+	tetherCtxKey   contextKey = "tether_query_ctx"
+	readOnlyCtxKey contextKey = "tether_readonly"
+)
 
 type traceContextKey string
 
@@ -164,11 +166,11 @@ func (e *Engine) bindGuardAuth(guardCtx *GuardCtx, authID string) {
 func (e *Engine) prepareGuardCtx(params map[string]interface{}, authID, execID, actionName string) *GuardCtx {
 	guardCtx := &GuardCtx{
 		Params:       params,
-		Profiler:     e.Profiler,
 		Dependencies: []string{},
 	}
 	e.bindGuardAuth(guardCtx, authID)
 	gormCtx := context.WithValue(context.Background(), tetherCtxKey, guardCtx)
+	gormCtx = context.WithValue(gormCtx, readOnlyCtxKey, true)
 	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
 	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, actionName)
 	guardCtx.DB = e.db.WithContext(gormCtx)
@@ -378,7 +380,6 @@ func NewEngine(db *gorm.DB) *Engine {
 		dbType:          dbType,
 		mutations:       make(map[string]Mutation),
 		queries:         make(map[string]Query),
-		dependencies:    make(map[string][]string),
 		tracker:         tracker,
 		auth:            defaultAuth{},
 		guards:          make(map[string]Guard),
@@ -407,11 +408,23 @@ func NewEngine(db *gorm.DB) *Engine {
 			slog.Error("Failed to execute mutation internally", "error", err)
 		}
 	})
+	enforceReadOnly := func(db *gorm.DB) {
+		if db.Statement.Context.Value(readOnlyCtxKey) == true {
+			db.AddError(fmt.Errorf("tether: database writes are strictly forbidden inside queries. Use a mutation instead."))
+		}
+	}
 	beforeProfiler := func(db *gorm.DB) {
 		// Profile the start time of the database operation
 		db.InstanceSet("tether:profiler_start", time.Now())
 	}
 	invalidate := func(tx *gorm.DB) {
+		// GORM runs every later callback even after AddError, so a write rejected
+		// by the read-only guard still reaches here. Publishing its tags would
+		// re-run the query that attempted the write, and that query would try
+		// the write again.
+		if tx.Error != nil {
+			return
+		}
 		tags := extractMutationTags(tx)
 		execID, _ := tx.Statement.Context.Value(ContextKeyExecutionID).(string)
 		actionName, _ := tx.Statement.Context.Value(ContextKeyActionName).(string)
@@ -443,6 +456,16 @@ func NewEngine(db *gorm.DB) *Engine {
 	snapshotOld := func(tx *gorm.DB) {
 		snapshotOldTrackedTags(tx)
 	}
+	db.Callback().Create().Before("gorm:create").Register("tether:readonly_guard", enforceReadOnly)
+	db.Callback().Update().Before("gorm:update").Register("tether:readonly_guard", enforceReadOnly)
+	db.Callback().Delete().Before("gorm:delete").Register("tether:readonly_guard", enforceReadOnly)
+	db.Callback().Raw().Before("gorm:raw").Register("tether:readonly_guard", func(db *gorm.DB) {
+		sql := strings.ToUpper(strings.TrimSpace(db.Statement.SQL.String()))
+		if strings.HasPrefix(sql, "INSERT") || strings.HasPrefix(sql, "UPDATE") || strings.HasPrefix(sql, "DELETE") {
+			enforceReadOnly(db)
+		}
+	})
+
 	db.Callback().Create().Before("gorm:create").Register("tether:before_create_profiler", beforeProfiler)
 	db.Callback().Update().Before("gorm:update").Register("tether:before_update_profiler", beforeProfiler)
 	db.Callback().Delete().Before("gorm:delete").Register("tether:before_delete_profiler", beforeProfiler)
@@ -1584,6 +1607,10 @@ func (e *Engine) sendQueryResult(subscription *reactivity.Subscription, result i
 	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
 }
 
+func (e *Engine) denyCapability() error {
+	return fmt.Errorf("tether: this capability is not available in this context")
+}
+
 // runQuery executes the query function and returns the result plus the
 // dependency tags it collected. It does not push to clients or update
 // subscription tags; callers decide how to fan those out.
@@ -1611,17 +1638,11 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		Dependencies: []string{},
 	}
 	queryCtx.Storage = &StorageCtx{
-		GetUploadURL:   e.getUploadURL,
+		GetUploadURL: func(opts storage.UploadOptions) (storage.UploadInfo, error) {
+			return storage.UploadInfo{}, e.denyCapability()
+		},
 		GetDownloadURL: e.getDownloadURL,
-		DeleteFile:     e.deleteFile,
-	}
-	queryCtx.Scheduler = &SchedulerCtx{
-		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
-			return e.scheduleTask(time.Now().Add(duration), functionName, params)
-		},
-		Cancel: func(taskID string) bool {
-			return e.cancelTask(taskID)
-		},
+		DeleteFile:     func(fileID string) error { return e.denyCapability() },
 	}
 	queryCtx.Auth = &AuthCtx{
 		GetIdentity: func() (string, error) {
@@ -1662,6 +1683,7 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 
 	// Create the GORM context
 	gormCtx := context.WithValue(context.Background(), tetherCtxKey, queryCtx)
+	gormCtx = context.WithValue(gormCtx, readOnlyCtxKey, true)
 	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
 	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, query)
 	queryCtx.DB = e.db.WithContext(gormCtx)
@@ -1767,10 +1789,9 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 			},
 		}
 		guardCtx := &GuardCtx{
-			DB:       e.db,
-			Auth:     guardAuth,
-			Params:   params,
-			Profiler: e.Profiler,
+			DB:     e.db.WithContext(context.WithValue(traceCtx, readOnlyCtxKey, true)),
+			Auth:   guardAuth,
+			Params: params,
 		}
 		result, err := executeGuard(e, guardCtx, guardName)
 		if err != nil {
