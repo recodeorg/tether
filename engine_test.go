@@ -1,6 +1,7 @@
 package tether
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -2029,6 +2030,82 @@ func TestAuthSuccessEncodesUserIDAsJSON(t *testing.T) {
 	data, _ := msg["data"].(map[string]interface{})
 	if data["user_id"] != `user "quoted"` {
 		t.Errorf("user_id = %v, want the raw authenticated id", data["user_id"])
+	}
+}
+
+func TestAuthFrameDoesNotLeakToken(t *testing.T) {
+	const secret = "audit-fake-secret"
+
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	e := newTestEngine(t)
+	auth := &stubAuth{userID: "user-1", expiresAt: time.Now().Add(time.Hour)}
+	e.SetAuth(auth)
+	if err := e.Profiler.Start(); err != nil {
+		t.Fatalf("start profiler: %v", err)
+	}
+	t.Cleanup(e.Profiler.Stop)
+
+	srv := httptest.NewServer(http.HandlerFunc(e.Handle))
+	t.Cleanup(srv.Close)
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	if err := conn.WriteJSON(map[string]interface{}{"type": "auth", "token": secret}); err != nil {
+		t.Fatalf("write auth: %v", err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	var reply map[string]interface{}
+	if err := conn.ReadJSON(&reply); err != nil {
+		t.Fatalf("read auth: %v", err)
+	}
+	if reply["success"] != true {
+		t.Fatalf("auth reply = %v", reply)
+	}
+	if !slices.Contains(auth.tokens, secret) {
+		t.Fatalf("VerifyToken tokens = %v, want the original secret", auth.tokens)
+	}
+
+	metrics := e.Profiler.DumpMetricsAndFlush()
+	encoded, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatalf("encode metrics: %v", err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("raw metrics contain the token: %s", encoded)
+	}
+	var sawAuth bool
+	for _, metric := range metrics {
+		if metric.Type != utilities.MetricTypeAuthentication {
+			continue
+		}
+		sawAuth = true
+		if metric.Name != "authentication" {
+			t.Errorf("auth metric name = %q, want authentication", metric.Name)
+		}
+	}
+	if !sawAuth {
+		t.Fatal("profiler did not record an authentication metric")
+	}
+
+	logged := logs.String()
+	if strings.Contains(logged, secret) {
+		t.Fatalf("debug logs contain the token:\n%s", logged)
+	}
+	for _, want := range []string{"WS: Received message", "WS: Unmarshalled message", "Received message", "[redacted]"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("debug logs missing %q:\n%s", want, logged)
+		}
 	}
 }
 

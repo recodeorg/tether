@@ -1799,22 +1799,23 @@ func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
 }
 
 func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) error {
-	slog.Debug("Received message", "from", clientID, "message", msg)
+	logged := utilities.RedactSensitiveFrame(msg)
+	slog.Debug("Received message", "from", clientID, "message", logged)
 	switch msg["type"] {
 	case "subscribe":
 		query, ok := msg["location"].(string)
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
 		params, ok := msg["params"].(map[string]interface{})
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
 		queryKey, ok := msg["query_key"].(string)
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
 		subscription := e.tracker.SubscribeToQuery(clientID, query, queryKey, params)
@@ -1837,13 +1838,13 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 	case "unsubscribe":
 		query, ok := msg["location"].(string)
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Invalid message"}`))
 			return nil
 		}
 		params, ok := msg["params"].(map[string]interface{})
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Invalid message"}`))
 			return nil
 		}
@@ -1851,17 +1852,17 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 	case "mutation":
 		mutation, ok := msg["location"].(string)
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
 		params, ok := msg["params"].(map[string]interface{})
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
 		mutationID, ok := msg["mutation_id"].(string)
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
 		_, err := e.ExecuteMutation(mutation, params, clientID, mutationID)
@@ -1878,7 +1879,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 	case "auth":
 		token, ok := msg["token"].(string)
 		if !ok {
-			slog.Error("Invalid message", "message", msg)
+			slog.Error("Invalid message", "message", logged)
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Invalid message"}`))
 			return nil
 		}
@@ -1887,7 +1888,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 		userID, expiresAt, err := e.auth.VerifyToken(e.db, token)
 		e.Profiler.Add(utilities.Metric{
 			ID:       execID,
-			Name:     "authentication:" + token,
+			Name:     string(utilities.MetricTypeAuthentication),
 			Type:     utilities.MetricTypeAuthentication,
 			Time:     start,
 			Duration: time.Since(start),

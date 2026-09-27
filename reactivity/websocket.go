@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/gorilla/websocket"
+	"github.com/recodeorg/tether/utilities"
 )
 
 // MessageReceiver receives decoded WebSocket payloads. Implemented by tether.Engine.
@@ -48,15 +49,17 @@ func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tr
 			slog.Error("WS: Failed to read message", "error", err)
 			return
 		}
-		slog.Debug("WS: Received message", "message", string(message))
-
 		var msg map[string]interface{}
 		err = json.Unmarshal(message, &msg)
 		if err != nil {
 			slog.Error("WS: Failed to unmarshal message", "error", err)
 			return
 		}
-		slog.Debug("WS: Unmarshalled message", "message", msg)
+		logged := utilities.RedactSensitiveFrame(msg)
+		if raw, mErr := json.Marshal(logged); mErr == nil {
+			slog.Debug("WS: Received message", "message", string(raw))
+		}
+		slog.Debug("WS: Unmarshalled message", "message", logged)
 		err = e.OnReceiveMessage(client.ID, msg)
 		if err != nil {
 			slog.Error("WS: Failed to on receive message", "error", err)
