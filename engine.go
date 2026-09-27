@@ -214,7 +214,9 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 		slog.Error("Failed to execute guard", "error", err)
 		return nil
 	}
-	e.tracker.UpdateTags(subscription.SubID, guardCtx.Dependencies)
+	if !e.tracker.UpdateTagsAtEpoch(subscription.SubID, guardCtx.Dependencies, auth.AuthEpoch) {
+		return nil
+	}
 	guardResultJSON, err := json.Marshal(guardResult)
 	if err != nil {
 		slog.Error("Failed to marshal guard result", "error", err)
@@ -226,7 +228,7 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 		return nil
 	}
 	paramsHash := xxhash.Sum64(paramsJSON)
-	if e.tracker.UpdateGuardFingerprint(attachedID, guardName, strconv.FormatUint(paramsHash, 10), string(guardResultJSON)) {
+	if e.tracker.UpdateGuardFingerprint(attachedID, guardName, strconv.FormatUint(paramsHash, 10), string(guardResultJSON), auth.AuthEpoch) {
 		return attached
 	}
 	return nil
@@ -1536,8 +1538,16 @@ func (e *Engine) invalidateTags(tags []string, execID string, actionName string)
 			unique = append(unique, subscription)
 		}
 	}
+	// Each client's auth is read before its fingerprint so an identity change
+	// between the two leaves a stale epoch that rejects this run's writes.
+	auths := make(map[string]reactivity.AuthCtx, len(unique))
 	batchedExecutions := make(map[string][]*reactivity.Subscription)
 	for _, subscription := range unique {
+		auth, ok := e.tracker.GetAuth(subscription.Client.ID)
+		if !ok {
+			continue
+		}
+		auths[subscription.SubID] = auth
 		authFingerprint := e.tracker.GetAuthFingerprint(subscription)
 		dedupKey := fmt.Sprintf("%s|%s|%s", subscription.Query, subscription.ParamsHash, authFingerprint)
 		batchedExecutions[dedupKey] = append(batchedExecutions[dedupKey], subscription)
@@ -1558,7 +1568,8 @@ func (e *Engine) invalidateTags(tags []string, execID string, actionName string)
 				}
 			}()
 			representative := subscriptions[0]
-			result, deps, ts, err := e.runQuery(representative.Query, representative.Params, representative)
+			repAuth := auths[representative.SubID]
+			result, deps, ts, err := e.runQuery(representative.Query, representative.Params, representative, repAuth)
 			if err != nil {
 				slog.Error("Failed to execute query", "error", err)
 				return
@@ -1568,14 +1579,15 @@ func (e *Engine) invalidateTags(tags []string, execID string, actionName string)
 			// Sharing that result would leak the representative's identity-specific
 			// data and copy their new auth tag onto every other client.
 			if len(subscriptions) > 1 && queryDepsIntroduceAuthTag(e.tracker, representative.SubID, deps) {
-				e.sendQueryResult(representative, result, deps, ts)
+				e.sendQueryResult(representative, result, deps, ts, repAuth.AuthEpoch)
 				for _, subscription := range subscriptions[1:] {
-					result, deps, ts, err := e.runQuery(subscription.Query, subscription.Params, subscription)
+					auth := auths[subscription.SubID]
+					result, deps, ts, err := e.runQuery(subscription.Query, subscription.Params, subscription, auth)
 					if err != nil {
 						slog.Error("Failed to execute query", "error", err)
 						continue
 					}
-					e.sendQueryResult(subscription, result, deps, ts)
+					e.sendQueryResult(subscription, result, deps, ts, auth.AuthEpoch)
 				}
 				return
 			}
@@ -1591,7 +1603,7 @@ func (e *Engine) invalidateTags(tags []string, execID string, actionName string)
 			// auto-tracked tags (e.g. new primary keys) stay in sync even though
 			// the query function ran only once.
 			for _, subscription := range subscriptions {
-				e.sendQueryResult(subscription, result, deps, ts)
+				e.sendQueryResult(subscription, result, deps, ts, auths[subscription.SubID].AuthEpoch)
 			}
 		}(subscriptions)
 	}
@@ -1648,25 +1660,28 @@ func queryDepsIntroduceAuthTag(tracker *reactivity.Tracker, subID string, deps [
 	return false
 }
 
-// sendQueryResult records deps on one subscription and pushes result to its client.
-func (e *Engine) sendQueryResult(subscription *reactivity.Subscription, result interface{}, deps []string, ts int64) {
-	e.tracker.UpdateTags(subscription.SubID, deps)
+// sendQueryResult records deps on one subscription and pushes result to its
+// client, unless that client's identity changed since authEpoch was read.
+func (e *Engine) sendQueryResult(subscription *reactivity.Subscription, result interface{}, deps []string, ts int64, authEpoch int) {
 	responseJSON, err := marshalQueryMessage(subscription.Query, result, subscription.QueryKey, ts)
 	if err != nil {
 		slog.Error("Failed to encode query result", "error", err)
 		return
 	}
-	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
+	if !e.tracker.CommitQueryResult(subscription.SubID, deps, responseJSON, authEpoch) {
+		slog.Debug("Dropping query result from a previous identity", "subID", subscription.SubID)
+	}
 }
 
 func (e *Engine) denyCapability() error {
 	return fmt.Errorf("tether: this capability is not available in this context")
 }
 
-// runQuery executes the query function and returns the result plus the
-// dependency tags it collected. It does not push to clients or update
-// subscription tags; callers decide how to fan those out.
-func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) (interface{}, []string, int64, error) {
+// runQuery executes the query function as auth's identity and returns the
+// result plus the dependency tags it collected. It does not push to clients or
+// update subscription tags; callers decide how to fan those out and must commit
+// them against auth.AuthEpoch.
+func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, auth reactivity.AuthCtx) (interface{}, []string, int64, error) {
 	if _, exists := e.queries[query]; !exists {
 		return nil, nil, 0, fmt.Errorf("query not found")
 	}
@@ -1675,10 +1690,6 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	}
 	if _, err := json.Marshal(params); err != nil {
 		return nil, nil, 0, err
-	}
-	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
-	if !ok {
-		return nil, nil, 0, fmt.Errorf("client not found")
 	}
 	authID := auth.UserID
 	slog.Debug("Executing query", "query", query, "params", params)
@@ -1716,8 +1727,7 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 			if err != nil {
 				return nil, err
 			}
-			e.tracker.AttachGuardToSubscription(subscription.SubID, guardID, guardName, params)
-			e.tracker.UpdateTags(guardID, guardCtx.Dependencies)
+			e.tracker.AttachGuardToSubscription(subscription.SubID, guardID, guardName, params, guardCtx.Dependencies, auth.AuthEpoch)
 			resultJSON, err := json.Marshal(result)
 			if err != nil {
 				return nil, err
@@ -1756,8 +1766,15 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	return result, queryCtx.Dependencies, ts, nil
 }
 
+// executeQuery runs a query for one subscription and pushes the result. A
+// result computed under an identity that has since changed is dropped without
+// error: the auth change re-runs the subscription under the new identity.
 func (e *Engine) executeQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) ([]byte, error) {
-	result, deps, ts, err := e.runQuery(query, params, subscription)
+	auth, ok := e.tracker.GetAuth(subscription.Client.ID)
+	if !ok {
+		return nil, fmt.Errorf("client not found")
+	}
+	result, deps, ts, err := e.runQuery(query, params, subscription, auth)
 	if err != nil {
 		return nil, err
 	}
@@ -1766,9 +1783,11 @@ func (e *Engine) executeQuery(query string, params map[string]interface{}, subsc
 	if err != nil {
 		return nil, err
 	}
-	e.tracker.UpdateTags(subscription.SubID, deps)
+	if !e.tracker.CommitQueryResult(subscription.SubID, deps, responseJSON, auth.AuthEpoch) {
+		slog.Debug("Dropping query result from a previous identity", "subID", subscription.SubID)
+		return nil, nil
+	}
 	slog.Debug("Updated dependencies on subscription", "subID", subscription.SubID, "dependencies", deps)
-	e.tracker.SendMessage(subscription.Client.ID, responseJSON)
 	return responseJSON, nil
 }
 

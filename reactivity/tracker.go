@@ -76,12 +76,35 @@ func (t *Tracker) resetAuthorization(clientID string) []*Subscription {
 	return subscriptions
 }
 
-func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardName string, params map[string]interface{}) {
+// authEpochCurrent reports whether sub's client is still tracked and still on
+// authEpoch. Guard subscriptions resolve their client through the attached
+// query. Callers must hold t.mu.
+func (t *Tracker) authEpochCurrent(sub *Subscription, authEpoch int) bool {
+	client := sub.Client
+	if client == nil && len(sub.LinkedSubIDs) > 0 {
+		if attached, ok := t.subscriptions[sub.LinkedSubIDs[0]]; ok {
+			client = attached.Client
+		}
+	}
+	if client == nil || t.clients[client.ID] != client {
+		return false
+	}
+	return client.GetAuth().AuthEpoch == authEpoch
+}
+
+// AttachGuardToSubscription records a guard's first execution as its own
+// subscription with deps. It is dropped if the client's identity changed since
+// authEpoch was read.
+func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardName string, params map[string]interface{}, deps []string, authEpoch int) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	querySub, ok := t.subscriptions[subID]
 	if !ok {
 		slog.Error("Tracker: Subscription not found", "subID", subID)
+		return
+	}
+	if !t.authEpochCurrent(querySub, authEpoch) {
+		slog.Debug("Tracker: Dropping guard from a previous identity", "subID", subID, "guard", guardName)
 		return
 	}
 	paramsJSON, err := json.Marshal(params)
@@ -99,6 +122,7 @@ func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardN
 		Params:       params,
 	}
 	querySub.LinkedSubIDs = append(querySub.LinkedSubIDs, guardID)
+	t.updateTags(guardID, deps)
 }
 
 func (t *Tracker) Track(c *Client) {
@@ -285,7 +309,55 @@ func (t *Tracker) UpdateTags(subID string, newTags []string) {
 		slog.Error("Tracker: Subscription not found", "subID", subID)
 		return
 	}
+	t.updateTags(subID, newTags)
+}
 
+// UpdateTagsAtEpoch is UpdateTags for work that ran under the client identity
+// at authEpoch. It reports false and changes nothing if that identity is gone.
+func (t *Tracker) UpdateTagsAtEpoch(subID string, newTags []string, authEpoch int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	sub, exists := t.subscriptions[subID]
+	if !exists || !t.authEpochCurrent(sub, authEpoch) {
+		return false
+	}
+	t.updateTags(subID, newTags)
+	return true
+}
+
+// CommitQueryResult records a query execution's tags and sends its message,
+// unless the client's identity changed since authEpoch was read. Both happen
+// under one lock so an auth reset cannot land between them.
+func (t *Tracker) CommitQueryResult(subID string, newTags []string, message []byte, authEpoch int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	sub, exists := t.subscriptions[subID]
+	if !exists || sub.Client == nil || !t.authEpochCurrent(sub, authEpoch) {
+		return false
+	}
+	t.updateTags(subID, newTags)
+	t.send(sub.Client, message)
+	return true
+}
+
+// guardResultPrefix is the name-and-params identity of a cached guard result,
+// "*guard_<name>_<paramsHash>:". Other tags return "".
+func guardResultPrefix(tag string) string {
+	if !strings.HasPrefix(tag, "*guard_") {
+		return ""
+	}
+	colon := strings.IndexByte(tag, ':')
+	if colon < 0 {
+		return ""
+	}
+	return tag[:colon+1]
+}
+
+// updateTags replaces subID's non-permanent tags with newTags. Permanent tags
+// stay, except a guard result, which replaces any result already stored for
+// the same guard name and params. Callers must hold t.mu and have checked
+// that subID exists.
+func (t *Tracker) updateTags(subID string, newTags []string) {
 	// Collect permanent tags before removing old tags
 	permanentTags := make(map[string]struct{})
 	for tag := range t.subToTags[subID] {
@@ -293,6 +365,32 @@ func (t *Tracker) UpdateTags(subID string, newTags []string) {
 			permanentTags[tag] = struct{}{}
 		}
 	}
+
+	// One result per guard name and params. The last result in this update
+	// wins, including over a result already recorded on the subscription.
+	guardIndex := make(map[string]int)
+	collapsed := make([]string, 0, len(newTags))
+	for _, tag := range newTags {
+		prefix := guardResultPrefix(tag)
+		if prefix == "" {
+			collapsed = append(collapsed, tag)
+			continue
+		}
+		if idx, ok := guardIndex[prefix]; ok {
+			collapsed[idx] = tag
+			continue
+		}
+		guardIndex[prefix] = len(collapsed)
+		collapsed = append(collapsed, tag)
+	}
+	for prefix := range guardIndex {
+		for old := range permanentTags {
+			if strings.HasPrefix(old, prefix) {
+				delete(permanentTags, old)
+			}
+		}
+	}
+	newTags = collapsed
 
 	// Remove subID from non-permanent tags in tagsToSubs
 	for oldTag := range t.subToTags[subID] {
@@ -353,11 +451,19 @@ func (t *Tracker) GetGuardFingerprint(sub *Subscription, guardName string, param
 	return ""
 }
 
-func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsHash string, newValue string) bool {
+// UpdateGuardFingerprint replaces the cached guard result on subID. It reports
+// whether the fingerprint changed, and changes nothing if the client's identity
+// changed since authEpoch was read.
+func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsHash string, newValue string, authEpoch int) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, exists := t.subscriptions[subID]; !exists {
+	sub, exists := t.subscriptions[subID]
+	if !exists {
 		slog.Error("Tracker: Subscription not found", "subID", subID)
+		return false
+	}
+	if !t.authEpochCurrent(sub, authEpoch) {
+		slog.Debug("Tracker: Dropping guard fingerprint from a previous identity", "subID", subID, "guard", guardName)
 		return false
 	}
 	if t.subToTags[subID] == nil {
@@ -413,10 +519,15 @@ func (t *Tracker) SendMessage(clientID string, message []byte) {
 		slog.Error("Tracker: Client not found", "clientID", clientID)
 		return
 	}
+	t.send(client, message)
+}
+
+// send queues message without blocking. Callers must hold t.mu.
+func (t *Tracker) send(client *Client, message []byte) {
 	select {
 	case client.Send <- message:
 	default:
-		slog.Error("Tracker: Client send channel is full", "clientID", clientID)
+		slog.Error("Tracker: Client send channel is full", "clientID", client.ID)
 		client.Conn.Close() // Aggressively close the connection to force the client to reconnect
 	}
 }

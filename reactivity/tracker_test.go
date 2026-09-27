@@ -255,6 +255,44 @@ func TestUpdateTagsReplacesNonPermanentTags(t *testing.T) {
 	assertTrackerConsistent(t, tr)
 }
 
+func TestUpdateTagsReplacesGuardResultWithSameNameAndParams(t *testing.T) {
+	tr := NewTracker()
+	client := NewClient(nil)
+	tr.Track(client)
+
+	sub := tr.SubscribeToQuery(client.ID, "q", "k", nil)
+	older := "*guard_isAllowed_1:true"
+	newer := "*guard_isAllowed_1:false"
+	otherParams := "*guard_isAllowed_2:true"
+	identity := "*user_identity:alice"
+
+	tr.UpdateTags(sub.SubID, []string{"old-data", older, otherParams, identity})
+	tr.UpdateTags(sub.SubID, []string{"new-data", older, newer})
+
+	if tr.SubscriptionHasTag(sub.SubID, older) {
+		t.Error("older guard result was kept alongside the replacement")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, newer) {
+		t.Error("replacement guard result was not recorded")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, otherParams) {
+		t.Error("guard result with different params was replaced")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, identity) {
+		t.Error("identity tag was replaced")
+	}
+	if subscriptionForTag(tr.GetSubscriptionsToTag("old-data"), sub.SubID) != nil {
+		t.Error("replaced data tag is still mapped")
+	}
+	if subscriptionForTag(tr.GetSubscriptionsToTag("new-data"), sub.SubID) == nil {
+		t.Error("new data tag was not mapped")
+	}
+	if subscriptionForTag(tr.GetSubscriptionsToTag(older), sub.SubID) != nil {
+		t.Error("replaced guard result is still mapped from tags")
+	}
+	assertTrackerConsistent(t, tr)
+}
+
 func TestUntrackRemovesClientFromAllMaps(t *testing.T) {
 	tr := NewTracker()
 	client := NewClient(nil)

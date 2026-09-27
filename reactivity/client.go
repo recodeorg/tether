@@ -18,7 +18,12 @@ type Client struct {
 }
 
 type AuthCtx struct {
-	UserID    string
+	UserID string
+	// AuthEpoch advances only when UserID changes, which is exactly when the
+	// tracker resets authorization state and re-runs the client's queries.
+	// Bumping it on a same-user refresh would reject in-flight results that
+	// nothing re-runs.
+	AuthEpoch int
 	ExpiresAt time.Time
 }
 
@@ -29,6 +34,9 @@ func NewClient(conn *websocket.Conn) *Client {
 func (c *Client) SetAuth(userID string, expiresAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.Auth.UserID != userID {
+		c.Auth.AuthEpoch++
+	}
 	c.Auth.UserID = userID
 	c.Auth.ExpiresAt = expiresAt
 }

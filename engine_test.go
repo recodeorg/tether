@@ -2494,6 +2494,224 @@ func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
 	}
 }
 
+// registerBlockingSecretQuery registers the secret query with an isAllowed
+// guard (allowing only alice) that tracks table_guard:mutated and parks its
+// blockOn-th invocation after it has read the caller's identity. entered is
+// closed once that invocation is parked; release lets it return.
+func registerBlockingSecretQuery(t *testing.T, e *Engine, blockOn int64) (entered <-chan struct{}, release func()) {
+	t.Helper()
+	var unused atomic.Int64
+	registerSecretQuery(e, "alice", &unused)
+	enteredCh := make(chan struct{})
+	releaseCh := make(chan struct{})
+	var once sync.Once
+	release = func() { once.Do(func() { close(releaseCh) }) }
+	t.Cleanup(release)
+	var runs atomic.Int64
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+		ctx.TrackTable("guard")
+		id, _ := ctx.Auth.GetIdentity()
+		if runs.Add(1) == blockOn {
+			close(enteredCh)
+			<-releaseCh
+		}
+		return id == "alice"
+	})
+	return enteredCh, release
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// assertGuardRevoked checks that sub holds only the post-expiry false decision
+// and keeps serving DENIED, no matter which fingerprint map iteration picks.
+func assertGuardRevoked(t *testing.T, e *Engine, client *reactivity.Client, sub *reactivity.Subscription) {
+	t.Helper()
+	if data, n := lastQueryData(t, client); n != 0 {
+		t.Errorf("stale guard pushed %d results after expiry, last = %v", n, data)
+	}
+	prefix := "*guard_isAllowed_" + emptyParamsHash() + ":"
+	if e.tracker.SubscriptionHasTag(sub.SubID, prefix+"true") {
+		t.Error("stale guard restored alice's true fingerprint")
+	}
+	if !e.tracker.SubscriptionHasTag(sub.SubID, prefix+"false") {
+		t.Error("post-expiry false fingerprint is missing")
+	}
+	if subs := e.tracker.GetSubscriptionsToTag("*user_identity:alice"); len(subs) != 0 {
+		t.Errorf("%d subscriptions still depend on alice's identity after expiry", len(subs))
+	}
+	for i := 0; i < 5; i++ {
+		e.invalidateTag("table_refresh:mutated")
+		if data, n := lastQueryData(t, client); n != 1 || data != "DENIED" {
+			t.Fatalf("invalidation %d got %d pushes, last = %v; want 1 push of DENIED", i, n, data)
+		}
+	}
+}
+
+func TestAuthExpiryDuringFirstGuardRejectsStaleResult(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	entered, release := registerBlockingSecretQuery(t, e, 1)
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(100 * time.Millisecond)})
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	sub := e.tracker.SubscribeToQuery(client.ID, "secret", "secret", map[string]interface{}{})
+	if sub == nil {
+		t.Fatal("SubscribeToQuery returned nil")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := e.executeQuery("secret", sub.Params, sub); err != nil {
+			t.Errorf("in-flight executeQuery: %v", err)
+		}
+	}()
+	waitClosed(t, entered, "the first guard to start")
+
+	if !waitForQueryData(t, client, "DENIED") {
+		t.Fatal("expiry did not push DENIED while the first guard was in flight")
+	}
+	release()
+	waitClosed(t, done, "the in-flight query to finish")
+
+	assertGuardRevoked(t, e, client, sub)
+}
+
+func TestAuthExpiryDuringGuardReevaluationRejectsStaleResult(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	entered, release := registerBlockingSecretQuery(t, e, 2)
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(150 * time.Millisecond)})
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	sub := subscribe(t, e, client, "secret", "secret", nil)
+	if data, _ := lastQueryData(t, client); data != "SECRET" {
+		t.Fatalf("initial data = %v, want SECRET", data)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.invalidateTag("table_guard:mutated")
+	}()
+	waitClosed(t, entered, "the guard re-evaluation to start")
+
+	if !waitForQueryData(t, client, "DENIED") {
+		t.Fatal("expiry did not push DENIED while the guard re-evaluation was in flight")
+	}
+	release()
+	waitClosed(t, done, "the in-flight invalidation to finish")
+
+	assertGuardRevoked(t, e, client, sub)
+}
+
+func TestTokenRefreshDuringFirstGuardKeepsResult(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	entered, release := registerBlockingSecretQuery(t, e, 1)
+
+	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(time.Hour)})
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "first"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	sub := e.tracker.SubscribeToQuery(client.ID, "secret", "secret", map[string]interface{}{})
+	if sub == nil {
+		t.Fatal("SubscribeToQuery returned nil")
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, err := e.executeQuery("secret", sub.Params, sub); err != nil {
+			t.Errorf("in-flight executeQuery: %v", err)
+		}
+	}()
+	waitClosed(t, entered, "the first guard to start")
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "refreshed"}); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+	release()
+	waitClosed(t, done, "the in-flight query to finish")
+
+	if data, n := lastQueryData(t, client); n != 1 || data != "SECRET" {
+		t.Errorf("after same-user refresh got %d pushes, last = %v; want 1 push of SECRET", n, data)
+	}
+	if !e.tracker.SubscriptionHasTag(sub.SubID, "*guard_isAllowed_"+emptyParamsHash()+":true") {
+		t.Error("same-user refresh dropped the in-flight guard decision")
+	}
+}
+
+func TestConcurrentFirstGuardRunsKeepOneResult(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.tracker.SetAuth(client.ID, "alice", time.Now().Add(time.Hour))
+
+	releaseCh := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	t.Cleanup(release)
+
+	var runs atomic.Int64
+	bothStarted := make(chan struct{})
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+		n := runs.Add(1)
+		if n <= 2 {
+			if n == 2 {
+				close(bothStarted)
+			}
+			<-releaseCh
+		}
+		return n
+	})
+	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+		result, err := ctx.Auth.ExecuteGuard("isAllowed", map[string]interface{}{})
+		if err != nil {
+			return "ERROR"
+		}
+		return result
+	})
+
+	sub := e.tracker.SubscribeToQuery(client.ID, "secret", "secret", map[string]interface{}{})
+	if sub == nil {
+		t.Fatal("SubscribeToQuery returned nil")
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer wg.Done()
+			if _, err := e.executeQuery("secret", sub.Params, sub); err != nil {
+				t.Errorf("executeQuery: %v", err)
+			}
+		}()
+	}
+	waitClosed(t, bothStarted, "both first guard runs to start")
+	release()
+	wg.Wait()
+
+	prefix := "*guard_isAllowed_" + emptyParamsHash() + ":"
+	kept := 0
+	for _, value := range []string{"1", "2"} {
+		if e.tracker.SubscriptionHasTag(sub.SubID, prefix+value) {
+			kept++
+		}
+	}
+	if kept != 1 {
+		t.Errorf("guard results kept = %d, want 1", kept)
+	}
+}
+
 func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
