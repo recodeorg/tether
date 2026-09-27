@@ -270,7 +270,7 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 				delete(e.taskToTimer, taskID)
 				e.timerMutex.Unlock()
 			}()
-			_, err := e.ExecuteMutationInternal(functionName, params)
+			_, err := e.executeMutationInternal(functionName, params)
 			if err != nil {
 				slog.Error("Failed to execute mutation internally", "error", err)
 			}
@@ -403,7 +403,7 @@ func NewEngine(db *gorm.DB) *Engine {
 
 	// profiler initialization
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
-		_, err := e.ExecuteMutationInternal(mutationName, map[string]interface{}{})
+		_, err := e.executeMutationInternal(mutationName, map[string]interface{}{})
 		if err != nil {
 			slog.Error("Failed to execute mutation internally", "error", err)
 		}
@@ -448,7 +448,7 @@ func NewEngine(db *gorm.DB) *Engine {
 			return
 		}
 		e.notifyRemote(tx.Statement.Context, tx.Statement.ConnPool, tags)
-		e.InvalidateTags(tags, execID, actionName)
+		e.invalidateTags(tags, execID, actionName)
 	}
 	// Updates only expose the post-write Dest, and Delete(&Model{}, id) leaves
 	// collection fields zero. Snapshot matching rows before either write so a
@@ -561,7 +561,7 @@ func (e *Engine) startPostgresListener(ctx context.Context, dsn string) {
 				if senderID != e.EphemeralID {
 					remoteTags := strings.Split(tags, ",")
 					uniqueID := uuid.New().String()
-					e.InvalidateTags(remoteTags, senderID+"|"+uniqueID, "remote_update") // TODO: forward execID and actionName from the sender for better profiling
+					e.invalidateTags(remoteTags, senderID+"|"+uniqueID, "remote_update") // TODO: forward execID and actionName from the sender for better profiling
 				}
 			}
 		}
@@ -677,7 +677,7 @@ func (e *Engine) pollScheduledTasks() {
 					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
 				}
 			}()
-			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
+			_, err := e.executeMutationInternal(t.FunctionName, params)
 			if err != nil {
 				slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
 			}
@@ -1182,7 +1182,7 @@ func (e *Engine) CreateTable(schema interface{}) {
 }
 
 func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
-	reactivity.Handle(w, r, e, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
+	reactivity.Handle(w, r, e.onReceiveMessage, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
 }
 
 func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
@@ -1430,23 +1430,11 @@ func (e *Engine) SetAllowedOrigins(allowedOrigins []string) {
 	}
 }
 
-func (e *Engine) OnConnect(clientID string) error {
-	slog.Debug("Connected to websocket", "client", clientID)
-	// TODO: implement the logic to handle the connection
-	return nil
+func (e *Engine) invalidateTag(tag string) {
+	e.invalidateTags([]string{tag}, "legacy", "legacy_invalidate_tag")
 }
 
-func (e *Engine) OnDisconnect(clientID string) error {
-	slog.Debug("Disconnected from websocket", "client", clientID)
-	// TODO: implement the logic to handle the disconnection
-	return nil
-}
-
-func (e *Engine) InvalidateTag(tag string) {
-	e.InvalidateTags([]string{tag}, "legacy", "legacy_invalidate_tag")
-}
-
-// InvalidateTags re-runs each distinct subscription that listens to any of the
+// invalidateTags re-runs each distinct subscription that listens to any of the
 // given tags. Subscriptions are snapshotted before any query executes so a
 // re-run that picks up additional tags (e.g. auto-tracked primary keys) cannot
 // cause the same mutation to fire the query a second time. Matching
@@ -1455,7 +1443,7 @@ func (e *Engine) InvalidateTag(tag string) {
 // records an auth tag the batch was not partitioned on, the result is delivered
 // only to the representative and every other subscription is executed under its
 // own identity.
-func (e *Engine) InvalidateTags(tags []string, execID string, actionName string) {
+func (e *Engine) invalidateTags(tags []string, execID string, actionName string) {
 	start := time.Now()
 	seen := make(map[string]struct{})
 	var unique []*reactivity.Subscription
@@ -1704,7 +1692,7 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	return result, queryCtx.Dependencies, ts, nil
 }
 
-func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) ([]byte, error) {
+func (e *Engine) executeQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription) ([]byte, error) {
 	result, deps, ts, err := e.runQuery(query, params, subscription)
 	if err != nil {
 		return nil, err
@@ -1720,7 +1708,7 @@ func (e *Engine) ExecuteQuery(query string, params map[string]interface{}, subsc
 	return responseJSON, nil
 }
 
-func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
+func (e *Engine) executeMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
 	if _, exists := e.mutations[mutation]; !exists {
 		return nil, fmt.Errorf("mutation not found")
 	}
@@ -1757,7 +1745,7 @@ func (e *Engine) ExecuteMutationInternal(mutation string, params map[string]inte
 	return result, nil
 }
 
-func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{}, clientID string, mutationID string) (interface{}, error) {
+func (e *Engine) executeMutation(mutation string, params map[string]interface{}, clientID string, mutationID string) (interface{}, error) {
 	if _, exists := e.mutations[mutation]; !exists {
 		return nil, fmt.Errorf("mutation not found")
 	}
@@ -1836,13 +1824,13 @@ func (e *Engine) ExecuteMutation(mutation string, params map[string]interface{},
 // authorization state was reset by an identity change.
 func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
 	for _, subscription := range subscriptions {
-		if _, err := e.ExecuteQuery(subscription.Query, subscription.Params, subscription); err != nil {
+		if _, err := e.executeQuery(subscription.Query, subscription.Params, subscription); err != nil {
 			slog.Error("Failed to re-run query after auth change", "query", subscription.Query, "error", err)
 		}
 	}
 }
 
-func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) error {
+func (e *Engine) onReceiveMessage(clientID string, msg map[string]interface{}) error {
 	logged := utilities.RedactSensitiveFrame(msg)
 	slog.Debug("Received message", "from", clientID, "message", logged)
 	switch msg["type"] {
@@ -1868,7 +1856,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to subscribe to query"}`))
 			return nil
 		}
-		_, err := e.ExecuteQuery(query, params, subscription)
+		_, err := e.executeQuery(query, params, subscription)
 		if err != nil {
 			slog.Error("Failed to execute query", "query", query, "params", params, "error", err)
 			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute query", "query_key": queryKey, "params": params})
@@ -1909,7 +1897,7 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 			slog.Error("Invalid message", "message", logged)
 			return nil
 		}
-		_, err := e.ExecuteMutation(mutation, params, clientID, mutationID)
+		_, err := e.executeMutation(mutation, params, clientID, mutationID)
 		if err != nil {
 			slog.Error("Failed to execute mutation", "mutation", mutation, "params", params, "error", err)
 			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute mutation", "mutation": mutation, "mutation_id": mutationID, "params": params})

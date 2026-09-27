@@ -118,7 +118,7 @@ func (t *trackedTx) Commit() error {
 		return err
 	}
 	for e, p := range pending {
-		e.InvalidateTags(p.tags, p.execID, p.actionName)
+		e.invalidateTags(p.tags, p.execID, p.actionName)
 	}
 	return nil
 }

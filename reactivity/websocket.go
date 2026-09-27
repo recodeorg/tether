@@ -10,17 +10,12 @@ import (
 )
 
 // MessageReceiver receives decoded WebSocket payloads. Implemented by tether.Engine.
-type EngineHandler interface {
-	OnConnect(clientID string) error
-	OnDisconnect(clientID string) error
-	OnReceiveMessage(clientID string, msg map[string]interface{}) error
-}
 
 type WebsocketHelper struct {
 	CheckOrigin func(r *http.Request) bool
 }
 
-func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tracker, helper *WebsocketHelper) {
+func Handle(w http.ResponseWriter, r *http.Request, onReceiveMessage func(clientID string, msg map[string]interface{}) error, tracker *Tracker, helper *WebsocketHelper) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: helper.CheckOrigin,
 	}
@@ -31,12 +26,6 @@ func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tr
 	}
 
 	client := NewClient(ws)
-	err = e.OnConnect(client.ID)
-	if err != nil {
-		slog.Error("WS: Failed to call onConnect handler", "error", err)
-		return
-	}
-	defer e.OnDisconnect(client.ID)
 	tracker.Track(client)
 	defer func() {
 		tracker.Untrack(client)
@@ -61,7 +50,7 @@ func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tr
 			slog.Debug("WS: Received message", "message", string(raw))
 		}
 		slog.Debug("WS: Unmarshalled message", "message", logged)
-		err = e.OnReceiveMessage(client.ID, msg)
+		err = onReceiveMessage(client.ID, msg)
 		if err != nil {
 			slog.Error("WS: Failed to on receive message", "error", err)
 			continue

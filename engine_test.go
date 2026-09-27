@@ -494,7 +494,7 @@ func subscribe(t *testing.T, e *Engine, client *reactivity.Client, query, queryK
 	if sub == nil {
 		t.Fatal("SubscribeToQuery returned nil")
 	}
-	if _, err := e.ExecuteQuery(query, params, sub); err != nil {
+	if _, err := e.executeQuery(query, params, sub); err != nil {
 		t.Fatalf("ExecuteQuery(%q): %v", query, err)
 	}
 	return sub
@@ -750,7 +750,7 @@ func TestCreateInvalidatesTrackCollection(t *testing.T) {
 		}
 		return msg
 	})
-	if _, err := e.ExecuteMutation("createMessage", map[string]interface{}{"body": "hi", "room": "lobby"}, client.ID, "m1"); err != nil {
+	if _, err := e.executeMutation("createMessage", map[string]interface{}{"body": "hi", "room": "lobby"}, client.ID, "m1"); err != nil {
 		t.Fatalf("ExecuteMutation: %v", err)
 	}
 
@@ -1296,7 +1296,7 @@ func TestInvalidateTagRerunsEverySubscriber(t *testing.T) {
 	drain(a)
 	drain(b)
 
-	e.InvalidateTag("messages_room_id:lobby")
+	e.invalidateTag("messages_room_id:lobby")
 	if got := runs.Load(); got != 4 {
 		t.Errorf("query runs after InvalidateTag = %d, want 4", got)
 	}
@@ -1311,7 +1311,7 @@ func TestInvalidateTagRerunsEverySubscriber(t *testing.T) {
 func TestInvalidateTagWithNoSubscribersDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	mustNoPanic(t, "InvalidateTag", func() {
-		e.InvalidateTag("messages:999")
+		e.invalidateTag("messages:999")
 	})
 }
 
@@ -1336,7 +1336,7 @@ func TestMutationOnOneClientPushesQueryToSubscribersOnly(t *testing.T) {
 	drain(subscriber)
 	drain(mutator)
 
-	if _, err := e.ExecuteMutation("createMessage", map[string]interface{}{}, mutator.ID, "mut-1"); err != nil {
+	if _, err := e.executeMutation("createMessage", map[string]interface{}{}, mutator.ID, "mut-1"); err != nil {
 		t.Fatalf("ExecuteMutation: %v", err)
 	}
 
@@ -1432,7 +1432,7 @@ func TestMutationFailureDoesNotPanicOrInvalidate(t *testing.T) {
 	var result interface{}
 	var err error
 	mustNoPanic(t, "failing mutation", func() {
-		result, err = e.ExecuteMutation("badCreate", map[string]interface{}{}, client.ID, "m-bad")
+		result, err = e.executeMutation("badCreate", map[string]interface{}{}, client.ID, "m-bad")
 	})
 	if err != nil {
 		t.Errorf("ExecuteMutation returned error %v; failing mutations should encode the handler result", err)
@@ -1454,7 +1454,7 @@ func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 
 	var err error
 	mustNoPanic(t, "ExecuteQuery(bad params)", func() {
-		_, err = e.ExecuteQuery("noop", map[string]interface{}{"ch": make(chan int)}, sub)
+		_, err = e.executeQuery("noop", map[string]interface{}{"ch": make(chan int)}, sub)
 	})
 	if err == nil {
 		t.Error("ExecuteQuery with unmarshalable params returned nil error")
@@ -1469,7 +1469,7 @@ func TestExecuteQueryUnserializableResultDoesNotPanic(t *testing.T) {
 
 	var err error
 	mustNoPanic(t, "ExecuteQuery(bad result)", func() {
-		_, err = e.ExecuteQuery("bad", map[string]interface{}{}, sub)
+		_, err = e.executeQuery("bad", map[string]interface{}{}, sub)
 	})
 	if err == nil {
 		t.Error("ExecuteQuery with unmarshalable result returned nil error")
@@ -1482,7 +1482,7 @@ func TestUnknownQueryDoesNotPanic(t *testing.T) {
 	sub := e.tracker.SubscribeToQuery(client.ID, "missing", "k", map[string]interface{}{})
 
 	mustNoPanic(t, "ExecuteQuery(unknown)", func() {
-		_, err := e.ExecuteQuery("missing", map[string]interface{}{}, sub)
+		_, err := e.executeQuery("missing", map[string]interface{}{}, sub)
 		if err == nil {
 			t.Error("ExecuteQuery(unknown) returned nil error")
 		}
@@ -1494,7 +1494,7 @@ func TestUnknownMutationDoesNotPanic(t *testing.T) {
 	client := trackClient(t, e)
 
 	mustNoPanic(t, "ExecuteMutation(unknown)", func() {
-		_, err := e.ExecuteMutation("missing", map[string]interface{}{}, client.ID, "m1")
+		_, err := e.executeMutation("missing", map[string]interface{}{}, client.ID, "m1")
 		if err == nil {
 			t.Error("ExecuteMutation(unknown) returned nil error")
 		}
@@ -1506,10 +1506,10 @@ func TestMalformedSubscribeDoesNotPanic(t *testing.T) {
 	client := trackClient(t, e)
 
 	mustNoPanic(t, "subscribe without fields", func() {
-		_ = e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "subscribe"})
+		_ = e.onReceiveMessage(client.ID, map[string]interface{}{"type": "subscribe"})
 	})
 	mustNoPanic(t, "subscribe with nil params", func() {
-		_ = e.OnReceiveMessage(client.ID, map[string]interface{}{
+		_ = e.onReceiveMessage(client.ID, map[string]interface{}{
 			"type":      "subscribe",
 			"location":  "q",
 			"params":    nil,
@@ -1523,7 +1523,7 @@ func TestMalformedMutationDoesNotPanic(t *testing.T) {
 	client := trackClient(t, e)
 
 	mustNoPanic(t, "mutation without fields", func() {
-		_ = e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "mutation"})
+		_ = e.onReceiveMessage(client.ID, map[string]interface{}{"type": "mutation"})
 	})
 }
 
@@ -1532,7 +1532,7 @@ func TestMalformedAuthDoesNotPanic(t *testing.T) {
 	client := trackClient(t, e)
 
 	mustNoPanic(t, "auth without token", func() {
-		_ = e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth"})
+		_ = e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth"})
 	})
 }
 
@@ -1573,7 +1573,7 @@ func TestStaleInvalidationOrdersTimestamps(t *testing.T) {
 	pause.Store(true)
 	done := make(chan struct{})
 	go func() {
-		e.InvalidateTags([]string{"widgets_id:1"}, "slow", "slow")
+		e.invalidateTags([]string{"widgets_id:1"}, "slow", "slow")
 		close(done)
 	}()
 	select {
@@ -1583,7 +1583,7 @@ func TestStaleInvalidationOrdersTimestamps(t *testing.T) {
 	}
 
 	version.Store(2)
-	e.InvalidateTags([]string{"widgets_id:1"}, "fast", "fast")
+	e.invalidateTags([]string{"widgets_id:1"}, "fast", "fast")
 	releaseQuery()
 	select {
 	case <-done:
@@ -1649,7 +1649,7 @@ func TestAuthMapsToTheAuthenticatedClientOnly(t *testing.T) {
 	bob := trackClient(t, e)
 
 	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(time.Hour)})
-	if err := e.OnReceiveMessage(alice.ID, map[string]interface{}{"type": "auth", "token": "alice-token"}); err != nil {
+	if err := e.onReceiveMessage(alice.ID, map[string]interface{}{"type": "auth", "token": "alice-token"}); err != nil {
 		t.Fatalf("auth alice: %v", err)
 	}
 
@@ -1746,7 +1746,7 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 
 	// Permanent tags should survive a later query that does not call GetIdentity.
 	e.queries["me"] = Query{Func: func(ctx *QueryCtx) interface{} { return "no-auth-call" }, Internal: false}
-	if _, err := e.ExecuteQuery("me", map[string]interface{}{}, sub); err != nil {
+	if _, err := e.executeQuery("me", map[string]interface{}{}, sub); err != nil {
 		t.Fatalf("ExecuteQuery: %v", err)
 	}
 	if !hasSubscription(e.tracker.GetSubscriptionsToTag("*user_identity:user-7"), sub.SubID) {
@@ -1828,7 +1828,7 @@ func TestGuardsBatchQueriesOnInvalidation(t *testing.T) {
 		t.Fatalf("initial guard runs = %d, want %d", got, want)
 	}
 
-	e.InvalidateTag("messages_room_id:lobby")
+	e.invalidateTag("messages_room_id:lobby")
 	if got, want := queryRuns.Load(), int64(3); got != want {
 		t.Errorf("query runs after invalidate = %d, want %d (one batched execution)", got, want)
 	}
@@ -1859,7 +1859,7 @@ func TestInvalidateTagStillBatchesClientsWithTheSameIdentity(t *testing.T) {
 		t.Fatalf("initial runs = %d, want %d", got, want)
 	}
 
-	e.InvalidateTag("settings_key:me")
+	e.invalidateTag("settings_key:me")
 	if got, want := runs.Load(), int64(3); got != want {
 		t.Errorf("runs after invalidate = %d, want %d (one batched execution)", got, want)
 	}
@@ -1904,7 +1904,7 @@ func TestInvalidateTagSplitsBatchWhenQueryBecomesIdentityDependent(t *testing.T)
 	}
 
 	private.Store(true)
-	e.InvalidateTag("settings_key:visibility")
+	e.invalidateTag("settings_key:visibility")
 
 	assertPrivate := func(client *reactivity.Client, want string) {
 		t.Helper()
@@ -2009,7 +2009,7 @@ func TestGuardPanicOnReevaluationDoesNotStopInvalidation(t *testing.T) {
 	drain(panicker)
 	drain(other)
 
-	e.InvalidateTag("room_members_user_id:shared")
+	e.invalidateTag("room_members_user_id:shared")
 
 	if panicGuardEvals.Load() != 2 {
 		t.Fatalf("panicking guard evals = %d, want 2 (initial plus reevaluation)", panicGuardEvals.Load())
@@ -2030,7 +2030,7 @@ func TestFailedAuthDoesNotSetIdentityOrPanic(t *testing.T) {
 
 	var err error
 	mustNoPanic(t, "failed auth", func() {
-		err = e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "nope"})
+		err = e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "nope"})
 	})
 	if err == nil {
 		t.Error("failed auth returned nil error")
@@ -2064,7 +2064,7 @@ func TestAuthSuccessEncodesUserIDAsJSON(t *testing.T) {
 	client := trackClient(t, e)
 	e.SetAuth(&stubAuth{userID: `user "quoted"`, expiresAt: time.Now().Add(time.Hour)})
 
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
 		t.Fatalf("auth: %v", err)
 	}
 
@@ -2177,7 +2177,7 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 	})
 
 	mustNoPanic(t, "authed mutation", func() {
-		result, err := e.ExecuteMutation("whoami", map[string]interface{}{}, authed.ID, "m1")
+		result, err := e.executeMutation("whoami", map[string]interface{}{}, authed.ID, "m1")
 		if err != nil {
 			t.Errorf("ExecuteMutation: %v", err)
 		}
@@ -2185,7 +2185,7 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 		fromAuthed = seen{id: data["id"].(string)}
 	})
 	mustNoPanic(t, "anon mutation", func() {
-		result, err := e.ExecuteMutation("whoami", map[string]interface{}{}, anon.ID, "m2")
+		result, err := e.executeMutation("whoami", map[string]interface{}{}, anon.ID, "m2")
 		if err != nil {
 			t.Errorf("ExecuteMutation: %v", err)
 		}
@@ -2208,7 +2208,7 @@ func TestAuthExpiryClearsOnlyThatClient(t *testing.T) {
 	expiresAt := time.Now().Add(40 * time.Millisecond)
 
 	e.SetAuth(&stubAuth{userID: "temp", expiresAt: expiresAt})
-	if err := e.OnReceiveMessage(expiring.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+	if err := e.onReceiveMessage(expiring.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
 		t.Fatalf("auth expiring client: %v", err)
 	}
 	e.tracker.SetAuth(kept.ID, "kept", time.Now().Add(time.Hour))
@@ -2278,7 +2278,7 @@ func TestAuthExpiryRevokesGuardedSubscription(t *testing.T) {
 	registerSecretQuery(e, "alice", &guardRuns)
 
 	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(100 * time.Millisecond)})
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
 		t.Fatalf("auth: %v", err)
 	}
 	subscribe(t, e, client, "secret", "secret", nil)
@@ -2293,7 +2293,7 @@ func TestAuthExpiryRevokesGuardedSubscription(t *testing.T) {
 		t.Fatalf("auth after expiry = %+v, want cleared", auth)
 	}
 
-	e.InvalidateTag("table_refresh:mutated")
+	e.invalidateTag("table_refresh:mutated")
 	data, n := lastQueryData(t, client)
 	if n != 1 || data != "DENIED" {
 		t.Errorf("after mutation got %d pushes, last = %v; want 1 push of DENIED", n, data)
@@ -2311,7 +2311,7 @@ func TestReauthAsDifferentUserRevokesGuardedSubscription(t *testing.T) {
 
 	auth := &stubAuth{userID: "alice", expiresAt: time.Now().Add(time.Hour)}
 	e.SetAuth(auth)
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "alice"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "alice"}); err != nil {
 		t.Fatalf("auth alice: %v", err)
 	}
 	sub := subscribe(t, e, client, "secret", "secret", nil)
@@ -2320,14 +2320,14 @@ func TestReauthAsDifferentUserRevokesGuardedSubscription(t *testing.T) {
 	}
 
 	auth.userID = "bob"
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "bob"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "bob"}); err != nil {
 		t.Fatalf("auth bob: %v", err)
 	}
 	if data, n := lastQueryData(t, client); n == 0 || data != "DENIED" {
 		t.Fatalf("after reauth as bob last push = %v (%d pushes), want DENIED", data, n)
 	}
 
-	e.InvalidateTag("table_refresh:mutated")
+	e.invalidateTag("table_refresh:mutated")
 	if data, n := lastQueryData(t, client); n != 1 || data != "DENIED" {
 		t.Errorf("after mutation got %d pushes, last = %v; want 1 push of DENIED", n, data)
 	}
@@ -2344,14 +2344,14 @@ func TestTokenRefreshForSameUserKeepsGuardedSubscription(t *testing.T) {
 
 	auth := &stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)}
 	e.SetAuth(auth)
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "first"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "first"}); err != nil {
 		t.Fatalf("auth: %v", err)
 	}
 	subscribe(t, e, client, "secret", "secret", nil)
 	drain(client)
 
 	auth.expiresAt = time.Now().Add(time.Hour)
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "refreshed"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "refreshed"}); err != nil {
 		t.Fatalf("refresh: %v", err)
 	}
 	time.Sleep(120 * time.Millisecond)
@@ -2359,7 +2359,7 @@ func TestTokenRefreshForSameUserKeepsGuardedSubscription(t *testing.T) {
 	if got, _ := e.tracker.GetAuth(client.ID); got.UserID != "alice" {
 		t.Fatalf("first token's expiry cleared the refreshed auth: %+v", got)
 	}
-	e.InvalidateTag("table_refresh:mutated")
+	e.invalidateTag("table_refresh:mutated")
 	if data, n := lastQueryData(t, client); n == 0 || data != "SECRET" {
 		t.Errorf("after refresh last push = %v (%d pushes), want SECRET", data, n)
 	}
@@ -2377,7 +2377,7 @@ func TestAuthExpiryRerunsIdentityQuery(t *testing.T) {
 	})
 
 	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)})
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
 		t.Fatalf("auth: %v", err)
 	}
 	sub := subscribe(t, e, client, "me", "me", nil)
@@ -2399,7 +2399,7 @@ func TestAuthExpiryAfterDisconnectDoesNotPanic(t *testing.T) {
 		client := reactivity.NewClient(nil)
 		e.tracker.Track(client)
 		e.SetAuth(&stubAuth{userID: "temp", expiresAt: time.Now().Add(20 * time.Millisecond)})
-		if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
 			t.Fatalf("auth: %v", err)
 		}
 		e.tracker.Untrack(client)
@@ -2429,7 +2429,7 @@ func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
 		})
 		expiresAt := time.Now().Add(40 * time.Millisecond)
 		e.SetAuth(&stubAuth{userID: "alice", expiresAt: expiresAt})
-		if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
 			t.Fatalf("auth: %v", err)
 		}
 		subscribe(t, e, client, "me", "me", nil)
@@ -2451,7 +2451,7 @@ func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
 	}
 }
 
-func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
+func TestonReceiveMessageSubscribeAndMutation(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
 
@@ -2473,7 +2473,7 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	})
 
 	mustNoPanic(t, "subscribe", func() {
-		if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
+		if err := e.onReceiveMessage(client.ID, map[string]interface{}{
 			"type":      "subscribe",
 			"location":  "getMessages",
 			"params":    map[string]interface{}{"room": "lobby"},
@@ -2488,7 +2488,7 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	drain(client)
 
 	mustNoPanic(t, "mutation", func() {
-		if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
+		if err := e.onReceiveMessage(client.ID, map[string]interface{}{
 			"type":        "mutation",
 			"location":    "createMessage",
 			"params":      map[string]interface{}{"body": "hi", "room": "lobby"},
@@ -2534,7 +2534,7 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 	})
 
 	params := map[string]interface{}{"room": "lobby"}
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
 		"type":      "subscribe",
 		"location":  "getMessages",
 		"params":    params,
@@ -2550,7 +2550,7 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 		t.Fatalf("query_key = %v, want lobby", initial[0]["query_key"])
 	}
 
-	if err := e.OnReceiveMessage(client.ID, map[string]interface{}{
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
 		"type":      "unsubscribe",
 		"location":  "getMessages",
 		"params":    params,
@@ -2559,7 +2559,7 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 		t.Fatalf("unsubscribe: %v", err)
 	}
 
-	e.InvalidateTag("messages_room_id:lobby")
+	e.invalidateTag("messages_room_id:lobby")
 	if got := queryMessages(t, drain(client)); len(got) != 0 {
 		t.Errorf("query pushes after unsubscribe = %d, want 0", len(got))
 	}
@@ -2568,24 +2568,14 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 	}
 }
 
-func TestOnReceiveMessageUnknownTypeDoesNotPanic(t *testing.T) {
+func TestonReceiveMessageUnknownTypeDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
 	mustNoPanic(t, "unknown type", func() {
-		if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "ping"}); err != nil {
+		if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "ping"}); err != nil {
 			t.Errorf("unknown type returned error: %v", err)
 		}
 	})
-}
-
-func TestOnConnectAndOnDisconnect(t *testing.T) {
-	e := newTestEngine(t)
-	if err := e.OnConnect("c1"); err != nil {
-		t.Errorf("OnConnect: %v", err)
-	}
-	if err := e.OnDisconnect("c1"); err != nil {
-		t.Errorf("OnDisconnect: %v", err)
-	}
 }
 
 func TestSetAllowedOrigins(t *testing.T) {
@@ -2936,7 +2926,7 @@ func TestSubscribeUnknownQueryViaMessageDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
 	mustNoPanic(t, "subscribe missing query", func() {
-		_ = e.OnReceiveMessage(client.ID, map[string]interface{}{
+		_ = e.onReceiveMessage(client.ID, map[string]interface{}{
 			"type":      "subscribe",
 			"location":  "does-not-exist",
 			"params":    map[string]interface{}{},
@@ -2956,7 +2946,7 @@ func TestExecuteQueryWithoutTrackedClientDoesNotPanic(t *testing.T) {
 		Params:   map[string]interface{}{},
 	}
 	mustNoPanic(t, "ExecuteQuery untracked client", func() {
-		_, _ = e.ExecuteQuery("q", map[string]interface{}{}, ghost)
+		_, _ = e.executeQuery("q", map[string]interface{}{}, ghost)
 	})
 }
 
