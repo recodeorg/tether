@@ -1852,7 +1852,7 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 		return result, nil
 	}
 
-	mutationCtx := &MutationCtx{DB: scopedDB, Storage: &StorageCtx{
+	mutationCtx := &MutationCtx{DB: scopedDB, Profiler: e.Profiler, Storage: &StorageCtx{
 		GetUploadURL:   e.getUploadURL,
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
