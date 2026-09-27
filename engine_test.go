@@ -954,7 +954,9 @@ func TestBatchDeleteByIDsInvalidatesCollectionCount(t *testing.T) {
 }
 
 func TestPredicateDeleteInvalidatesCollectionCounts(t *testing.T) {
-	e := newTestEngine(t)
+	// Both subscriptions re-run concurrently, so they can land on different
+	// pooled connections; :memory: would give each connection an empty schema.
+	e := newConcurrentTestEngine(t)
 	client := trackClient(t, e)
 
 	msgs := []testMessage{
