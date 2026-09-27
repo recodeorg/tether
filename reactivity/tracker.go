@@ -216,6 +216,7 @@ func (t *Tracker) ExpireAuth(clientID string, expiresAt time.Time) []*Subscripti
 	if auth.UserID == "" {
 		return nil
 	}
+	t.SendMessage(clientID, []byte(`{"type": "auth", "success": false, "data": "Identity expired"}`))
 	return t.resetAuthorization(clientID)
 }
 
