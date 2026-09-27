@@ -1282,6 +1282,290 @@ func TestQueryWriteDoesNotMutateOrRetrigger(t *testing.T) {
 	}
 }
 
+// cachedUpdate is prepared by a mutation before the query runs, so a query's
+// PrepareStmt session would find it in GORM's shared statement cache.
+const cachedUpdate = "UPDATE messages SET body = 'changed' WHERE body = ?"
+
+// readOnlyWriteAttempts covers every route out of ctx.DB that can reach the
+// database, not just GORM's Raw callback.
+var readOnlyWriteAttempts = []struct {
+	name string
+	run  func(db *gorm.DB) error
+}{
+	{"exec after block comment", func(db *gorm.DB) error {
+		return db.Exec("/* application comment */ UPDATE messages SET body = 'changed'").Error
+	}},
+	{"exec after line comment", func(db *gorm.DB) error {
+		return db.Exec("-- note\nUPDATE messages SET body = 'changed'").Error
+	}},
+	{"exec lowercase with leading whitespace", func(db *gorm.DB) error {
+		return db.Exec("\n\t update messages set body = 'changed'").Error
+	}},
+	{"raw returning scan", func(db *gorm.DB) error {
+		var ids []uint
+		return db.Raw("UPDATE messages SET body = 'changed' RETURNING id").Scan(&ids).Error
+	}},
+	{"raw returning find", func(db *gorm.DB) error {
+		var ids []uint
+		return db.Raw("UPDATE messages SET body = 'changed' RETURNING id").Find(&ids).Error
+	}},
+	{"raw returning row", func(db *gorm.DB) error {
+		var id uint
+		return db.Raw("UPDATE messages SET body = 'changed' RETURNING id").Row().Scan(&id)
+	}},
+	{"raw returning rows", func(db *gorm.DB) error {
+		rows, err := db.Raw("UPDATE messages SET body = 'changed' RETURNING id").Rows()
+		if err == nil {
+			rows.Close()
+		}
+		return err
+	}},
+	{"second statement", func(db *gorm.DB) error {
+		return db.Exec("SELECT 1; UPDATE messages SET body = 'changed'").Error
+	}},
+	{"cte main statement", func(db *gorm.DB) error {
+		return db.Exec("WITH t AS (SELECT 1) UPDATE messages SET body = 'changed'").Error
+	}},
+	{"data-modifying cte", func(db *gorm.DB) error {
+		var ids []uint
+		return db.Raw("WITH u AS (UPDATE messages SET body = 'changed' RETURNING id) SELECT id FROM u").Scan(&ids).Error
+	}},
+	{"insert", func(db *gorm.DB) error {
+		return db.Exec("INSERT INTO messages (body, room_id) VALUES ('changed', 'lobby')").Error
+	}},
+	{"select into", func(db *gorm.DB) error {
+		return db.Exec("SELECT * INTO query_copy FROM messages").Error
+	}},
+	{"create table", func(db *gorm.DB) error {
+		return db.Exec("CREATE TABLE query_ddl (id integer)").Error
+	}},
+	{"alter table", func(db *gorm.DB) error {
+		return db.Exec("ALTER TABLE messages ADD COLUMN extra text").Error
+	}},
+	{"migrator", func(db *gorm.DB) error {
+		return db.Migrator().CreateTable(&testNote{})
+	}},
+	{"transaction", func(db *gorm.DB) error {
+		return db.Transaction(func(tx *gorm.DB) error {
+			return tx.Exec("UPDATE messages SET body = 'changed'").Error
+		})
+	}},
+	{"transaction commit statement", func(db *gorm.DB) error {
+		return db.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Exec("COMMIT").Error; err != nil {
+				return err
+			}
+			return tx.Exec("UPDATE messages SET body = 'changed'").Error
+		})
+	}},
+	{"replaced context", func(db *gorm.DB) error {
+		return db.WithContext(context.Background()).Exec("UPDATE messages SET body = 'changed'").Error
+	}},
+	{"config conn pool", func(db *gorm.DB) error {
+		_, err := db.ConnPool.ExecContext(context.Background(), "UPDATE messages SET body = 'changed'")
+		return err
+	}},
+	{"statement conn pool", func(db *gorm.DB) error {
+		_, err := db.Statement.ConnPool.ExecContext(context.Background(), "UPDATE messages SET body = 'changed'")
+		return err
+	}},
+	{"sql.DB handle", func(db *gorm.DB) error {
+		sqlDB, err := db.DB()
+		if err != nil {
+			return err
+		}
+		_, err = sqlDB.Exec("UPDATE messages SET body = 'changed'")
+		return err
+	}},
+	{"connection", func(db *gorm.DB) error {
+		return db.Connection(func(tx *gorm.DB) error {
+			return tx.Exec("UPDATE messages SET body = 'changed'").Error
+		})
+	}},
+	{"cached prepared statement", func(db *gorm.DB) error {
+		return db.Session(&gorm.Session{PrepareStmt: true}).Exec(cachedUpdate, "original").Error
+	}},
+	{"update builder", func(db *gorm.DB) error {
+		return db.Model(&testMessage{}).Where("body = ?", "original").Update("body", "changed").Error
+	}},
+	{"delete builder", func(db *gorm.DB) error {
+		return db.Where("body = ?", "original").Delete(&testMessage{}).Error
+	}},
+	{"drop table", func(db *gorm.DB) error {
+		return db.Exec("DROP TABLE messages").Error
+	}},
+}
+
+func runReadOnlyWriteAttempts(db *gorm.DB) map[string]error {
+	errs := make(map[string]error, len(readOnlyWriteAttempts))
+	for _, attempt := range readOnlyWriteAttempts {
+		errs[attempt.name] = attempt.run(db)
+	}
+	return errs
+}
+
+func checkReadOnlyWriteAttempts(t *testing.T, e *Engine, errs map[string]error) {
+	t.Helper()
+	if len(errs) != len(readOnlyWriteAttempts) {
+		t.Fatalf("recorded %d write attempts, want %d", len(errs), len(readOnlyWriteAttempts))
+	}
+	for _, attempt := range readOnlyWriteAttempts {
+		err := errs[attempt.name]
+		switch {
+		case err == nil:
+			t.Errorf("%s: write succeeded", attempt.name)
+		case attempt.name == "sql.DB handle" || attempt.name == "connection":
+			// Refused before any SQL is sent: ctx.DB exposes no *sql.DB.
+		case !errors.Is(err, errReadOnly):
+			t.Errorf("%s: err = %v, want the read-only error", attempt.name, err)
+		}
+	}
+
+	var rows []testMessage
+	if err := e.db.Order("id").Find(&rows).Error; err != nil {
+		t.Fatalf("read messages: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Body != "original" {
+		t.Errorf("messages = %+v, want the single original row", rows)
+	}
+	for _, table := range []string{"query_ddl", "query_copy", "notes"} {
+		if e.db.Migrator().HasTable(table) {
+			t.Errorf("table %s was created", table)
+		}
+	}
+	if e.db.Migrator().HasColumn(&testMessage{}, "extra") {
+		t.Error("messages.extra column was added")
+	}
+}
+
+func seedReadOnlyWriteAttempts(t *testing.T, e *Engine) {
+	t.Helper()
+	if err := e.db.Create(&testMessage{Body: "original", RoomID: "lobby"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	prepared := e.db.Session(&gorm.Session{PrepareStmt: true})
+	if err := prepared.Exec(cachedUpdate, "no-such-body").Error; err != nil {
+		t.Fatalf("prime prepared statement: %v", err)
+	}
+}
+
+func TestQueryRejectsEveryWritePath(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	seedReadOnlyWriteAttempts(t, e)
+
+	var errs map[string]error
+	e.RegisterQuery("writer", func(ctx *QueryCtx) interface{} {
+		errs = runReadOnlyWriteAttempts(ctx.DB)
+		return nil
+	})
+	subscribe(t, e, client, "writer", "k", nil)
+	checkReadOnlyWriteAttempts(t, e, errs)
+}
+
+func TestGuardRejectsEveryWritePath(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	seedReadOnlyWriteAttempts(t, e)
+
+	var errs map[string]error
+	e.RegisterGuard("writer", func(ctx *GuardCtx) interface{} {
+		errs = runReadOnlyWriteAttempts(ctx.DB)
+		return true
+	})
+	e.RegisterQuery("guarded", func(ctx *QueryCtx) interface{} {
+		if _, err := ctx.Auth.ExecuteGuard("writer", map[string]interface{}{}); err != nil {
+			t.Errorf("ExecuteGuard: %v", err)
+		}
+		return nil
+	})
+	subscribe(t, e, client, "guarded", "k", nil)
+	checkReadOnlyWriteAttempts(t, e, errs)
+}
+
+func TestMutationGuardRejectsWrites(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	seedReadOnlyWriteAttempts(t, e)
+
+	var errs map[string]error
+	e.RegisterGuard("writer", func(ctx *GuardCtx) interface{} {
+		errs = runReadOnlyWriteAttempts(ctx.DB)
+		return true
+	})
+	e.RegisterMutation("guarded", func(ctx *MutationCtx) interface{} {
+		if _, err := ctx.Auth.ExecuteGuard("writer", map[string]interface{}{}); err != nil {
+			t.Errorf("ExecuteGuard: %v", err)
+		}
+		return nil
+	})
+	if _, err := e.executeMutation("guarded", map[string]interface{}{}, client.ID, "m1"); err != nil {
+		t.Fatalf("executeMutation: %v", err)
+	}
+	checkReadOnlyWriteAttempts(t, e, errs)
+}
+
+func TestQueryReadPathsStillWork(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	if err := e.db.Create(&testMessage{Body: "UPDATE; not a statement", RoomID: "lobby"}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	reads := []struct {
+		name string
+		run  func(db *gorm.DB) (int64, error)
+	}{
+		{"commented select", func(db *gorm.DB) (n int64, err error) {
+			err = db.Raw("/* dashboard */ SELECT count(*) FROM messages -- trailing").Scan(&n).Error
+			return
+		}},
+		{"string literal naming a write", func(db *gorm.DB) (n int64, err error) {
+			err = db.Raw("SELECT count(*) FROM messages WHERE body = 'UPDATE; not a statement'").Scan(&n).Error
+			return
+		}},
+		{"cte select", func(db *gorm.DB) (n int64, err error) {
+			err = db.Raw("WITH m AS (SELECT id FROM messages) SELECT count(*) FROM m").Scan(&n).Error
+			return
+		}},
+		{"row", func(db *gorm.DB) (n int64, err error) {
+			err = db.Raw("SELECT count(*) FROM messages WHERE room_id = ?", "lobby").Row().Scan(&n)
+			return
+		}},
+		{"builder count", func(db *gorm.DB) (n int64, err error) {
+			err = db.Model(&testMessage{}).Where("room_id = ?", "lobby").Count(&n).Error
+			return
+		}},
+		{"transaction", func(db *gorm.DB) (n int64, err error) {
+			err = db.Transaction(func(tx *gorm.DB) error {
+				return tx.Transaction(func(inner *gorm.DB) error {
+					return inner.Model(&testMessage{}).Count(&n).Error
+				})
+			})
+			return
+		}},
+		{"prepared session", func(db *gorm.DB) (n int64, err error) {
+			err = db.Session(&gorm.Session{PrepareStmt: true}).Model(&testMessage{}).Count(&n).Error
+			return
+		}},
+	}
+
+	got := map[string]int64{}
+	errs := map[string]error{}
+	e.RegisterQuery("reader", func(ctx *QueryCtx) interface{} {
+		for _, read := range reads {
+			got[read.name], errs[read.name] = read.run(ctx.DB)
+		}
+		return nil
+	})
+	subscribe(t, e, client, "reader", "k", nil)
+	for _, read := range reads {
+		if errs[read.name] != nil || got[read.name] != 1 {
+			t.Errorf("%s: count = %d, err = %v; want 1, nil", read.name, got[read.name], errs[read.name])
+		}
+	}
+}
+
 func TestTrackTableIsInvalidatedByMutations(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)

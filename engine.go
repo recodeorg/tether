@@ -81,6 +81,7 @@ type Engine struct {
 	Profiler        *utilities.Profiler
 	EphemeralID     string
 	storage         storage.StorageAdapter
+	readOnlyPool    *readOnlyPool
 }
 
 type Mutation struct {
@@ -105,10 +106,7 @@ type defaultAuth struct{}
 
 type contextKey string
 
-const (
-	tetherCtxKey   contextKey = "tether_query_ctx"
-	readOnlyCtxKey contextKey = "tether_readonly"
-)
+const tetherCtxKey contextKey = "tether_query_ctx"
 
 type traceContextKey string
 
@@ -175,11 +173,20 @@ func (e *Engine) prepareGuardCtx(params map[string]interface{}, authID, execID, 
 	}
 	e.bindGuardAuth(guardCtx, authID)
 	gormCtx := context.WithValue(context.Background(), tetherCtxKey, guardCtx)
-	gormCtx = context.WithValue(gormCtx, readOnlyCtxKey, true)
 	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
 	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, actionName)
-	guardCtx.DB = e.db.WithContext(gormCtx)
+	guardCtx.DB = e.readOnlyDB(gormCtx)
 	return guardCtx
+}
+
+// readOnlyDB returns the handle given to queries and guards. Both the
+// statement and config pools are replaced so that ctx.DB.ConnPool and
+// PrepareStmt sessions also go through readOnlyPool.
+func (e *Engine) readOnlyDB(ctx context.Context) *gorm.DB {
+	db := e.db.WithContext(ctx)
+	db.Statement.ConnPool = e.readOnlyPool
+	db.Config.ConnPool = e.readOnlyPool
+	return db
 }
 
 // reevaluateGuard runs a guard subscription after one of its data tags changed.
@@ -405,6 +412,7 @@ func NewEngine(db *gorm.DB) *Engine {
 		EphemeralID:     uuid.New().String(),
 	}
 	trackTransactions(db)
+	e.readOnlyPool = &readOnlyPool{pool: db.ConnPool, postgres: dbType == "postgres"}
 	// scheduler initialization
 	e.CreateTable([]TetherTask{}) // Create the internal table for the scheduled tasks
 	e.startScheduler()
@@ -426,9 +434,11 @@ func NewEngine(db *gorm.DB) *Engine {
 			slog.Error("Failed to execute mutation internally", "error", err)
 		}
 	})
+	// Rejects GORM's write builders before they build SQL or open a
+	// transaction; readOnlyPool would refuse the resulting statement anyway.
 	enforceReadOnly := func(db *gorm.DB) {
-		if db.Statement.Context.Value(readOnlyCtxKey) == true {
-			db.AddError(fmt.Errorf("tether: database writes are strictly forbidden inside queries. Use a mutation instead."))
+		if isReadOnlyConn(db.Statement.ConnPool) {
+			db.AddError(errReadOnly)
 		}
 	}
 	beforeProfiler := func(db *gorm.DB) {
@@ -474,15 +484,15 @@ func NewEngine(db *gorm.DB) *Engine {
 	snapshotOld := func(tx *gorm.DB) {
 		snapshotOldTrackedTags(tx)
 	}
+	db.Callback().Create().Before("*").Register("tether:readonly_unwrap", unwrapPreparedReadOnly)
+	db.Callback().Query().Before("*").Register("tether:readonly_unwrap", unwrapPreparedReadOnly)
+	db.Callback().Update().Before("*").Register("tether:readonly_unwrap", unwrapPreparedReadOnly)
+	db.Callback().Delete().Before("*").Register("tether:readonly_unwrap", unwrapPreparedReadOnly)
+	db.Callback().Row().Before("*").Register("tether:readonly_unwrap", unwrapPreparedReadOnly)
+	db.Callback().Raw().Before("*").Register("tether:readonly_unwrap", unwrapPreparedReadOnly)
 	db.Callback().Create().Before("gorm:create").Register("tether:readonly_guard", enforceReadOnly)
 	db.Callback().Update().Before("gorm:update").Register("tether:readonly_guard", enforceReadOnly)
 	db.Callback().Delete().Before("gorm:delete").Register("tether:readonly_guard", enforceReadOnly)
-	db.Callback().Raw().Before("gorm:raw").Register("tether:readonly_guard", func(db *gorm.DB) {
-		sql := strings.ToUpper(strings.TrimSpace(db.Statement.SQL.String()))
-		if strings.HasPrefix(sql, "INSERT") || strings.HasPrefix(sql, "UPDATE") || strings.HasPrefix(sql, "DELETE") {
-			enforceReadOnly(db)
-		}
-	})
 
 	db.Callback().Create().Before("gorm:create").Register("tether:before_create_profiler", beforeProfiler)
 	db.Callback().Update().Before("gorm:update").Register("tether:before_update_profiler", beforeProfiler)
@@ -1778,10 +1788,9 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 
 	// Create the GORM context
 	gormCtx := context.WithValue(context.Background(), tetherCtxKey, queryCtx)
-	gormCtx = context.WithValue(gormCtx, readOnlyCtxKey, true)
 	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
 	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, query)
-	queryCtx.DB = e.db.WithContext(gormCtx)
+	queryCtx.DB = e.readOnlyDB(gormCtx)
 
 	// Stamp the execution before the query reads anything so the client can drop
 	// this message if a later invalidation arrives first.
@@ -1893,7 +1902,7 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 			},
 		}
 		guardCtx := &GuardCtx{
-			DB:     e.db.WithContext(context.WithValue(traceCtx, readOnlyCtxKey, true)),
+			DB:     e.readOnlyDB(traceCtx),
 			Auth:   guardAuth,
 			Params: params,
 		}
