@@ -623,7 +623,7 @@ func (e *Engine) pollScheduledTasks() {
 		e.timerMutex.Lock()
 		timer := time.AfterFunc(delay, func() {
 			e.timerMutex.Lock()
-			defer delete(e.taskToTimer, t.ID)
+			delete(e.taskToTimer, t.ID)
 			e.timerMutex.Unlock()
 			var check TetherTask
 			if err := e.db.Where("id = ?", t.ID).First(&check).Error; err != nil {

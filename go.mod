@@ -1,6 +1,6 @@
 module github.com/recodeorg/tether
 
-go 1.25.6
+go 1.26.8
 
 require (
 	github.com/cespare/xxhash v1.1.0
@@ -34,7 +34,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	golang.org/x/sync v0.19.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
 )
 
 require (
@@ -46,7 +46,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/robfig/cron/v3 v3.0.0
 	golang.org/x/sys v0.7.0 // indirect
-	golang.org/x/text v0.34.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect
 	modernc.org/memory v1.5.0 // indirect
