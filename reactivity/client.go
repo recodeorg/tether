@@ -40,10 +40,13 @@ func (c *Client) GetAuth() AuthCtx {
 	return copy
 }
 
+const writeWait = 10 * time.Second
+
 func (c *Client) WritePump() {
 	defer c.Conn.Close()
 
 	for message := range c.Send {
+		c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 		err := c.Conn.WriteMessage(websocket.TextMessage, message)
 		if err != nil {
 			slog.Error("Client write pump failed", "error", err, "client", c.ID)

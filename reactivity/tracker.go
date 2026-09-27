@@ -412,5 +412,6 @@ func (t *Tracker) SendMessage(clientID string, message []byte) {
 	case client.Send <- message:
 	default:
 		slog.Error("Tracker: Client send channel is full", "clientID", clientID)
+		client.Conn.Close() // Aggressively close the connection to force the client to reconnect
 	}
 }
