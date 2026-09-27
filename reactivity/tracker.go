@@ -223,6 +223,11 @@ func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey strin
 		return nil
 	}
 
+	if len(t.clientToSubs[clientID]) >= 100 {
+		slog.Error("Tracker: Client has too many subscriptions", "clientID", clientID)
+		return nil
+	}
+
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		slog.Error("Tracker: Failed to marshal params", "error", err)

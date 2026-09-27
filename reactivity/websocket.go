@@ -43,6 +43,7 @@ func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tr
 		close(client.Send)
 	}()
 	go client.WritePump()
+	ws.SetReadLimit(1024 * 8) // 8KB
 	for {
 		_, message, err := ws.ReadMessage()
 		if err != nil {
