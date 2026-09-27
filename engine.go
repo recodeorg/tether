@@ -1660,7 +1660,12 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 				return nil, err
 			}
 			queryCtx.Dependencies = append(queryCtx.Dependencies, fmt.Sprintf("*guard_%s_%s:%s", guardName, paramsHash, resultJSON))
-			return result, nil
+			var unmarshalResult interface{}
+			err = json.Unmarshal(resultJSON, &unmarshalResult)
+			if err != nil {
+				return nil, err
+			}
+			return unmarshalResult, nil
 		},
 	}
 	execID := uuid.NewString()
