@@ -622,6 +622,14 @@ func (e *Engine) pollScheduledTasks() {
 		// remove the entry before it is stored.
 		e.timerMutex.Lock()
 		timer := time.AfterFunc(delay, func() {
+			e.timerMutex.Lock()
+			defer delete(e.taskToTimer, t.ID)
+			e.timerMutex.Unlock()
+			var check TetherTask
+			if err := e.db.Where("id = ?", t.ID).First(&check).Error; err != nil {
+				slog.Error("Task removed before execution", "taskID", t.ID, "error", err)
+				return
+			}
 			defer func() {
 				if err := recover(); err != nil {
 					slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
@@ -644,9 +652,6 @@ func (e *Engine) pollScheduledTasks() {
 					}
 				} else {
 					e.db.Delete(&TetherTask{}, "id = ?", t.ID)
-					e.timerMutex.Lock()
-					delete(e.taskToTimer, t.ID)
-					e.timerMutex.Unlock()
 				}
 			}()
 			_, err := e.ExecuteMutationInternal(t.FunctionName, params)
