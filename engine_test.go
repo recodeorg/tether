@@ -153,6 +153,7 @@ func newTestEngine(t *testing.T) *Engine {
 func newTestEngineWithType(t *testing.T) *Engine {
 	t.Helper()
 	e := NewEngine(newTestDB(t))
+	t.Cleanup(e.Close)
 	e.CreateTable(&testMessage{})
 	return e
 }
@@ -591,9 +592,32 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 					t.Fatalf("NewEngine(%q) panicked: %v", dbType, r)
 				}
 			}()
-			_ = NewEngine(newTestDB(t))
+			e := NewEngine(newTestDB(t))
+			if e != nil {
+				t.Cleanup(e.Close)
+			}
 		})
 	}
+}
+
+func TestCloseStopsBackgroundLoops(t *testing.T) {
+	e := newTestEngine(t)
+	e.UseStorage(local.NewLocalStorage(t.TempDir()))
+
+	done := make(chan struct{})
+	go func() {
+		e.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close blocked")
+	}
+	if err := e.ctx.Err(); err == nil {
+		t.Fatal("expected engine context to be cancelled")
+	}
+	e.Close()
 }
 func TestTrackCollectionAndTrackTableTagFormat(t *testing.T) {
 	ctx := &QueryCtx{}
@@ -2451,7 +2475,7 @@ func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
 	}
 }
 
-func TestonReceiveMessageSubscribeAndMutation(t *testing.T) {
+func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
 
@@ -2568,7 +2592,7 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 	}
 }
 
-func TestonReceiveMessageUnknownTypeDoesNotPanic(t *testing.T) {
+func TestOnReceiveMessageUnknownTypeDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
 	mustNoPanic(t, "unknown type", func() {
@@ -2989,6 +3013,7 @@ func newConcurrentTestEngine(t *testing.T) *Engine {
 	}
 
 	e := NewEngine(db)
+	t.Cleanup(e.Close)
 	e.CreateTable(&testMessage{})
 	e.SetCheckOrigin(func(*http.Request) bool { return true })
 	return e

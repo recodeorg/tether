@@ -45,6 +45,7 @@ func newPooledEngine(t *testing.T, maxConns int) *Engine {
 	sqlDB.SetMaxIdleConns(maxConns)
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	e := NewEngine(db)
+	t.Cleanup(e.Close)
 	e.CreateTable(&testMessage{})
 	return e
 }

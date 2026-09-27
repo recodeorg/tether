@@ -62,6 +62,9 @@ type TetherDownloadToken struct {
 }
 
 type Engine struct {
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
 	mutations       map[string]Mutation
@@ -375,7 +378,11 @@ func NewEngine(db *gorm.DB) *Engine {
 	if dbType != "sqlite" && dbType != "postgres" {
 		panic("Invalid database type")
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	e := &Engine{
+		ctx:             ctx,
+		cancel:          cancel,
+		wg:              sync.WaitGroup{},
 		db:              db,
 		dbType:          dbType,
 		mutations:       make(map[string]Mutation),
@@ -390,15 +397,16 @@ func NewEngine(db *gorm.DB) *Engine {
 	trackTransactions(db)
 	// scheduler initialization
 	e.CreateTable([]TetherTask{}) // Create the internal table for the scheduled tasks
-	e.startScheduler(context.Background())
+	e.startScheduler()
 
 	if e.dbType == "postgres" {
 		dsn, err := getPostgresDSN(db)
 		if err != nil {
 			slog.Error("Failed to get PostgreSQL DSN", "error", err)
+			e.Close()
 			return nil
 		}
-		e.startPostgresListener(context.Background(), dsn)
+		e.startPostgresListener(dsn)
 	}
 
 	// profiler initialization
@@ -524,30 +532,76 @@ func NewEngine(db *gorm.DB) *Engine {
 	return e
 }
 
-func (e *Engine) startPostgresListener(ctx context.Context, dsn string) {
+// Close cancels background work and waits for the scheduler, Postgres listener,
+// and storage cleanup loop to exit. It is safe to call more than once.
+func (e *Engine) Close() {
+	e.cancel()
+	e.wg.Wait()
+}
+
+// contextSleep waits for d or until ctx is cancelled. It reports whether the
+// full delay elapsed.
+func contextSleep(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func closePgConn(conn *pgx.Conn) {
+	// The engine context is already cancelled during shutdown, and passing it
+	// here would abort the close.
+	if err := conn.Close(context.Background()); err != nil {
+		slog.Debug("Failed to close PostgreSQL listener", "error", err)
+	}
+}
+
+func (e *Engine) startPostgresListener(dsn string) {
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		for {
-			conn, err := pgx.Connect(ctx, dsn)
+			if e.ctx.Err() != nil {
+				return
+			}
+			conn, err := pgx.Connect(e.ctx, dsn)
 			if err != nil {
+				if e.ctx.Err() != nil {
+					return
+				}
 				slog.Error("Failed to connect to PostgreSQL", "error", err)
-				time.Sleep(2 * time.Second)
+				if !contextSleep(e.ctx, 2*time.Second) {
+					return
+				}
 				continue
 			}
-			_, err = conn.Exec(ctx, "LISTEN tether_sync")
+			_, err = conn.Exec(e.ctx, "LISTEN tether_sync")
 			if err != nil {
+				closePgConn(conn)
+				if e.ctx.Err() != nil {
+					return
+				}
 				slog.Error("Failed to listen to PostgreSQL", "error", err)
-				conn.Close(ctx)
-				time.Sleep(2 * time.Second)
+				if !contextSleep(e.ctx, 2*time.Second) {
+					return
+				}
 				continue
 			}
 
 			slog.Info("Connected to Postgres pub/sub channel")
 
 			for {
-				notification, err := conn.WaitForNotification(ctx)
+				notification, err := conn.WaitForNotification(e.ctx)
 				if err != nil {
+					closePgConn(conn)
+					if e.ctx.Err() != nil {
+						return
+					}
 					slog.Error("Postgres notification error, reconnecting", "error", err)
-					conn.Close(ctx)
 					break
 				}
 
@@ -568,13 +622,16 @@ func (e *Engine) startPostgresListener(ctx context.Context, dsn string) {
 	}()
 }
 
-func (e *Engine) startScheduler(ctx context.Context) {
+func (e *Engine) startScheduler() {
 	slog.Debug("Starting scheduler")
 	ticker := time.NewTicker(SCHEDULE_LOOP_INTERVAL)
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
+		defer ticker.Stop()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-e.ctx.Done():
 				slog.Debug("Scheduler stopped")
 				return
 			case <-ticker.C:
@@ -588,14 +645,21 @@ func (e *Engine) UseStorage(storage storage.StorageAdapter) {
 	e.storage = storage
 	e.CreateTable([]TetherStorage{})
 	e.CreateTable([]TetherDownloadToken{})
+	e.wg.Add(1)
 	go func() {
+		defer e.wg.Done()
 		ticker := time.NewTicker(1 * time.Hour)
 		defer ticker.Stop()
-		for range ticker.C {
-			e.db.Where("expires_at < ?", time.Now()).Delete(&TetherDownloadToken{})
+		for {
+			select {
+			case <-e.ctx.Done():
+				return
+			case <-ticker.C:
+				e.db.Where("expires_at < ?", time.Now()).Delete(&TetherDownloadToken{})
 
-			abandonedThreshold := time.Now().Add(-24 * time.Hour)
-			e.db.Where("status IN ? AND created_at < ?", []string{"pending", "uploading"}, abandonedThreshold).Delete(&TetherStorage{})
+				abandonedThreshold := time.Now().Add(-24 * time.Hour)
+				e.db.Where("status IN ? AND created_at < ?", []string{"pending", "uploading"}, abandonedThreshold).Delete(&TetherStorage{})
+			}
 		}
 	}()
 }
