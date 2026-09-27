@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -81,9 +82,16 @@ func (p *Profiler) StartWithCallback(flushInterval time.Duration, mutationName s
 			case <-stop:
 				return
 			case <-ticker.C:
-				if p.onFlush != nil {
-					p.onFlush(mutationName)
-				}
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("Recovered from panic", "error", r)
+						}
+					}()
+					if p.onFlush != nil {
+						p.onFlush(mutationName)
+					}
+				}()
 			}
 		}
 	}()
@@ -146,11 +154,11 @@ type ProfileOp struct {
 // non-overlapping components. Logic is the parent query/mutation wall time
 // minus nested database (and cache/routing/auth) time.
 type ProfiledExecution struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Type      MetricType    `json:"type"`
-	StartedAt time.Time     `json:"started_at"`
-	Tags      []string      `json:"tags,omitempty"`
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Type      MetricType `json:"type"`
+	StartedAt time.Time  `json:"started_at"`
+	Tags      []string   `json:"tags,omitempty"`
 
 	Total    time.Duration `json:"total"`
 	Logic    time.Duration `json:"logic"`

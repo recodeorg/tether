@@ -388,6 +388,55 @@ func TestCompletedOneShotTasksReleaseTaskTimers(t *testing.T) {
 	}
 }
 
+// A mutation due inside the schedule lookahead is armed with time.AfterFunc
+// on this process. The callback has to recover: an unrecovered panic there
+// crashes the process, and the task row plus timer entry must still be released.
+func TestNearTermScheduledTaskPanicIsRecovered(t *testing.T) {
+	if os.Getenv("TETHER_TEST_CHILD") == "1" {
+		e := newConcurrentTestEngine(t)
+		e.RegisterMutation("boom", func(ctx *MutationCtx) interface{} {
+			panic("scheduled boom")
+		})
+		id, err := e.scheduleTask(time.Now(), "boom", nil)
+		if err != nil {
+			t.Fatalf("schedule panicking task: %v", err)
+		}
+		if !waitUntil(t, 2*time.Second, func() bool {
+			e.timerMutex.RLock()
+			_, tracked := e.taskToTimer[id]
+			e.timerMutex.RUnlock()
+			if tracked {
+				return false
+			}
+			var n int64
+			e.db.Model(&TetherTask{}).Where("id = ?", id).Count(&n)
+			return n == 0
+		}) {
+			t.Fatal("panicking scheduled task was not cleaned up")
+		}
+
+		var ran atomic.Bool
+		e.RegisterMutation("ok", func(ctx *MutationCtx) interface{} {
+			ran.Store(true)
+			return nil
+		})
+		if _, err := e.scheduleTask(time.Now(), "ok", nil); err != nil {
+			t.Fatalf("schedule follow-up task: %v", err)
+		}
+		if !waitUntil(t, 2*time.Second, func() bool { return ran.Load() }) {
+			t.Fatal("later scheduled task did not run after the panic")
+		}
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestNearTermScheduledTaskPanicIsRecovered$")
+	cmd.Env = append(os.Environ(), "TETHER_TEST_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Errorf("near-term scheduled task panic crashed the process: %v\n%s", err, out)
+	}
+}
+
 func loadCron(t *testing.T, e *Engine, id string) TetherTask {
 	t.Helper()
 	var got TetherTask
@@ -1640,6 +1689,50 @@ func TestGuardInvalidationRerunsAttachedQuery(t *testing.T) {
 	}
 }
 
+func TestGuardPanicOnReevaluationDoesNotStopInvalidation(t *testing.T) {
+	e := newTestEngine(t)
+	panicker := trackClient(t, e)
+	other := trackClient(t, e)
+	e.tracker.SetAuth(panicker.ID, "user-panic", time.Now().Add(time.Hour))
+	e.tracker.SetAuth(other.ID, "user-ok", time.Now().Add(time.Hour))
+
+	var panicGuardEvals, okGuardEvals atomic.Int64
+	e.RegisterGuard("role", func(ctx *GuardCtx) interface{} {
+		id, _ := ctx.Auth.GetIdentity()
+		ctx.TrackCollection("room_members", "user_id", "shared")
+		if id == "user-panic" {
+			if panicGuardEvals.Add(1) > 1 {
+				panic("guard boom")
+			}
+			return "first"
+		}
+		return fmt.Sprintf("ok-%d", okGuardEvals.Add(1))
+	})
+	e.RegisterQuery("who", func(ctx *QueryCtx) interface{} {
+		role, err := ctx.Auth.ExecuteGuard("role", map[string]interface{}{})
+		if err != nil {
+			return "ERROR"
+		}
+		return role
+	})
+	subscribe(t, e, panicker, "who", "panic", nil)
+	subscribe(t, e, other, "who", "ok", nil)
+	drain(panicker)
+	drain(other)
+
+	e.InvalidateTag("room_members_user_id:shared")
+
+	if panicGuardEvals.Load() != 2 {
+		t.Fatalf("panicking guard evals = %d, want 2 (initial plus reevaluation)", panicGuardEvals.Load())
+	}
+	if okGuardEvals.Load() != 2 {
+		t.Fatalf("other guard evals = %d, want 2", okGuardEvals.Load())
+	}
+	if data, n := lastQueryData(t, other); n != 1 || data != "ok-2" {
+		t.Fatalf("other client after guard panic: %d pushes, data = %v; want one push of ok-2", n, data)
+	}
+}
+
 func TestFailedAuthDoesNotSetIdentityOrPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
@@ -1954,6 +2047,42 @@ func TestAuthExpiryAfterDisconnectDoesNotPanic(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Errorf("auth expiry timer crashed after the client disconnected: %v\n%s", err, out)
+	}
+}
+
+func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
+	if os.Getenv("TETHER_TEST_CHILD") == "1" {
+		e := newTestEngine(t)
+		client := trackClient(t, e)
+		var runs atomic.Int64
+		e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+			if runs.Add(1) > 1 {
+				panic("expiry boom")
+			}
+			id, _ := ctx.Auth.GetIdentity()
+			return id
+		})
+		expiresAt := time.Now().Add(40 * time.Millisecond)
+		e.SetAuth(&stubAuth{userID: "alice", expiresAt: expiresAt})
+		if err := e.OnReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+			t.Fatalf("auth: %v", err)
+		}
+		subscribe(t, e, client, "me", "me", nil)
+
+		if !waitUntil(t, time.Second, func() bool {
+			auth, ok := e.tracker.GetAuth(client.ID)
+			return ok && auth.UserID == ""
+		}) {
+			t.Fatal("expired auth was not cleared")
+		}
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAuthExpiryQueryPanicIsRecovered$")
+	cmd.Env = append(os.Environ(), "TETHER_TEST_CHILD=1")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Errorf("auth expiry timer crashed when the re-run panicked: %v\n%s", err, out)
 	}
 }
 

@@ -179,7 +179,16 @@ func (e *Engine) prepareGuardCtx(params map[string]interface{}, authID, execID, 
 // Identity and DB dependencies stay on the guard; the attached query only
 // stores the *guard_ fingerprint used for batching. Returns the attached
 // query subscription when that fingerprint actually changed.
-func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID string) *reactivity.Subscription {
+func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID string) (rerun *reactivity.Subscription) {
+	// Runs on the caller's goroutine, before InvalidateTags starts workers.
+	// A panicking guard would otherwise take down that caller: the postgres
+	// listener, a scheduler timer, or a profiler flush.
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("Recovered from panic", "error", r)
+			rerun = nil
+		}
+	}()
 	if len(subscription.LinkedSubIDs) == 0 {
 		return nil
 	}
@@ -251,6 +260,9 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 		e.timerMutex.Lock()
 		timer := time.AfterFunc(time.Until(timestamp), func() {
 			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("Failed to execute scheduled task", "taskID", taskID, "error", r)
+				}
 				e.db.Delete(&TetherTask{}, "id = ?", taskID)
 				e.timerMutex.Lock()
 				delete(e.taskToTimer, taskID)
@@ -1422,6 +1434,11 @@ func (e *Engine) InvalidateTags(tags []string, execID string, actionName string)
 		go func(subscriptions []*reactivity.Subscription) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("Recovered from panic", "error", r)
+				}
+			}()
 			representative := subscriptions[0]
 			result, deps, cacheKey, err := e.runQuery(representative.Query, representative.Params, representative)
 			if err != nil {
@@ -1844,6 +1861,11 @@ func (e *Engine) OnReceiveMessage(clientID string, msg map[string]interface{}) e
 		}
 		e.rerunSubscriptions(e.tracker.SetAuth(clientID, userID, expiresAt))
 		time.AfterFunc(time.Until(expiresAt), func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("Recovered from panic", "error", r)
+				}
+			}()
 			e.rerunSubscriptions(e.tracker.ExpireAuth(clientID, expiresAt))
 		})
 		message := map[string]interface{}{"type": "auth", "success": true, "data": map[string]interface{}{"user_id": userID}}
