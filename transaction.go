@@ -3,10 +3,13 @@ package tether
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"log/slog"
+	"reflect"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"gorm.io/gorm"
 )
@@ -68,17 +71,22 @@ type pendingInvalidation struct {
 // queries (which use other pooled connections) observe the committed data.
 type trackedTx struct {
 	gorm.Tx
-	pool    *trackedPool
-	ctx     context.Context
-	mu      sync.Mutex
-	pending map[*Engine]*pendingInvalidation
+	pool *trackedPool
+	ctx  context.Context
+	invalidations
 }
 
 func (t *trackedTx) GetDBConn() (*sql.DB, error) {
 	return t.pool.GetDBConn()
 }
 
-func (t *trackedTx) queue(e *Engine, tags []string, execID, actionName string) {
+// invalidations collects tags written inside one transaction.
+type invalidations struct {
+	mu      sync.Mutex
+	pending map[*Engine]*pendingInvalidation
+}
+
+func (t *invalidations) queue(e *Engine, tags []string, execID, actionName string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.pending == nil {
@@ -101,12 +109,18 @@ func (t *trackedTx) queue(e *Engine, tags []string, execID, actionName string) {
 	}
 }
 
-func (t *trackedTx) take() map[*Engine]*pendingInvalidation {
+func (t *invalidations) take() map[*Engine]*pendingInvalidation {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	pending := t.pending
 	t.pending = nil
 	return pending
+}
+
+func publishPending(pending map[*Engine]*pendingInvalidation) {
+	for e, p := range pending {
+		e.invalidateTags(p.tags, p.execID, p.actionName)
+	}
 }
 
 func (t *trackedTx) Commit() error {
@@ -118,15 +132,72 @@ func (t *trackedTx) Commit() error {
 	if err := t.Tx.Commit(); err != nil {
 		return err
 	}
-	for e, p := range pending {
-		e.invalidateTags(p.tags, p.execID, p.actionName)
-	}
+	publishPending(pending)
 	return nil
 }
 
 func (t *trackedTx) Rollback() error {
 	t.take()
 	return t.Tx.Rollback()
+}
+
+// sqlTxHook publishes invalidations when a raw *sql.Tx commits. db.Connection
+// checks out a *sql.Conn and GORM begins its transaction with Conn.BeginTx,
+// which returns that *sql.Tx instead of a trackedTx. Callbacks then run on a
+// cloned statement, while Commit is invoked on the statement Begin returned,
+// so replacing the callback's ConnPool cannot see the commit. The driver
+// transaction is the one object both sides share.
+type sqlTxHook struct {
+	driver.Tx
+	invalidations
+}
+
+func (h *sqlTxHook) Commit() error {
+	if err := h.Tx.Commit(); err != nil {
+		h.take()
+		return err
+	}
+	publishPending(h.take())
+	return nil
+}
+
+func (h *sqlTxHook) Rollback() error {
+	h.take()
+	return h.Tx.Rollback()
+}
+
+// sqlTxOf returns the raw transaction behind a pinned connection, if any.
+func sqlTxOf(conn gorm.ConnPool) *sql.Tx {
+	if prepared, ok := conn.(*gorm.PreparedStmtTX); ok {
+		conn = prepared.Tx
+	}
+	tx, _ := conn.(*sql.Tx)
+	return tx
+}
+
+// sqlTxHookOf returns the commit hook for tx, installing it on first use.
+// A nil result means the transaction could not be hooked; the caller publishes
+// immediately rather than dropping the invalidation.
+func sqlTxHookOf(tx *sql.Tx) *sqlTxHook {
+	field := reflect.ValueOf(tx).Elem().FieldByName("txi")
+	if !field.IsValid() || field.Kind() != reflect.Interface || field.IsNil() {
+		slog.Error("Failed to defer invalidation until the pinned transaction commits")
+		return nil
+	}
+	// txi is unexported, so the field Value refuses Interface. NewAt views the
+	// same memory as an ordinary driver.Tx.
+	current := reflect.NewAt(field.Type(), unsafe.Pointer(field.UnsafeAddr())).Elem()
+	if hook, ok := current.Interface().(*sqlTxHook); ok {
+		return hook
+	}
+	inner, ok := current.Interface().(driver.Tx)
+	if !ok {
+		slog.Error("Failed to defer invalidation until the pinned transaction commits")
+		return nil
+	}
+	hook := &sqlTxHook{Tx: inner}
+	current.Set(reflect.ValueOf(driver.Tx(hook)))
+	return hook
 }
 
 // trackTransactions installs trackedPool under db. With PrepareStmt the

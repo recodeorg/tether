@@ -470,10 +470,20 @@ func NewEngine(db *gorm.DB) *Engine {
 			}
 		}
 		// Subscriptions re-run on other pooled connections, so writes inside a
-		// transaction are only published once it commits.
+		// transaction are only published once it commits. A transaction begun
+		// from db.Connection's pinned *sql.Conn is a raw *sql.Tx; its hook
+		// publishes on that commit. NOTIFY still runs now so it shares the
+		// transaction and PostgreSQL delivers it only if the commit succeeds.
 		if pending := trackedTxOf(tx.Statement.ConnPool); pending != nil {
 			pending.queue(e, tags, execID, actionName)
 			return
+		}
+		if sqlTx := sqlTxOf(tx.Statement.ConnPool); sqlTx != nil {
+			if hook := sqlTxHookOf(sqlTx); hook != nil {
+				hook.queue(e, tags, execID, actionName)
+				e.notifyRemote(tx.Statement.Context, sqlTx, tags)
+				return
+			}
 		}
 		e.notifyRemote(tx.Statement.Context, tx.Statement.ConnPool, tags)
 		e.invalidateTags(tags, execID, actionName)

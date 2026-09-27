@@ -266,6 +266,78 @@ func TestImplicitTransactionPublishesCommittedData(t *testing.T) {
 	}
 }
 
+func TestConnectionUpdatePublishesCommittedData(t *testing.T) {
+	e := newPooledEngine(t, 4)
+	client, msg, _ := subscribeToBody(t, e)
+
+	err := e.db.Connection(func(conn *gorm.DB) error {
+		return conn.Model(&msg).Update("body", "new").Error
+	})
+	if err != nil {
+		t.Fatalf("Connection: %v", err)
+	}
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != "new" {
+		t.Errorf("pushes after update = %d, last = %v; want one push of \"new\"", n, data)
+	}
+}
+
+func TestConnectionTransactionCommitPublishesCommittedData(t *testing.T) {
+	e := newPooledEngine(t, 4)
+	client, msg, runs := subscribeToBody(t, e)
+
+	err := e.db.Connection(func(conn *gorm.DB) error {
+		return conn.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&msg).Update("body", "new").Error; err != nil {
+				return err
+			}
+			if got := runs.Load(); got != 1 {
+				t.Errorf("query runs before commit = %d, want 1", got)
+			}
+			return nil
+		})
+	})
+	if err != nil {
+		t.Fatalf("Connection: %v", err)
+	}
+
+	if got := storedBody(t, e, msg.ID); got != "new" {
+		t.Fatalf("stored body = %q, want \"new\"", got)
+	}
+	data, n := lastQueryData(t, client)
+	if n != 1 || data != "new" {
+		t.Errorf("pushes after commit = %d, last = %v; want one push of \"new\"", n, data)
+	}
+}
+
+func TestConnectionTransactionRollbackDiscardsInvalidation(t *testing.T) {
+	e := newPooledEngine(t, 4)
+	client, msg, runs := subscribeToBody(t, e)
+
+	abort := errors.New("abort")
+	err := e.db.Connection(func(conn *gorm.DB) error {
+		return conn.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&msg).Update("body", "new").Error; err != nil {
+				return err
+			}
+			return abort
+		})
+	})
+	if !errors.Is(err, abort) {
+		t.Fatalf("Connection error = %v, want %v", err, abort)
+	}
+
+	if got := storedBody(t, e, msg.ID); got != "old" {
+		t.Fatalf("stored body = %q, want \"old\"", got)
+	}
+	if got := runs.Load(); got != 1 {
+		t.Errorf("query runs after rollback = %d, want 1", got)
+	}
+	if _, n := lastQueryData(t, client); n != 0 {
+		t.Errorf("pushes after rollback = %d, want 0", n)
+	}
+}
+
 type recordingTx struct {
 	calls []string
 }
@@ -417,5 +489,32 @@ func TestPostgresNotifyDeliveredOnlyOnCommit(t *testing.T) {
 	}
 	if want := fmt.Sprintf("messages:%d", msg.ID); !strings.Contains(payload, want) {
 		t.Errorf("notification payload = %q, want it to include %q", payload, want)
+	}
+
+	_ = e.db.Connection(func(conn *gorm.DB) error {
+		return conn.Transaction(func(tx *gorm.DB) error {
+			if err := tx.Model(&msg).Update("body", "rolled back").Error; err != nil {
+				return err
+			}
+			return errors.New("abort")
+		})
+	})
+	if payload, ok := nextFromEngine(500 * time.Millisecond); ok {
+		t.Errorf("notification after pinned rollback = %q, want none", payload)
+	}
+
+	if err := e.db.Connection(func(conn *gorm.DB) error {
+		return conn.Transaction(func(tx *gorm.DB) error {
+			return tx.Model(&msg).Update("body", "pinned").Error
+		})
+	}); err != nil {
+		t.Fatalf("Connection: %v", err)
+	}
+	payload, ok = nextFromEngine(5 * time.Second)
+	if !ok {
+		t.Fatal("no notification after pinned commit")
+	}
+	if want := fmt.Sprintf("messages:%d", msg.ID); !strings.Contains(payload, want) {
+		t.Errorf("pinned notification payload = %q, want it to include %q", payload, want)
 	}
 }
