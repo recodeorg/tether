@@ -1722,21 +1722,14 @@ func isSafeInlineMime(mimeType string) bool {
 	return mediaType == "application/pdf"
 }
 
-func (e *Engine) getUploadURL(opts storage.UploadOptions) (storage.UploadInfo, error) {
+func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo, error) {
 	if e.storage == nil {
 		return storage.UploadInfo{}, fmt.Errorf("storage not configured")
 	}
 
 	fileID := uuid.NewString()
 	token := uuid.NewString()
-	maxBytes := opts.MaxBytes
-	expiresIn := opts.ExpiresIn
-	if maxBytes == 0 {
-		maxBytes = 1024 * 1024 * 20 // 20MB
-	}
-	if expiresIn == 0 {
-		expiresIn = time.Minute * 15 // 15 minutes
-	}
+	maxBytes, expiresIn := storage.EffectiveUploadLimits(e.storage.DefaultUploadOptions(), opts)
 
 	err := e.db.Create(&TetherStorage{
 		ID:        fileID,
@@ -2085,7 +2078,7 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		Dependencies: []string{},
 	}
 	queryCtx.Storage = &StorageCtx{
-		GetUploadURL: func(opts storage.UploadOptions) (storage.UploadInfo, error) {
+		GetUploadURL: func(opts ...storage.UploadOption) (storage.UploadInfo, error) {
 			return storage.UploadInfo{}, e.denyCapability()
 		},
 		GetDownloadURL: e.getDownloadURL,

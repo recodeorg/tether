@@ -54,9 +54,12 @@ type StorageCtx struct {
 	// upload URL. The client uploads the file by sending its raw bytes, with
 	// a Content-Type header, in a PUT request to that URL. Store the FileID in
 	// your own tables to refer to the file later. The upload is limited to
-	// opts.MaxBytes (default 20 MB) and must start within opts.ExpiresIn
-	// (default 15 minutes). Not available in queries.
-	GetUploadURL func(opts storage.UploadOptions) (storage.UploadInfo, error)
+	// 20 MB and must start within 15 minutes, unless changed with
+	// [storage.WithMaxBytes] or [storage.WithExpiresIn]. Options passed to the
+	// storage adapter's constructor are applied first; opts are applied after
+	// them, in order. A zero size or lifetime selects the built-in default.
+	// Not available in queries.
+	GetUploadURL func(opts ...storage.UploadOption) (storage.UploadInfo, error)
 	// GetDownloadURL returns a URL that serves the file to anyone who has it
 	// for the next 15 minutes. It does not check that the file exists or that
 	// the caller may read it, so authorize the caller first.

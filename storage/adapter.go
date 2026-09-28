@@ -9,13 +9,61 @@ import (
 	"time"
 )
 
-// UploadOptions configures an upload URL created by StorageCtx.GetUploadURL.
-type UploadOptions struct {
-	// MaxBytes is the largest file the upload accepts. Zero means 20 MB.
-	MaxBytes int64
-	// ExpiresIn is how long the upload URL stays valid. Zero means 15
-	// minutes.
-	ExpiresIn time.Duration
+const (
+	defaultMaxBytes  int64 = 20 * 1024 * 1024
+	defaultExpiresIn       = 15 * time.Minute
+)
+
+// uploadLimits is filled in by [UploadOption] values. A zero field selects
+// the built-in default when the limits are resolved.
+type uploadLimits struct {
+	maxBytes  int64
+	expiresIn time.Duration
+}
+
+// UploadOption configures an upload URL created by StorageCtx.GetUploadURL.
+// The same options may be passed to a storage adapter constructor as the
+// defaults for every upload from that adapter.
+type UploadOption func(*uploadLimits)
+
+// WithMaxBytes sets the largest file the upload accepts. Zero selects the
+// built-in default of 20 MB.
+func WithMaxBytes(n int64) UploadOption {
+	return func(cfg *uploadLimits) {
+		cfg.maxBytes = n
+	}
+}
+
+// WithExpiresIn sets how long the upload URL stays valid. Zero selects the
+// built-in default of 15 minutes.
+func WithExpiresIn(d time.Duration) UploadOption {
+	return func(cfg *uploadLimits) {
+		cfg.expiresIn = d
+	}
+}
+
+// EffectiveUploadLimits applies defaults and then opts, in order. Nil options
+// are ignored. A zero size or lifetime selects the built-in default of 20 MB
+// or 15 minutes, including when a later option clears an earlier one.
+func EffectiveUploadLimits(defaults []UploadOption, opts []UploadOption) (maxBytes int64, expiresIn time.Duration) {
+	cfg := uploadLimits{}
+	for _, opt := range defaults {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
+	if cfg.maxBytes == 0 {
+		cfg.maxBytes = defaultMaxBytes
+	}
+	if cfg.expiresIn == 0 {
+		cfg.expiresIn = defaultExpiresIn
+	}
+	return cfg.maxBytes, cfg.expiresIn
 }
 
 // UploadInfo is returned by StorageCtx.GetUploadURL.
@@ -46,4 +94,9 @@ type StorageAdapter interface {
 	// Name identifies the adapter, such as "tether/storage/s3". It is saved
 	// with each file so files can be traced to the backend that holds them.
 	Name() string
+	// DefaultUploadOptions returns the upload options passed to the adapter's
+	// constructor. StorageCtx.GetUploadURL applies these first, then any
+	// options passed at the call. Return nil to keep the built-in defaults of
+	// 20 MB and 15 minutes.
+	DefaultUploadOptions() []UploadOption
 }

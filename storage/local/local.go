@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/recodeorg/tether/storage"
 )
 
 // LocalStorage is a [storage.StorageAdapter] that stores each file in
@@ -18,12 +20,16 @@ import (
 // on different servers cannot read each other's files.
 type LocalStorage struct {
 	UploadDir string
+	defaults  []storage.UploadOption
 }
 
 // NewLocalStorage returns a LocalStorage that stores files in uploadDir,
 // creating the directory if it does not exist. It returns an error if the
 // directory cannot be created.
-func NewLocalStorage(uploadDir string) (*LocalStorage, error) {
+//
+// defaults are applied to every upload URL from this adapter. Options passed
+// to GetUploadURL are applied after them, in order. Nil options are ignored.
+func NewLocalStorage(uploadDir string, defaults ...storage.UploadOption) (*LocalStorage, error) {
 	err := os.MkdirAll(uploadDir, os.ModePerm)
 	if err != nil {
 		slog.Error("Failed to create directory", "error", err)
@@ -31,6 +37,7 @@ func NewLocalStorage(uploadDir string) (*LocalStorage, error) {
 	}
 	return &LocalStorage{
 		UploadDir: uploadDir,
+		defaults:  append([]storage.UploadOption(nil), defaults...),
 	}, nil
 }
 
@@ -104,4 +111,9 @@ func (l *LocalStorage) safePath(fileID string) (string, error) {
 // Name returns "tether/storage/local".
 func (l *LocalStorage) Name() string {
 	return "tether/storage/local"
+}
+
+// DefaultUploadOptions returns the defaults passed to [NewLocalStorage].
+func (l *LocalStorage) DefaultUploadOptions() []storage.UploadOption {
+	return l.defaults
 }

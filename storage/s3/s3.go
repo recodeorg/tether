@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/recodeorg/tether/storage"
 )
 
 // Config configures an [S3Storage].
@@ -29,12 +30,16 @@ type S3Storage struct {
 	client        *s3.Client
 	presignClient *s3.PresignClient
 	bucket        string
+	defaults      []storage.UploadOption
 }
 
 // NewS3Storage returns an S3Storage for cfg. Credentials are loaded the
 // standard AWS SDK way, from environment variables, shared config files or
 // an instance role. It returns an error if cfg.Endpoint uses plain HTTP.
-func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
+//
+// defaults are applied to every upload URL from this adapter. Options passed
+// to GetUploadURL are applied after them, in order. Nil options are ignored.
+func NewS3Storage(ctx context.Context, cfg Config, defaults ...storage.UploadOption) (*S3Storage, error) {
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(cfg.Region),
 	}
@@ -61,6 +66,7 @@ func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
 		client:        client,
 		presignClient: s3.NewPresignClient(client),
 		bucket:        cfg.Bucket,
+		defaults:      append([]storage.UploadOption(nil), defaults...),
 	}, nil
 }
 
@@ -106,4 +112,9 @@ func (s *S3Storage) Delete(fileID string) error {
 // Name returns "tether/storage/s3".
 func (s *S3Storage) Name() string {
 	return "tether/storage/s3"
+}
+
+// DefaultUploadOptions returns the defaults passed to [NewS3Storage].
+func (s *S3Storage) DefaultUploadOptions() []storage.UploadOption {
+	return s.defaults
 }

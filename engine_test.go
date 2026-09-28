@@ -3815,7 +3815,7 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 	e.SetStorage(store)
 	e.SetAllowedOrigins([]string{"https://app.example"})
 
-	upload, err := e.getUploadURL(storage.UploadOptions{})
+	upload, err := e.getUploadURL()
 	if err != nil {
 		t.Fatalf("getUploadURL: %v", err)
 	}
@@ -3885,7 +3885,7 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 	})
 
 	t.Run("put without origin", func(t *testing.T) {
-		next, err := e.getUploadURL(storage.UploadOptions{})
+		next, err := e.getUploadURL()
 		if err != nil {
 			t.Fatalf("getUploadURL: %v", err)
 		}
@@ -3939,7 +3939,7 @@ func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 	}
 	e.SetStorage(store)
 
-	upload, err := e.getUploadURL(storage.UploadOptions{})
+	upload, err := e.getUploadURL()
 	if err != nil {
 		t.Fatalf("getUploadURL: %v", err)
 	}
@@ -3975,7 +3975,7 @@ func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
 		return strings.HasSuffix(r.Header.Get("Origin"), ".example")
 	})
 
-	upload, err := e.getUploadURL(storage.UploadOptions{})
+	upload, err := e.getUploadURL()
 	if err != nil {
 		t.Fatalf("getUploadURL: %v", err)
 	}
@@ -4080,6 +4080,48 @@ func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
 	})
 }
 
+func TestGetUploadURLUsesAdapterDefaultsAndCallOptions(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.NewLocalStorage(t.TempDir(), storage.WithMaxBytes(1234), storage.WithExpiresIn(time.Hour))
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	started := time.Now()
+	upload, err := e.getUploadURL()
+	if err != nil {
+		t.Fatalf("getUploadURL: %v", err)
+	}
+	var row TetherStorage
+	if err := e.db.Where("id = ?", upload.FileID).First(&row).Error; err != nil {
+		t.Fatalf("load upload: %v", err)
+	}
+	if row.MaxBytes != 1234 {
+		t.Fatalf("default MaxBytes = %d, want 1234", row.MaxBytes)
+	}
+	if row.ExpiresAt.Before(started.Add(time.Hour-time.Second)) || row.ExpiresAt.After(time.Now().Add(time.Hour+time.Second)) {
+		t.Fatalf("default ExpiresAt = %s, want about 1h from now", row.ExpiresAt)
+	}
+
+	overridden, err := e.getUploadURL(storage.WithMaxBytes(99))
+	if err != nil {
+		t.Fatalf("getUploadURL override: %v", err)
+	}
+	row = TetherStorage{}
+	if err := e.db.Where("id = ?", overridden.FileID).First(&row).Error; err != nil {
+		t.Fatalf("load override: %v", err)
+	}
+	if row.MaxBytes != 99 {
+		t.Fatalf("override MaxBytes = %d, want 99", row.MaxBytes)
+	}
+	if row.ExpiresAt.Before(started.Add(time.Hour-time.Second)) || row.ExpiresAt.After(time.Now().Add(time.Hour+time.Second)) {
+		t.Fatalf("override ExpiresAt = %s, want the adapter default of about 1h", row.ExpiresAt)
+	}
+}
+
 func TestDeleteFileRemovesStoredObject(t *testing.T) {
 	e := newTestEngine(t)
 	store, err := local.NewLocalStorage(t.TempDir())
@@ -4088,7 +4130,7 @@ func TestDeleteFileRemovesStoredObject(t *testing.T) {
 	}
 	e.SetStorage(store)
 
-	upload, err := e.getUploadURL(storage.UploadOptions{})
+	upload, err := e.getUploadURL()
 	if err != nil {
 		t.Fatalf("getUploadURL: %v", err)
 	}
@@ -4137,6 +4179,10 @@ func (r *recordingStorage) Name() string {
 	return r.local.Name()
 }
 
+func (r *recordingStorage) DefaultUploadOptions() []storage.UploadOption {
+	return r.local.DefaultUploadOptions()
+}
+
 // cleanupStorage records whether upload metadata still existed when Delete ran,
 // and can fail a chosen id without touching its bytes.
 type cleanupStorage struct {
@@ -4170,6 +4216,10 @@ func (c *cleanupStorage) Delete(fileID string) error {
 
 func (c *cleanupStorage) Name() string {
 	return c.local.Name()
+}
+
+func (c *cleanupStorage) DefaultUploadOptions() []storage.UploadOption {
+	return c.local.DefaultUploadOptions()
 }
 
 func TestCleanStorage(t *testing.T) {

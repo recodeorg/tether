@@ -5,6 +5,7 @@ First stable release. Focuses on correct auth/reactivity under batching and tran
 ### Breaking changes
 - `RegisterQuery` no longer accepts a `dependencies` slice; dependencies come only from `TrackCollection` / `TrackTable` inside the query
 - `QueryOptions` and `MutationOptions` are replaced by functional options. Pass `Internal()` to `RegisterQuery` or `RegisterMutation` to hide that function from clients
+- `storage.UploadOptions` is replaced by functional options. `GetUploadURL` takes `...storage.UploadOption` (`WithMaxBytes`, `WithExpiresIn`). `NewLocalStorage` and `NewS3Storage` take the same options as adapter defaults, and `StorageAdapter` gains `DefaultUploadOptions`
 - `CreateTable` no longer accepts a table name argument
 - `QueryCtx.Scheduler` and `GuardCtx.Profiler` removed (schedule from mutations; profiling is on `MutationCtx`)
 - Several engine hooks are no longer exported: `ExecuteQuery`, `ExecuteMutation`, `ExecuteMutationInternal`, `InvalidateTag`, `InvalidateTags`, `OnReceiveMessage`, `OnConnect`, `OnDisconnect`, and `GetDependentQueries`
