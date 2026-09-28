@@ -1927,6 +1927,98 @@ func TestStaleInvalidationOrdersTimestamps(t *testing.T) {
 	}
 }
 
+func TestStaleExecutionDoesNotOverwriteDependencies(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	var dep atomic.Value
+	dep.Store("base")
+	var pause atomic.Bool
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseQuery := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseQuery()
+
+	var runs atomic.Int64
+	e.RegisterQuery("widget", func(ctx *QueryCtx) interface{} {
+		runs.Add(1)
+		selected := dep.Load().(string)
+		ctx.TrackCollection("widgets", "id", selected)
+		if pause.CompareAndSwap(true, false) {
+			close(started)
+			<-release
+		}
+		return selected
+	})
+
+	sub := subscribe(t, e, client, "widget", "k", nil)
+	drain(client)
+	runs.Store(0)
+
+	pause.Store(true)
+	dep.Store("data1")
+	done := make(chan struct{})
+	go func() {
+		e.invalidateTags([]string{"widgets_id:base"}, "slow", "slow")
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow execution did not reach the query")
+	}
+
+	dep.Store("data2")
+	e.invalidateTags([]string{"widgets_id:base"}, "fast", "fast")
+	releaseQuery()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow execution did not finish")
+	}
+
+	if e.tracker.SubscriptionHasTag(sub.SubID, "widgets_id:data1") {
+		t.Fatal("stale execution restored dependency data1")
+	}
+	if !e.tracker.SubscriptionHasTag(sub.SubID, "widgets_id:data2") {
+		t.Fatal("newest execution's dependency data2 is missing")
+	}
+	if e.tracker.SubscriptionHasTag(sub.SubID, "widgets_id:base") {
+		t.Fatal("initial dependency was left in place")
+	}
+
+	msgs := queryMessages(t, drain(client))
+	if len(msgs) != 2 {
+		t.Fatalf("invalidation messages = %d, want 2: %v", len(msgs), msgs)
+	}
+	timestampOf := func(msg map[string]interface{}) float64 {
+		t.Helper()
+		ts, ok := msg["timestamp"].(float64)
+		if !ok {
+			t.Fatalf("timestamp = %#v", msg["timestamp"])
+		}
+		return ts
+	}
+	if msgs[0]["data"] != "data2" || msgs[1]["data"] != "data1" {
+		t.Fatalf("arrival order = [%v, %v], want [data2, data1]", msgs[0]["data"], msgs[1]["data"])
+	}
+	if !(timestampOf(msgs[1]) < timestampOf(msgs[0])) {
+		t.Fatalf("timestamps = data2 %v, data1 %v; want data1 < data2", timestampOf(msgs[0]), timestampOf(msgs[1]))
+	}
+
+	before := runs.Load()
+	e.invalidateTag("widgets_id:data2")
+	if got := runs.Load() - before; got != 1 {
+		t.Fatalf("invalidating data2 ran the query %d times, want 1", got)
+	}
+	before = runs.Load()
+	e.invalidateTag("widgets_id:data1")
+	if got := runs.Load() - before; got != 0 {
+		t.Fatalf("invalidating stale data1 ran the query %d times, want 0", got)
+	}
+}
+
 func TestQueryResultIncludesLocationAndQueryKey(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
@@ -3052,6 +3144,97 @@ func TestConcurrentFirstGuardRunsKeepOneResult(t *testing.T) {
 	}
 	if kept != 1 {
 		t.Errorf("guard results kept = %d, want 1", kept)
+	}
+}
+
+func TestStaleGuardExecutionDoesNotOverwriteState(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	var dep atomic.Value
+	dep.Store("data1")
+	var result atomic.Int64
+	result.Store(1)
+	var pause atomic.Bool
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseGuard := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseGuard()
+
+	var runs atomic.Int64
+	e.RegisterGuard("allow", func(ctx *GuardCtx) interface{} {
+		runs.Add(1)
+		selected := dep.Load().(string)
+		decision := result.Load()
+		ctx.TrackCollection("perms", "id", selected)
+		if pause.CompareAndSwap(true, false) {
+			close(started)
+			<-release
+		}
+		return decision
+	})
+	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+		allowed, err := ctx.Auth.ExecuteGuard("allow", map[string]interface{}{})
+		if err != nil {
+			return "ERROR"
+		}
+		return allowed
+	})
+
+	sub := subscribe(t, e, client, "secret", "k", nil)
+	drain(client)
+	if len(sub.LinkedSubIDs) != 1 {
+		t.Fatalf("linked guards = %d, want 1", len(sub.LinkedSubIDs))
+	}
+	guardID := sub.LinkedSubIDs[0]
+	runs.Store(0)
+
+	pause.Store(true)
+	done := make(chan struct{})
+	go func() {
+		e.invalidateTags([]string{"perms_id:data1"}, "slow", "slow")
+		close(done)
+	}()
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow guard reevaluation did not start")
+	}
+
+	dep.Store("data2")
+	result.Store(2)
+	e.invalidateTags([]string{"perms_id:data1"}, "fast", "fast")
+	releaseGuard()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow guard reevaluation did not finish")
+	}
+
+	if e.tracker.SubscriptionHasTag(guardID, "perms_id:data1") {
+		t.Fatal("stale guard reevaluation restored dependency data1")
+	}
+	if !e.tracker.SubscriptionHasTag(guardID, "perms_id:data2") {
+		t.Fatal("newest guard reevaluation's dependency data2 is missing")
+	}
+	fingerprint := "*guard_allow_" + emptyParamsHash() + ":"
+	if e.tracker.SubscriptionHasTag(sub.SubID, fingerprint+"1") {
+		t.Fatal("stale guard reevaluation restored result 1")
+	}
+	if !e.tracker.SubscriptionHasTag(sub.SubID, fingerprint+"2") {
+		t.Fatal("newest guard result 2 is missing")
+	}
+
+	before := runs.Load()
+	e.invalidateTag("perms_id:data2")
+	if got := runs.Load() - before; got != 1 {
+		t.Fatalf("invalidating data2 ran the guard %d times, want 1", got)
+	}
+	before = runs.Load()
+	e.invalidateTag("perms_id:data1")
+	if got := runs.Load() - before; got != 0 {
+		t.Fatalf("invalidating stale data1 ran the guard %d times, want 0", got)
 	}
 }
 

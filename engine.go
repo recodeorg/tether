@@ -196,13 +196,16 @@ func (e *Engine) readOnlyDB(ctx context.Context) *gorm.DB {
 // fails, the query's cached guard results are dropped so it cannot keep using
 // a grant that could not be revalidated.
 func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID string) (rerun *reactivity.Subscription) {
+	// Stamp before the guard reads anything so an older reevaluation cannot
+	// overwrite dependencies or the cached result published by a newer one.
+	ts := e.nextQueryTimestamp()
 	// Runs on the caller's goroutine, before InvalidateTags starts workers.
 	// A panicking guard would otherwise take down that caller: the postgres
 	// listener, a scheduler timer, or a profiler flush.
 	defer func() {
 		if r := recover(); r != nil {
 			slog.Error("Recovered from panic", "error", r)
-			e.tracker.DropGuards(subscription.SubID)
+			e.tracker.DropGuards(subscription.SubID, ts)
 			rerun = nil
 		}
 	}()
@@ -224,26 +227,26 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 	guardResult, err := executeGuard(e, guardCtx, guardName)
 	if err != nil {
 		slog.Error("Failed to execute guard", "error", err)
-		e.tracker.DropGuards(subscription.SubID)
+		e.tracker.DropGuards(subscription.SubID, ts)
 		return nil
 	}
-	if !e.tracker.UpdateTagsAtEpoch(subscription.SubID, guardCtx.Dependencies, auth.AuthEpoch) {
+	if !e.tracker.UpdateTagsAtEpoch(subscription.SubID, guardCtx.Dependencies, auth.AuthEpoch, ts) {
 		return nil
 	}
 	guardResultJSON, err := json.Marshal(guardResult)
 	if err != nil {
 		slog.Error("Failed to marshal guard result", "error", err)
-		e.tracker.DropGuards(subscription.SubID)
+		e.tracker.DropGuards(subscription.SubID, ts)
 		return nil
 	}
 	paramsJSON, err := json.Marshal(subscription.Params)
 	if err != nil {
 		slog.Error("Failed to marshal params", "error", err)
-		e.tracker.DropGuards(subscription.SubID)
+		e.tracker.DropGuards(subscription.SubID, ts)
 		return nil
 	}
 	paramsHash := xxhash.Sum64(paramsJSON)
-	if e.tracker.UpdateGuardFingerprint(attachedID, guardName, strconv.FormatUint(paramsHash, 10), string(guardResultJSON), auth.AuthEpoch) {
+	if e.tracker.UpdateGuardFingerprint(attachedID, guardName, strconv.FormatUint(paramsHash, 10), string(guardResultJSON), auth.AuthEpoch, ts) {
 		return attached
 	}
 	return nil
@@ -1715,13 +1718,16 @@ func queryDepsIntroduceAuthTag(tracker *reactivity.Tracker, subID string, deps [
 
 // sendQueryResult records deps on one subscription and pushes result to its
 // client, unless that client's identity changed since authEpoch was read.
+// Dependency and guard tags from an execution older than ts are left as the
+// newer execution recorded them; the frame is still delivered so the client
+// can drop it.
 func (e *Engine) sendQueryResult(subscription *reactivity.Subscription, result interface{}, deps []string, ts int64, authEpoch int) {
 	responseJSON, err := marshalQueryMessage(subscription.Query, result, subscription.QueryKey, ts)
 	if err != nil {
 		slog.Error("Failed to encode query result", "error", err)
 		return
 	}
-	if !e.tracker.CommitQueryResult(subscription.SubID, deps, responseJSON, authEpoch) {
+	if !e.tracker.CommitQueryResult(subscription.SubID, deps, responseJSON, authEpoch, ts) {
 		slog.Debug("Dropping query result from a previous identity", "subID", subscription.SubID)
 	}
 }
@@ -1733,7 +1739,7 @@ func (e *Engine) denyCapability() error {
 // runQuery executes the query function as auth's identity and returns the
 // result plus the dependency tags it collected. It does not push to clients or
 // update subscription tags; callers decide how to fan those out and must commit
-// them against auth.AuthEpoch.
+// them against auth.AuthEpoch and the returned execution timestamp.
 func (e *Engine) runQuery(query string, params map[string]interface{}, subscription *reactivity.Subscription, auth reactivity.AuthCtx) (interface{}, []string, int64, error) {
 	if _, exists := e.queries[query]; !exists {
 		return nil, nil, 0, fmt.Errorf("query not found")
@@ -1746,6 +1752,10 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	}
 	authID := auth.UserID
 	slog.Debug("Executing query", "query", query, "params", params)
+
+	// Assigned before the query function runs. ExecuteGuard closes over it and
+	// only runs after the assignment below.
+	var ts int64
 
 	// Create the query context first so GetIdentity can append dependency tags.
 	queryCtx := &QueryCtx{
@@ -1780,7 +1790,7 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 			if err != nil {
 				return nil, err
 			}
-			e.tracker.AttachGuardToSubscription(subscription.SubID, guardID, guardName, params, guardCtx.Dependencies, auth.AuthEpoch)
+			e.tracker.AttachGuardToSubscription(subscription.SubID, guardID, guardName, params, guardCtx.Dependencies, auth.AuthEpoch, ts)
 			resultJSON, err := json.Marshal(result)
 			if err != nil {
 				return nil, err
@@ -1803,8 +1813,9 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 	queryCtx.DB = e.readOnlyDB(gormCtx)
 
 	// Stamp the execution before the query reads anything so the client can drop
-	// this message if a later invalidation arrives first.
-	ts := e.nextQueryTimestamp()
+	// this message if a later invalidation arrives first, and so an older
+	// execution cannot overwrite dependency or guard state.
+	ts = e.nextQueryTimestamp()
 	start := time.Now()
 	result := e.queries[query].Func(queryCtx)
 	e.Profiler.Add(utilities.Metric{
@@ -1835,7 +1846,7 @@ func (e *Engine) executeQuery(query string, params map[string]interface{}, subsc
 	if err != nil {
 		return nil, err
 	}
-	if !e.tracker.CommitQueryResult(subscription.SubID, deps, responseJSON, auth.AuthEpoch) {
+	if !e.tracker.CommitQueryResult(subscription.SubID, deps, responseJSON, auth.AuthEpoch, ts) {
 		slog.Debug("Dropping query result from a previous identity", "subID", subscription.SubID)
 		return nil, nil
 	}

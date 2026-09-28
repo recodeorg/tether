@@ -24,6 +24,12 @@ type Tracker struct {
 	clientToSubs  map[string]map[string]struct{} // client ID -> sub IDs
 	subToTags     map[string]map[string]struct{} // sub ID -> tags
 	tagsToSubs    map[string]map[string]struct{} // tags -> sub IDs
+
+	// depsAt is the newest execution timestamp whose dependency tags were
+	// stored for a subscription. guardAt is that timestamp per guard-result
+	// prefix. An older execution must not replace either.
+	depsAt  map[string]int64
+	guardAt map[string]map[string]int64
 }
 
 type Subscription struct {
@@ -43,6 +49,8 @@ func NewTracker() *Tracker {
 		clientToSubs:  make(map[string]map[string]struct{}),
 		subToTags:     make(map[string]map[string]struct{}),
 		tagsToSubs:    make(map[string]map[string]struct{}),
+		depsAt:        make(map[string]int64),
+		guardAt:       make(map[string]map[string]int64),
 	}
 }
 
@@ -71,6 +79,7 @@ func (t *Tracker) resetAuthorization(clientID string) []*Subscription {
 				delete(t.tagsToSubs, tag)
 			}
 		}
+		delete(t.guardAt, subID)
 		subscriptions = append(subscriptions, sub)
 	}
 	return subscriptions
@@ -94,8 +103,9 @@ func (t *Tracker) authEpochCurrent(sub *Subscription, authEpoch int) bool {
 
 // AttachGuardToSubscription records a guard's first execution as its own
 // subscription with deps. It is dropped if the client's identity changed since
-// authEpoch was read.
-func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardName string, params map[string]interface{}, deps []string, authEpoch int) {
+// authEpoch was read, or if a newer execution already published state for this
+// query. A newer execution replaces an older attachment of the same guard.
+func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardName string, params map[string]interface{}, deps []string, authEpoch int, ts int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	querySub, ok := t.subscriptions[subID]
@@ -107,10 +117,22 @@ func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardN
 		slog.Debug("Tracker: Dropping guard from a previous identity", "subID", subID, "guard", guardName)
 		return
 	}
+	if ts < t.depsAt[subID] {
+		slog.Debug("Tracker: Dropping stale guard attachment", "subID", subID, "guard", guardName)
+		return
+	}
 	paramsJSON, err := json.Marshal(params)
 	if err != nil {
 		slog.Error("Tracker: Failed to marshal params", "error", err)
 		return
+	}
+	paramsHash := strconv.FormatUint(xxhash.Sum64(paramsJSON), 10)
+	if existing := t.linkedGuard(querySub, guardName, paramsHash); existing != nil {
+		if t.depsAt[existing.SubID] > ts {
+			slog.Debug("Tracker: Dropping stale guard attachment", "subID", subID, "guard", guardName)
+			return
+		}
+		t.unlinkGuard(querySub, existing.SubID)
 	}
 	t.subscriptions[guardID] = &Subscription{
 		SubID:        guardID,
@@ -118,11 +140,42 @@ func (t *Tracker) AttachGuardToSubscription(subID string, guardID string, guardN
 		Query:        guardName,
 		LinkedSubIDs: []string{subID},
 		QueryKey:     "",
-		ParamsHash:   strconv.FormatUint(xxhash.Sum64(paramsJSON), 10),
+		ParamsHash:   paramsHash,
 		Params:       params,
 	}
 	querySub.LinkedSubIDs = append(querySub.LinkedSubIDs, guardID)
-	t.updateTags(guardID, deps)
+	t.commitTags(guardID, deps, ts)
+	if ts > t.depsAt[subID] {
+		t.depsAt[subID] = ts
+	}
+}
+
+// linkedGuard returns the guard subscription already attached to querySub for
+// the same guard name and params. Callers must hold t.mu.
+func (t *Tracker) linkedGuard(querySub *Subscription, guardName, paramsHash string) *Subscription {
+	for _, id := range querySub.LinkedSubIDs {
+		guard, ok := t.subscriptions[id]
+		if !ok {
+			continue
+		}
+		if guard.Query == guardName && guard.ParamsHash == paramsHash {
+			return guard
+		}
+	}
+	return nil
+}
+
+// unlinkGuard removes guardID from querySub and from the tracker. Callers must
+// hold t.mu.
+func (t *Tracker) unlinkGuard(querySub *Subscription, guardID string) {
+	kept := make([]string, 0, len(querySub.LinkedSubIDs))
+	for _, id := range querySub.LinkedSubIDs {
+		if id != guardID {
+			kept = append(kept, id)
+		}
+	}
+	querySub.LinkedSubIDs = kept
+	t.removeSubscription(guardID)
 }
 
 func (t *Tracker) Track(c *Client) {
@@ -178,6 +231,8 @@ func (t *Tracker) removeSubscription(subID string) {
 
 	// 4. Finally, delete the subscription itself
 	delete(t.subscriptions, subID)
+	delete(t.depsAt, subID)
+	delete(t.guardAt, subID)
 }
 
 // SetAuth updates the client's identity. When the user ID changes, cached
@@ -216,7 +271,9 @@ func (t *Tracker) ExpireAuth(clientID string, expiresAt time.Time) []*Subscripti
 	if auth.UserID == "" {
 		return nil
 	}
-	t.SendMessage(clientID, []byte(`{"type": "auth", "success": false, "data": "Identity expired"}`))
+	// send is used directly because ExpireAuth already holds t.mu. SendMessage
+	// would take that lock again and stall the expiry rerun.
+	t.send(client, []byte(`{"type": "auth", "success": false, "data": "Identity expired"}`))
 	return t.resetAuthorization(clientID)
 }
 
@@ -314,31 +371,81 @@ func (t *Tracker) UpdateTags(subID string, newTags []string) {
 }
 
 // UpdateTagsAtEpoch is UpdateTags for work that ran under the client identity
-// at authEpoch. It reports false and changes nothing if that identity is gone.
-func (t *Tracker) UpdateTagsAtEpoch(subID string, newTags []string, authEpoch int) bool {
+// at authEpoch and execution timestamp ts. It reports false and changes nothing
+// if that identity is gone or a newer execution already stored dependencies.
+func (t *Tracker) UpdateTagsAtEpoch(subID string, newTags []string, authEpoch int, ts int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	sub, exists := t.subscriptions[subID]
 	if !exists || !t.authEpochCurrent(sub, authEpoch) {
 		return false
 	}
-	t.updateTags(subID, newTags)
+	if !t.commitTags(subID, newTags, ts) {
+		slog.Debug("Tracker: Dropping stale dependency tags", "subID", subID)
+		return false
+	}
 	return true
 }
 
 // CommitQueryResult records a query execution's tags and sends its message,
 // unless the client's identity changed since authEpoch was read. Both happen
-// under one lock so an auth reset cannot land between them.
-func (t *Tracker) CommitQueryResult(subID string, newTags []string, message []byte, authEpoch int) bool {
+// under one lock so an auth reset cannot land between them. Tags from an
+// execution older than the one already recorded are left unchanged; the
+// message is still delivered so the client can order frames.
+func (t *Tracker) CommitQueryResult(subID string, newTags []string, message []byte, authEpoch int, ts int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	sub, exists := t.subscriptions[subID]
 	if !exists || sub.Client == nil || !t.authEpochCurrent(sub, authEpoch) {
 		return false
 	}
-	t.updateTags(subID, newTags)
+	if !t.commitTags(subID, newTags, ts) {
+		slog.Debug("Tracker: Dropping stale dependency tags", "subID", subID)
+	}
 	t.send(sub.Client, message)
 	return true
+}
+
+// commitTags stores newTags when ts is at least as new as the dependency
+// state already recorded for subID. A guard result published by a newer
+// execution is left in place. Callers must hold t.mu and have checked that
+// subID exists. It reports whether this execution's tags were stored.
+func (t *Tracker) commitTags(subID string, newTags []string, ts int64) bool {
+	if ts < t.depsAt[subID] {
+		return false
+	}
+	filtered := make([]string, 0, len(newTags))
+	writtenGuards := make([]string, 0)
+	for _, tag := range newTags {
+		prefix := guardResultPrefix(tag)
+		if prefix != "" && t.guardRevision(subID, prefix) > ts {
+			continue
+		}
+		filtered = append(filtered, tag)
+		if prefix != "" {
+			writtenGuards = append(writtenGuards, prefix)
+		}
+	}
+	t.updateTags(subID, filtered)
+	t.depsAt[subID] = ts
+	for _, prefix := range writtenGuards {
+		t.setGuardRevision(subID, prefix, ts)
+	}
+	return true
+}
+
+func (t *Tracker) guardRevision(subID, prefix string) int64 {
+	return t.guardAt[subID][prefix]
+}
+
+func (t *Tracker) setGuardRevision(subID, prefix string, ts int64) {
+	if ts < t.guardRevision(subID, prefix) {
+		return
+	}
+	if t.guardAt[subID] == nil {
+		t.guardAt[subID] = make(map[string]int64)
+	}
+	t.guardAt[subID][prefix] = ts
 }
 
 // guardResultPrefix is the name-and-params identity of a cached guard result,
@@ -454,8 +561,9 @@ func (t *Tracker) GetGuardFingerprint(sub *Subscription, guardName string, param
 
 // UpdateGuardFingerprint replaces the cached guard result on subID. It reports
 // whether the fingerprint changed, and changes nothing if the client's identity
-// changed since authEpoch was read.
-func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsHash string, newValue string, authEpoch int) bool {
+// changed since authEpoch was read or a newer execution already published this
+// guard result.
+func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsHash string, newValue string, authEpoch int, ts int64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	sub, exists := t.subscriptions[subID]
@@ -472,6 +580,11 @@ func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsH
 	}
 
 	prefix := "*guard_" + guardName + "_" + paramsHash + ":"
+	if t.guardRevision(subID, prefix) > ts {
+		slog.Debug("Tracker: Dropping stale guard fingerprint", "subID", subID, "guard", guardName)
+		return false
+	}
+	t.setGuardRevision(subID, prefix, ts)
 	newTag := prefix + newValue
 	var oldTag string
 	for tag := range t.subToTags[subID] {
@@ -500,8 +613,11 @@ func (t *Tracker) UpdateGuardFingerprint(subID string, guardName string, paramsH
 
 // DropGuards discards every cached guard result on the query attached to
 // guardID, along with its guard subscriptions, so the query's next run must
-// execute its guards again. It is a no-op if guardID is no longer tracked.
-func (t *Tracker) DropGuards(guardID string) {
+// execute its guards again. It is a no-op if guardID is no longer tracked or
+// a newer execution has already published this query's guard state. ts is the
+// execution that decided the guard could not be revalidated; zero means the
+// caller is unversioned and the drop always applies.
+func (t *Tracker) DropGuards(guardID string, ts int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	guard, ok := t.subscriptions[guardID]
@@ -513,6 +629,10 @@ func (t *Tracker) DropGuards(guardID string) {
 		t.removeSubscription(guardID)
 		return
 	}
+	if ts > 0 && t.executionSuperseded(querySub, ts) {
+		slog.Debug("Tracker: Keeping newer guard state", "subID", querySub.SubID, "guard", guardID)
+		return
+	}
 	for _, linkedID := range querySub.LinkedSubIDs {
 		t.removeSubscription(linkedID)
 	}
@@ -521,12 +641,35 @@ func (t *Tracker) DropGuards(guardID string) {
 		if !strings.HasPrefix(tag, "*guard_") {
 			continue
 		}
+		prefix := guardResultPrefix(tag)
 		delete(t.subToTags[querySub.SubID], tag)
 		delete(t.tagsToSubs[tag], querySub.SubID)
 		if len(t.tagsToSubs[tag]) == 0 {
 			delete(t.tagsToSubs, tag)
 		}
+		if prefix != "" && ts > 0 {
+			t.setGuardRevision(querySub.SubID, prefix, ts)
+		}
 	}
+}
+
+// executionSuperseded reports whether a newer execution than ts has already
+// published dependency or guard state for querySub. Callers must hold t.mu.
+func (t *Tracker) executionSuperseded(querySub *Subscription, ts int64) bool {
+	if t.depsAt[querySub.SubID] > ts {
+		return true
+	}
+	for _, id := range querySub.LinkedSubIDs {
+		if t.depsAt[id] > ts {
+			return true
+		}
+	}
+	for _, at := range t.guardAt[querySub.SubID] {
+		if at > ts {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Tracker) GetSubscriptionsToTag(tag string) []*Subscription {

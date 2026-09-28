@@ -26,6 +26,12 @@ func assertTrackerEmpty(t *testing.T, tr *Tracker) {
 	if len(tr.tagsToSubs) != 0 {
 		t.Errorf("tagsToSubs not empty: got %d entries", len(tr.tagsToSubs))
 	}
+	if len(tr.depsAt) != 0 {
+		t.Errorf("depsAt not empty: got %d entries", len(tr.depsAt))
+	}
+	if len(tr.guardAt) != 0 {
+		t.Errorf("guardAt not empty: got %d entries", len(tr.guardAt))
+	}
 }
 
 func assertTrackerConsistent(t *testing.T, tr *Tracker) {
@@ -300,12 +306,12 @@ func TestDropGuardsClearsGuardResultsAndSubscriptions(t *testing.T) {
 	epoch := client.GetAuth().AuthEpoch
 
 	sub := tr.SubscribeToQuery(client.ID, "q", "k", nil)
-	tr.AttachGuardToSubscription(sub.SubID, "guard-a", "a", map[string]interface{}{}, []string{"perms-a"}, epoch)
-	tr.AttachGuardToSubscription(sub.SubID, "guard-b", "b", map[string]interface{}{}, []string{"perms-b"}, epoch)
+	tr.AttachGuardToSubscription(sub.SubID, "guard-a", "a", map[string]interface{}{}, []string{"perms-a"}, epoch, 1)
+	tr.AttachGuardToSubscription(sub.SubID, "guard-b", "b", map[string]interface{}{}, []string{"perms-b"}, epoch, 2)
 	identity := "*user_identity:alice"
 	tr.UpdateTags(sub.SubID, []string{"data", identity, "*guard_a_1:true", "*guard_b_1:true"})
 
-	tr.DropGuards("guard-a")
+	tr.DropGuards("guard-a", 0)
 
 	for _, guardID := range []string{"guard-a", "guard-b"} {
 		if _, ok := tr.GetSubscription(guardID); ok {
@@ -329,6 +335,76 @@ func TestDropGuardsClearsGuardResultsAndSubscriptions(t *testing.T) {
 		if n := len(tr.GetSubscriptionsToTag(tag)); n != 0 {
 			t.Errorf("GetSubscriptionsToTag(%q) = %d subs, want 0", tag, n)
 		}
+	}
+	assertTrackerConsistent(t, tr)
+}
+
+func TestOlderExecutionDoesNotOverwriteDependencyOrGuardState(t *testing.T) {
+	tr := NewTracker()
+	client := NewClient(nil)
+	tr.Track(client)
+	epoch := client.GetAuth().AuthEpoch
+	sub := tr.SubscribeToQuery(client.ID, "q", "k", nil)
+
+	if !tr.CommitQueryResult(sub.SubID, []string{"data2", "*guard_allow_1:2"}, []byte("new"), epoch, 20) {
+		t.Fatal("newer commit rejected")
+	}
+	if !tr.CommitQueryResult(sub.SubID, []string{"data1", "*guard_allow_1:1"}, []byte("old"), epoch, 10) {
+		t.Fatal("older result frame was not delivered")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, "data2") || tr.SubscriptionHasTag(sub.SubID, "data1") {
+		t.Fatal("older query overwrote dependency tags")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, "*guard_allow_1:2") || tr.SubscriptionHasTag(sub.SubID, "*guard_allow_1:1") {
+		t.Fatal("older query overwrote the guard result")
+	}
+	var frames []string
+	for i := 0; i < 2; i++ {
+		select {
+		case msg := <-client.Send:
+			frames = append(frames, string(msg))
+		default:
+			t.Fatal("missing result frame")
+		}
+	}
+	if len(frames) != 2 || frames[0] != "new" || frames[1] != "old" {
+		t.Fatalf("frames = %v, want [new, old]", frames)
+	}
+
+	if tr.UpdateTagsAtEpoch(sub.SubID, []string{"data0"}, epoch, 5) {
+		t.Fatal("older dependency update was applied")
+	}
+	if !tr.UpdateGuardFingerprint(sub.SubID, "allow", "1", "9", epoch, 30) {
+		t.Fatal("newer guard result was not stored")
+	}
+	if !tr.CommitQueryResult(sub.SubID, []string{"data25", "*guard_allow_1:2"}, []byte("mid"), epoch, 25) {
+		t.Fatal("dependency update between the two guard results was rejected")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, "data25") || tr.SubscriptionHasTag(sub.SubID, "data2") {
+		t.Fatal("query did not refresh dependencies around a newer guard result")
+	}
+	if !tr.SubscriptionHasTag(sub.SubID, "*guard_allow_1:9") || tr.SubscriptionHasTag(sub.SubID, "*guard_allow_1:2") {
+		t.Fatal("query older than the guard result overwrote the fingerprint")
+	}
+
+	params := map[string]interface{}{}
+	other := tr.SubscribeToQuery(client.ID, "other", "k2", params)
+	tr.AttachGuardToSubscription(other.SubID, "g-new", "allow", params, []string{"data2"}, epoch, 2)
+	tr.AttachGuardToSubscription(other.SubID, "g-old", "allow", params, []string{"data1"}, epoch, 1)
+	if _, ok := tr.GetSubscription("g-old"); ok {
+		t.Fatal("older guard attachment replaced the newer guard")
+	}
+	if !tr.SubscriptionHasTag("g-new", "data2") || tr.SubscriptionHasTag("g-new", "data1") {
+		t.Fatal("older guard attachment overwrote dependency tags")
+	}
+
+	tr.DropGuards("g-new", 1)
+	if _, ok := tr.GetSubscription("g-new"); !ok {
+		t.Fatal("older guard failure removed a newer guard")
+	}
+	tr.DropGuards("g-new", 2)
+	if _, ok := tr.GetSubscription("g-new"); ok {
+		t.Fatal("guard failure at the publishing execution did not drop it")
 	}
 	assertTrackerConsistent(t, tr)
 }
