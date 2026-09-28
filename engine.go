@@ -124,6 +124,8 @@ func (defaultAuth) VerifyToken(_ *gorm.DB, _ string) (string, time.Time, error) 
 func getIdentity(deps *[]string, authID string) (string, error) {
 	if authID != "" {
 		*deps = append(*deps, "*user_identity:"+authID)
+	} else {
+		*deps = append(*deps, "*user_identity:anonymous")
 	}
 	return authID, nil
 }
