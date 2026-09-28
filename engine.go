@@ -347,6 +347,11 @@ func (e *Engine) RegisterCron(cronName string, cronString string, functionName s
 		slog.Error("Failed to calculate next cron time", "error", err)
 		return "", err
 	}
+	if nextTime.IsZero() {
+		err := fmt.Errorf("impossible cron schedule with no future occurrences: %s", cronString)
+		slog.Error("Failed to register cron", "error", err, "name", cronName)
+		return "", err
+	}
 	task := TetherTask{
 		ID:           uuid.New().String(),
 		Name:         cronName,
