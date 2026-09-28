@@ -2817,7 +2817,67 @@ func TestAuthFrameDoesNotLeakToken(t *testing.T) {
 	if strings.Contains(logged, secret) {
 		t.Fatalf("debug logs contain the token:\n%s", logged)
 	}
-	for _, want := range []string{"WS: Received message", "WS: Unmarshalled message", "Received message", "[redacted]"} {
+	for _, want := range []string{"WS: Received message", "Received message"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("debug logs missing %q:\n%s", want, logged)
+		}
+	}
+}
+
+// Login/refresh mutations take credentials in params and return them in
+// results; neither may reach a framework log at any level.
+func TestParamsAndResultsDoNotLeakToLogs(t *testing.T) {
+	const (
+		paramSecret  = "audit-synthetic-param-secret"
+		resultSecret = "audit-synthetic-result-secret"
+	)
+
+	var logs syncBuffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	e := newTestEngine(t)
+	e.RegisterMutation("login", func(ctx *MutationCtx) interface{} {
+		return map[string]interface{}{"refresh_token": resultSecret}
+	})
+	e.RegisterMutation("internalLogin", func(ctx *MutationCtx) interface{} {
+		return map[string]interface{}{"refresh_token": resultSecret}
+	}, MutationOptions{Internal: true})
+	e.RegisterQuery("session", func(ctx *QueryCtx) interface{} {
+		return map[string]interface{}{"refresh_token": resultSecret}
+	})
+	client := trackClient(t, e)
+	params := func() map[string]interface{} {
+		return map[string]interface{}{"password": paramSecret, "nested": map[string]interface{}{"x": paramSecret}}
+	}
+
+	frames := []map[string]interface{}{
+		{"type": "mutation", "location": "login", "params": params(), "mutation_id": "m1"},
+		{"type": "mutation", "location": "missing", "params": params(), "mutation_id": "m2"},
+		{"type": "mutation", "location": "login", "params": params()},
+		{"type": "subscribe", "location": "session", "params": params(), "query_key": "q1"},
+		{"type": "subscribe", "location": "missing", "params": params(), "query_key": "q2"},
+		{"type": "subscribe", "location": "session", "params": paramSecret, "query_key": "q3"},
+		{"type": "unsubscribe", "location": "session", "params": params()},
+		{"type": map[string]interface{}{"password": paramSecret}, "params": params()},
+		{"type": "auth", "token": map[string]interface{}{"password": paramSecret}},
+	}
+	for _, frame := range frames {
+		_ = e.onReceiveMessage(client.ID, frame)
+	}
+	if _, err := e.executeMutationInternal("internalLogin", params()); err != nil {
+		t.Fatalf("executeMutationInternal: %v", err)
+	}
+	drain(client)
+
+	logged := logs.String()
+	for _, secret := range []string{paramSecret, resultSecret} {
+		if strings.Contains(logged, secret) {
+			t.Fatalf("debug logs contain %q:\n%s", secret, logged)
+		}
+	}
+	for _, want := range []string{"Executed mutation", "Executing query", "Failed to execute mutation", "Failed to execute query", "Invalid message"} {
 		if !strings.Contains(logged, want) {
 			t.Fatalf("debug logs missing %q:\n%s", want, logged)
 		}

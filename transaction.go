@@ -265,7 +265,7 @@ func notifyPayloads(senderID string, tags []string) []string {
 	for _, tag := range tags {
 		encoded, _ := json.Marshal(tag)
 		if len(prefix)+len(encoded)+len(suffix) >= maxNotifyPayload {
-			slog.Error("Tag too large to send via PostgreSQL notification", "tag", tag)
+			slog.Error("Tag too large to send via PostgreSQL notification", "bytes", len(encoded))
 			continue
 		}
 		if b.Len() > 0 && b.Len()+1+len(encoded)+len(suffix) >= maxNotifyPayload {

@@ -358,7 +358,7 @@ func (t *Tracker) SubscribeToQuery(clientID string, query string, queryKey strin
 	}
 	t.subscriptions[subID] = sub
 	t.clientToSubs[clientID][subID] = struct{}{}
-	slog.Debug("Tracker: Subscribed to query", "query", query, "clientID", clientID, "params", params)
+	slog.Debug("Tracker: Subscribed to query", "query", query, "clientID", clientID)
 	return sub
 }
 
@@ -381,7 +381,7 @@ func (t *Tracker) UnsubscribeFromQuery(clientID string, query string, params map
 		}
 	}
 	t.removeSubscription(subID)
-	slog.Debug("Tracker: Unsubscribed from query", "query", query, "clientID", clientID, "params", params)
+	slog.Debug("Tracker: Unsubscribed from query", "query", query, "clientID", clientID)
 }
 
 func (t *Tracker) UpdateTags(subID string, newTags []string) {
