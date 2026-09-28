@@ -16,7 +16,7 @@ func TestEffectiveUploadLimits(t *testing.T) {
 		nil,
 	)
 	if maxBytes != 1234 || expiresIn != time.Hour {
-		t.Fatalf("adapter defaults = %d, %s", maxBytes, expiresIn)
+		t.Fatalf("defaults = %d, %s", maxBytes, expiresIn)
 	}
 
 	maxBytes, expiresIn = EffectiveUploadLimits(

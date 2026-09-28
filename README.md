@@ -71,51 +71,54 @@ func main() {
 		log.Fatal(err)
 	}
 
-	engine := tether.NewEngine(db)
+	engine, err := tether.NewEngine(db)
+	if err != nil {
+		log.Fatal(err)
+	}
 	defer engine.Close()
 	engine.CreateTable(&Message{})
 	engine.CreateTable(&RoomMember{})
 
 	// A reusable authorization check. Its result is cached per user and
 	// re-evaluated automatically when room membership changes.
-	engine.RegisterGuard("isMember", func(ctx *tether.GuardCtx) interface{} {
+	engine.RegisterGuard("isMember", func(ctx *tether.GuardCtx) (any, error) {
 		userID, err := ctx.Auth.GetIdentity()
 		if err != nil {
-			return false
+			return false, nil
 		}
 		ctx.TrackCollection("room_members", "user_id", userID)
 
 		var member RoomMember
 		err = ctx.DB.Where("user_id = ? AND room_id = ?", userID, ctx.Params["room"]).First(&member).Error
-		return err == nil
+		return err == nil, nil
 	})
 
 	// A live query. Subscribers get a fresh result whenever the messages
 	// in this room change.
-	engine.RegisterQuery("getMessages", func(ctx *tether.QueryCtx) interface{} {
+	engine.RegisterQuery("getMessages", func(ctx *tether.QueryCtx) (any, error) {
 		room := ctx.Params["room"].(string)
 		allowed, err := ctx.Auth.ExecuteGuard("isMember", map[string]interface{}{"room": room})
 		if err != nil || allowed != true {
-			return errors.New("forbidden")
+			return nil, errors.New("forbidden")
 		}
 
 		ctx.TrackCollection("messages", "room_id", room)
 		var messages []Message
 		ctx.DB.Where("room_id = ?", room).Find(&messages)
-		return messages
+		return messages, nil
 	})
 
 	// Mutations don't need to notify anyone. Tether sees the write and
 	// updates every affected query on its own.
-	engine.RegisterMutation("sendMessage", func(ctx *tether.MutationCtx) interface{} {
+	engine.RegisterMutation("sendMessage", func(ctx *tether.MutationCtx) (any, error) {
 		message := Message{
 			Body:   ctx.Params["body"].(string),
 			RoomID: ctx.Params["room"].(string),
 		}
 		if err := ctx.DB.Create(&message).Error; err != nil {
-			return errors.New(err.Error())
+			return nil, errors.New(err.Error())
 		}
-		return message
+		return message, nil
 	})
 
 	http.HandleFunc("/tether", engine.Handle)

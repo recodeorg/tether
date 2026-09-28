@@ -1,4 +1,4 @@
-package utilities
+package tether
 
 import (
 	"strings"
@@ -242,7 +242,7 @@ func TestSanitizeMetricsUnattributedEmptyID(t *testing.T) {
 
 func TestStartWithCallbackRecoversFlushPanic(t *testing.T) {
 	var calls atomic.Int32
-	p := NewProfiler(func(string) {
+	p := newProfiler(func(string) {
 		if calls.Add(1) == 1 {
 			panic("flush boom")
 		}

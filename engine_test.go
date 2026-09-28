@@ -28,7 +28,6 @@ import (
 	"github.com/recodeorg/tether/internal/reactivity"
 	"github.com/recodeorg/tether/storage"
 	"github.com/recodeorg/tether/storage/local"
-	"github.com/recodeorg/tether/utilities"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -70,7 +69,7 @@ type stubAuth struct {
 	sawDB     bool
 }
 
-func (a *stubAuth) VerifyToken(db *gorm.DB, token string) (string, time.Time, error) {
+func (a *stubAuth) VerifyToken(ctx context.Context, db *gorm.DB, token string) (string, time.Time, error) {
 	a.tokens = append(a.tokens, token)
 	a.sawDB = db != nil
 	if a.err != nil {
@@ -330,9 +329,9 @@ func TestCompletedOneShotTasksReleaseTaskTimers(t *testing.T) {
 	// the same database; :memory: would give each connection an empty schema.
 	e := newConcurrentTestEngine(t)
 	var ran atomic.Int32
-	e.RegisterMutation("scheduledTick", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("scheduledTick", func(ctx *MutationCtx) (any, error) {
 		ran.Add(1)
-		return nil
+		return nil, nil
 	})
 
 	const n = 25
@@ -399,7 +398,7 @@ func TestCompletedOneShotTasksReleaseTaskTimers(t *testing.T) {
 func TestNearTermScheduledTaskPanicIsRecovered(t *testing.T) {
 	if os.Getenv("TETHER_TEST_CHILD") == "1" {
 		e := newConcurrentTestEngine(t)
-		e.RegisterMutation("boom", func(ctx *MutationCtx) interface{} {
+		e.RegisterMutation("boom", func(ctx *MutationCtx) (any, error) {
 			panic("scheduled boom")
 		})
 		id, err := e.scheduleTask(time.Now(), "boom", nil)
@@ -421,9 +420,9 @@ func TestNearTermScheduledTaskPanicIsRecovered(t *testing.T) {
 		}
 
 		var ran atomic.Bool
-		e.RegisterMutation("ok", func(ctx *MutationCtx) interface{} {
+		e.RegisterMutation("ok", func(ctx *MutationCtx) (any, error) {
 			ran.Store(true)
-			return nil
+			return nil, nil
 		})
 		if _, err := e.scheduleTask(time.Now(), "ok", nil); err != nil {
 			t.Fatalf("schedule follow-up task: %v", err)
@@ -608,11 +607,11 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 
 func TestCloseStopsBackgroundLoops(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir())
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	e.SetStorage(store)
+	e.SetStorage(store, "")
 
 	done := make(chan struct{})
 	go func() {
@@ -636,9 +635,9 @@ func TestCloseStopsBackgroundLoops(t *testing.T) {
 func TestCloseStopsScheduledTaskTimers(t *testing.T) {
 	e := newConcurrentTestEngine(t)
 	var ran atomic.Int32
-	e.RegisterMutation("tick", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("tick", func(ctx *MutationCtx) (any, error) {
 		ran.Add(1)
-		return nil
+		return nil, nil
 	})
 
 	// Long enough that neither timer fires before Close on a remote database.
@@ -699,10 +698,10 @@ func TestCloseWaitsForRunningScheduledTask(t *testing.T) {
 	e := newConcurrentTestEngine(t)
 	started := make(chan struct{})
 	release := make(chan struct{})
-	e.RegisterMutation("slow", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("slow", func(ctx *MutationCtx) (any, error) {
 		close(started)
 		<-release
-		return nil
+		return nil, nil
 	})
 	id, err := e.scheduleTask(time.Now(), "slow", nil)
 	if err != nil {
@@ -793,11 +792,11 @@ func TestAuthExpiryTimerReplacedAndStoppedOnUntrack(t *testing.T) {
 func TestCloseStopsProfilerFlush(t *testing.T) {
 	e := newConcurrentTestEngine(t)
 	var flushes atomic.Int32
-	e.RegisterMutation("flush", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("flush", func(ctx *MutationCtx) (any, error) {
 		flushes.Add(1)
-		return nil
+		return nil, nil
 	})
-	if err := e.Profiler.StartWithCallback(10*time.Millisecond, "flush"); err != nil {
+	if err := e.Profiler().StartWithCallback(10*time.Millisecond, "flush"); err != nil {
 		t.Fatalf("start profiler: %v", err)
 	}
 	if !waitUntil(t, 2*time.Second, func() bool { return flushes.Load() > 0 }) {
@@ -805,7 +804,7 @@ func TestCloseStopsProfilerFlush(t *testing.T) {
 	}
 
 	e.Close()
-	if e.Profiler.IsActive() {
+	if e.Profiler().IsActive() {
 		t.Fatal("profiler still active after Close")
 	}
 	after := flushes.Load()
@@ -821,16 +820,16 @@ func TestTrackCollectionAndTrackTableTagFormat(t *testing.T) {
 	ctx.TrackTable("messages")
 
 	want := []string{"messages_room_id:lobby", "messages_room_id:5", "table_messages:mutated"}
-	if !slices.Equal(ctx.Dependencies, want) {
-		t.Errorf("Dependencies = %v, want %v", ctx.Dependencies, want)
+	if !slices.Equal(ctx.dependencies, want) {
+		t.Errorf("dependencies = %v, want %v", ctx.dependencies, want)
 	}
 
 	guard := &GuardCtx{}
 	guard.TrackCollection("room_members", "user_id", "user-7")
 	guard.TrackTable("room_members")
 	wantGuard := []string{"room_members_user_id:user-7", "table_room_members:mutated"}
-	if !slices.Equal(guard.Dependencies, wantGuard) {
-		t.Errorf("GuardCtx.Dependencies = %v, want %v", guard.Dependencies, wantGuard)
+	if !slices.Equal(guard.dependencies, wantGuard) {
+		t.Errorf("GuardCtx.dependencies = %v, want %v", guard.dependencies, wantGuard)
 	}
 }
 
@@ -945,15 +944,15 @@ func TestCreateInvalidatesTrackCollection(t *testing.T) {
 	client := trackClient(t, e)
 
 	var runs atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		roomID := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", roomID)
 		var msgs []testMessage
 		if err := ctx.DB.Where("room_id = ?", roomID).Find(&msgs).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msgs
+		return msgs, nil
 	})
 
 	subscribe(t, e, client, "getMessages", "lobby", map[string]interface{}{"room": "lobby"})
@@ -962,12 +961,12 @@ func TestCreateInvalidatesTrackCollection(t *testing.T) {
 	}
 	drain(client)
 
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		msg := testMessage{Body: ctx.Params["body"].(string), RoomID: ctx.Params["room"].(string)}
 		if err := ctx.DB.Create(&msg).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msg
+		return msg, nil
 	})
 	if _, err := e.executeMutation("createMessage", map[string]interface{}{"body": "hi", "room": "lobby"}, client.ID, "m1"); err != nil {
 		t.Fatalf("ExecuteMutation: %v", err)
@@ -986,19 +985,19 @@ func TestCreateDoesNotInvalidateOtherCollections(t *testing.T) {
 	client := trackClient(t, e)
 
 	var lobbyRuns, otherRuns atomic.Int64
-	e.RegisterQuery("getLobby", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getLobby", func(ctx *QueryCtx) (any, error) {
 		lobbyRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
-	e.RegisterQuery("getOther", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getOther", func(ctx *QueryCtx) (any, error) {
 		otherRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "other")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "other").Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
 
 	subscribe(t, e, client, "getLobby", "lobby", nil)
@@ -1028,25 +1027,25 @@ func TestUpdateInvalidatesPrimaryKeyAndCollectionTags(t *testing.T) {
 	}
 
 	var pkRuns, colRuns, otherRuns atomic.Int64
-	e.RegisterQuery("byID", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("byID", func(ctx *QueryCtx) (any, error) {
 		pkRuns.Add(1)
 		var got testMessage
 		ctx.DB.First(&got, msg.ID)
-		return got
+		return got, nil
 	})
-	e.RegisterQuery("byRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("byRoom", func(ctx *QueryCtx) (any, error) {
 		colRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
-	e.RegisterQuery("otherRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("otherRoom", func(ctx *QueryCtx) (any, error) {
 		otherRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "other")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "other").Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
 
 	subscribe(t, e, client, "byID", "id", nil)
@@ -1081,12 +1080,12 @@ func TestDeleteInvalidatesTrackedTags(t *testing.T) {
 	}
 
 	var runs atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
 	subscribe(t, e, client, "getMessages", "lobby", nil)
 	if runs.Load() != 1 {
@@ -1115,23 +1114,23 @@ func TestDeleteByIDInvalidatesCollectionCount(t *testing.T) {
 	}
 
 	var roomRuns, otherRuns atomic.Int64
-	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) (any, error) {
 		roomRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "r")
 		var n int64
 		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return n
+		return n, nil
 	})
-	e.RegisterQuery("countOther", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("countOther", func(ctx *QueryCtx) (any, error) {
 		otherRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "other")
 		var n int64
 		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "other").Count(&n).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return n
+		return n, nil
 	})
 	subscribe(t, e, client, "countRoom", "room", nil)
 	subscribe(t, e, client, "countOther", "other", nil)
@@ -1176,14 +1175,14 @@ func TestBatchDeleteByIDsInvalidatesCollectionCount(t *testing.T) {
 	}
 
 	var runs atomic.Int64
-	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "r")
 		var n int64
 		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return n
+		return n, nil
 	})
 	subscribe(t, e, client, "countRoom", "room", nil)
 	drain(client)
@@ -1217,14 +1216,14 @@ func TestPredicateDeleteInvalidatesCollectionCounts(t *testing.T) {
 
 	var roomRuns, otherRuns atomic.Int64
 	registerCount := func(name, room string, runs *atomic.Int64) {
-		e.RegisterQuery(name, func(ctx *QueryCtx) interface{} {
+		e.RegisterQuery(name, func(ctx *QueryCtx) (any, error) {
 			runs.Add(1)
 			ctx.TrackCollection("messages", "room_id", room)
 			var n int64
 			if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", room).Count(&n).Error; err != nil {
-				return map[string]interface{}{"error": err.Error()}
+				return map[string]interface{}{"error": err.Error()}, nil
 			}
-			return n
+			return n, nil
 		})
 	}
 	registerCount("countRoom", "r", &roomRuns)
@@ -1264,15 +1263,15 @@ func TestMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
 	}
 
 	var oldRuns, newRuns atomic.Int64
-	e.RegisterQuery("oldRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("oldRoom", func(ctx *QueryCtx) (any, error) {
 		oldRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "old")
-		return "old"
+		return "old", nil
 	})
-	e.RegisterQuery("newRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("newRoom", func(ctx *QueryCtx) (any, error) {
 		newRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "new")
-		return "new"
+		return "new", nil
 	})
 	subscribe(t, e, client, "oldRoom", "old", nil)
 	subscribe(t, e, client, "newRoom", "new", nil)
@@ -1300,15 +1299,15 @@ func TestMapUpdatesMovingRecordInvalidatesOldAndNewCollections(t *testing.T) {
 	}
 
 	var oldRuns, newRuns atomic.Int64
-	e.RegisterQuery("oldRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("oldRoom", func(ctx *QueryCtx) (any, error) {
 		oldRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "old")
-		return "old"
+		return "old", nil
 	})
-	e.RegisterQuery("newRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("newRoom", func(ctx *QueryCtx) (any, error) {
 		newRuns.Add(1)
 		ctx.TrackCollection("messages", "room_id", "new")
-		return "new"
+		return "new", nil
 	})
 	subscribe(t, e, client, "oldRoom", "old", nil)
 	subscribe(t, e, client, "newRoom", "new", nil)
@@ -1335,11 +1334,11 @@ func TestMapUpdatesInvalidateLoadedRecord(t *testing.T) {
 	}
 
 	var runs atomic.Int64
-	e.RegisterQuery("byID", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("byID", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		var got testMessage
 		ctx.DB.First(&got, msg.ID)
-		return got
+		return got, nil
 	})
 	subscribe(t, e, client, "byID", "id", nil)
 
@@ -1370,21 +1369,21 @@ func TestPredicateUpdateInvalidatesAutoTrackedPrimaryKey(t *testing.T) {
 	}
 
 	var updatedRuns, otherRuns atomic.Int64
-	e.RegisterQuery("updatedNote", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("updatedNote", func(ctx *QueryCtx) (any, error) {
 		updatedRuns.Add(1)
 		var got testNote
 		if err := ctx.DB.First(&got, note.NoteID).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return got
+		return got, nil
 	})
-	e.RegisterQuery("otherNote", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("otherNote", func(ctx *QueryCtx) (any, error) {
 		otherRuns.Add(1)
 		var got testNote
 		if err := ctx.DB.First(&got, other.NoteID).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return got
+		return got, nil
 	})
 	subscribe(t, e, client, "updatedNote", "updated", nil)
 	subscribe(t, e, client, "otherNote", "other", nil)
@@ -1425,10 +1424,10 @@ func TestAutoTrackRecordsLoadedIDs(t *testing.T) {
 		t.Fatalf("seed Create: %v", err)
 	}
 
-	e.RegisterQuery("getOne", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getOne", func(ctx *QueryCtx) (any, error) {
 		var got testMessage
 		ctx.DB.First(&got, msg.ID)
-		return got
+		return got, nil
 	})
 	sub := subscribe(t, e, client, "getOne", "one", nil)
 
@@ -1450,10 +1449,10 @@ func TestAutoTrackSliceLoadsEveryID(t *testing.T) {
 		t.Fatalf("seed Create: %v", err)
 	}
 
-	e.RegisterQuery("getAll", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getAll", func(ctx *QueryCtx) (any, error) {
 		var got []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&got)
-		return got
+		return got, nil
 	})
 	sub := subscribe(t, e, client, "getAll", "all", nil)
 
@@ -1477,10 +1476,10 @@ func TestAutoTrackRequiresExportedIDField(t *testing.T) {
 		t.Fatalf("Create note: %v", err)
 	}
 
-	e.RegisterQuery("getNote", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getNote", func(ctx *QueryCtx) (any, error) {
 		var got testNote
 		ctx.DB.First(&got, note.NoteID)
-		return got
+		return got, nil
 	})
 	sub := subscribe(t, e, client, "getNote", "note", nil)
 
@@ -1496,7 +1495,7 @@ func TestQueryWriteDoesNotMutateOrRetrigger(t *testing.T) {
 
 	var runs atomic.Int64
 	var writeErr atomic.Value
-	e.RegisterQuery("returnCount", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("returnCount", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		var msgs []testMessage
 		if err := ctx.DB.Table("messages").Select("*").Find(&msgs).Error; err != nil {
@@ -1509,7 +1508,7 @@ func TestQueryWriteDoesNotMutateOrRetrigger(t *testing.T) {
 		} else {
 			writeErr.Store("")
 		}
-		return len(msgs)
+		return len(msgs), nil
 	})
 	subscribe(t, e, client, "returnCount", "k", nil)
 	if got := runs.Load(); got != 1 {
@@ -1715,9 +1714,9 @@ func TestQueryRejectsEveryWritePath(t *testing.T) {
 	seedReadOnlyWriteAttempts(t, e)
 
 	var errs map[string]error
-	e.RegisterQuery("writer", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("writer", func(ctx *QueryCtx) (any, error) {
 		errs = runReadOnlyWriteAttempts(ctx.DB)
-		return nil
+		return nil, nil
 	})
 	subscribe(t, e, client, "writer", "k", nil)
 	checkReadOnlyWriteAttempts(t, e, errs)
@@ -1729,15 +1728,15 @@ func TestGuardRejectsEveryWritePath(t *testing.T) {
 	seedReadOnlyWriteAttempts(t, e)
 
 	var errs map[string]error
-	e.RegisterGuard("writer", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("writer", func(ctx *GuardCtx) (any, error) {
 		errs = runReadOnlyWriteAttempts(ctx.DB)
-		return true
+		return true, nil
 	})
-	e.RegisterQuery("guarded", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("guarded", func(ctx *QueryCtx) (any, error) {
 		if _, err := ctx.Auth.ExecuteGuard("writer", map[string]interface{}{}); err != nil {
 			t.Errorf("ExecuteGuard: %v", err)
 		}
-		return nil
+		return nil, nil
 	})
 	subscribe(t, e, client, "guarded", "k", nil)
 	checkReadOnlyWriteAttempts(t, e, errs)
@@ -1749,15 +1748,15 @@ func TestMutationGuardRejectsWrites(t *testing.T) {
 	seedReadOnlyWriteAttempts(t, e)
 
 	var errs map[string]error
-	e.RegisterGuard("writer", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("writer", func(ctx *GuardCtx) (any, error) {
 		errs = runReadOnlyWriteAttempts(ctx.DB)
-		return true
+		return true, nil
 	})
-	e.RegisterMutation("guarded", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("guarded", func(ctx *MutationCtx) (any, error) {
 		if _, err := ctx.Auth.ExecuteGuard("writer", map[string]interface{}{}); err != nil {
 			t.Errorf("ExecuteGuard: %v", err)
 		}
-		return nil
+		return nil, nil
 	})
 	if _, err := e.executeMutation("guarded", map[string]interface{}{}, client.ID, "m1"); err != nil {
 		t.Fatalf("executeMutation: %v", err)
@@ -1812,11 +1811,11 @@ func TestQueryReadPathsStillWork(t *testing.T) {
 
 	got := map[string]int64{}
 	errs := map[string]error{}
-	e.RegisterQuery("reader", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("reader", func(ctx *QueryCtx) (any, error) {
 		for _, read := range reads {
 			got[read.name], errs[read.name] = read.run(ctx.DB)
 		}
-		return nil
+		return nil, nil
 	})
 	subscribe(t, e, client, "reader", "k", nil)
 	for _, read := range reads {
@@ -1831,12 +1830,12 @@ func TestTrackTableIsInvalidatedByMutations(t *testing.T) {
 	client := trackClient(t, e)
 
 	var runs atomic.Int64
-	e.RegisterQuery("allMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("allMessages", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackTable("messages")
 		var msgs []testMessage
 		ctx.DB.Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
 	subscribe(t, e, client, "allMessages", "all", nil)
 
@@ -1854,10 +1853,10 @@ func TestInvalidateTagRerunsEverySubscriber(t *testing.T) {
 	b := trackClient(t, e)
 
 	var runs atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
-		return []testMessage{}
+		return []testMessage{}, nil
 	})
 	subscribe(t, e, a, "getMessages", "a", map[string]interface{}{"who": "a"})
 	subscribe(t, e, b, "getMessages", "b", map[string]interface{}{"who": "b"})
@@ -1888,16 +1887,16 @@ func TestMutationOnOneClientPushesQueryToSubscribersOnly(t *testing.T) {
 	subscriber := trackClient(t, e)
 	mutator := trackClient(t, e)
 
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
-		return len(msgs)
+		return len(msgs), nil
 	})
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		msg := testMessage{Body: "hi", RoomID: "lobby"}
 		ctx.DB.Create(&msg)
-		return msg.ID
+		return msg.ID, nil
 	})
 
 	subscribe(t, e, subscriber, "getMessages", "lobby", nil)
@@ -1945,7 +1944,7 @@ func TestQueryFailureDoesNotPanicAndStillTracksCollections(t *testing.T) {
 	client := trackClient(t, e)
 
 	var runs atomic.Int64
-	e.RegisterQuery("brokenFind", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("brokenFind", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
@@ -1953,7 +1952,7 @@ func TestQueryFailureDoesNotPanicAndStillTracksCollections(t *testing.T) {
 		if err == nil {
 			t.Error("expected GORM error from invalid column")
 		}
-		return map[string]interface{}{"error": err.Error()}
+		return map[string]interface{}{"error": err.Error()}, nil
 	})
 
 	mustNoPanic(t, "failing query subscribe", func() {
@@ -1979,22 +1978,22 @@ func TestMutationFailureDoesNotPanicOrInvalidate(t *testing.T) {
 	client := trackClient(t, e)
 
 	var runs atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Find(&msgs)
-		return msgs
+		return msgs, nil
 	})
 	subscribe(t, e, client, "getMessages", "lobby", nil)
 	drain(client)
 
-	e.RegisterMutation("badCreate", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("badCreate", func(ctx *MutationCtx) (any, error) {
 		err := ctx.DB.Exec("INSERT INTO messages (not_a_column) VALUES (1)").Error
 		if err == nil {
-			return "unexpected success"
+			return "unexpected success", nil
 		}
-		return map[string]interface{}{"error": err.Error()}
+		return map[string]interface{}{"error": err.Error()}, nil
 	})
 
 	var result interface{}
@@ -2017,8 +2016,8 @@ func TestMutationFailureDoesNotPanicOrInvalidate(t *testing.T) {
 func TestMutationReturningErrorSendsErrorFrame(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterMutation("denied", func(ctx *MutationCtx) interface{} {
-		return errors.New("not logged in")
+	e.RegisterMutation("denied", func(ctx *MutationCtx) (any, error) {
+		return nil, errors.New("not logged in")
 	})
 
 	if _, err := e.executeMutation("denied", map[string]interface{}{}, client.ID, "m-denied"); err != nil {
@@ -2036,9 +2035,9 @@ func TestMutationReturningErrorSendsErrorFrame(t *testing.T) {
 
 func TestInternalOptionHidesFunctionsFromClients(t *testing.T) {
 	e := newTestEngine(t)
-	e.RegisterQuery("hidden", func(ctx *QueryCtx) interface{} { return "secret" }, Internal())
-	e.RegisterMutation("hidden", func(ctx *MutationCtx) interface{} { return "secret" }, Internal())
-	e.RegisterGuard("plain", func(ctx *GuardCtx) interface{} { return true })
+	e.RegisterQuery("hidden", func(ctx *QueryCtx) (any, error) { return "secret", nil }, Internal())
+	e.RegisterMutation("hidden", func(ctx *MutationCtx) (any, error) { return "secret", nil }, Internal())
+	e.RegisterGuard("plain", func(ctx *GuardCtx) (any, error) { return true, nil })
 
 	client := trackClient(t, e)
 	sub := e.tracker.SubscribeToQuery(client.ID, "hidden", "k", map[string]interface{}{})
@@ -2059,8 +2058,8 @@ func TestInternalOptionHidesFunctionsFromClients(t *testing.T) {
 
 func TestInternalMutationReturningErrorReturnsIt(t *testing.T) {
 	e := newTestEngine(t)
-	e.RegisterMutation("fails", func(ctx *MutationCtx) interface{} {
-		return errors.New("boom")
+	e.RegisterMutation("fails", func(ctx *MutationCtx) (any, error) {
+		return nil, errors.New("boom")
 	})
 
 	result, err := e.executeMutationInternal("fails", map[string]interface{}{})
@@ -2072,21 +2071,65 @@ func TestInternalMutationReturningErrorReturnsIt(t *testing.T) {
 	}
 }
 
+func TestScheduledMutationGetIdentityReturnsErrNoCaller(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterMutation("who", func(ctx *MutationCtx) (any, error) {
+		_, err := ctx.Auth.GetIdentity()
+		return nil, err
+	}, Internal())
+
+	_, err := e.executeMutationInternal("who", nil)
+	if !errors.Is(err, ErrNoCaller) {
+		t.Fatalf("GetIdentity error = %v, want ErrNoCaller", err)
+	}
+}
+
+func TestRegisteringANameTwicePanics(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterQuery("q", func(*QueryCtx) (any, error) { return nil, nil })
+	e.RegisterMutation("m", func(*MutationCtx) (any, error) { return nil, nil })
+	e.RegisterGuard("g", func(*GuardCtx) (any, error) { return true, nil })
+
+	assertPanic := func(name string, fn func()) {
+		t.Helper()
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Errorf("%s: duplicate registration did not panic", name)
+				return
+			}
+			if !strings.Contains(fmt.Sprint(r), "already registered") {
+				t.Errorf("%s: panic = %v, want already registered", name, r)
+			}
+		}()
+		fn()
+	}
+	assertPanic("query", func() {
+		e.RegisterQuery("q", func(*QueryCtx) (any, error) { return nil, nil })
+	})
+	assertPanic("mutation", func() {
+		e.RegisterMutation("m", func(*MutationCtx) (any, error) { return nil, nil })
+	})
+	assertPanic("guard", func() {
+		e.RegisterGuard("g", func(*GuardCtx) (any, error) { return true, nil })
+	})
+}
+
 func TestQueryReturningErrorSendsErrorFrameAndStaysLive(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		ctx.TrackCollection("messages", "room_id", "lobby")
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
 		if len(msgs) == 0 {
-			return errors.New("room is empty")
+			return nil, errors.New("room is empty")
 		}
-		return len(msgs)
+		return len(msgs), nil
 	})
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		ctx.DB.Create(&testMessage{Body: "hi", RoomID: "lobby"})
-		return nil
+		return nil, nil
 	})
 
 	subscribe(t, e, client, "getMessages", "lobby-key", nil)
@@ -2116,7 +2159,7 @@ func TestQueryReturningErrorSendsErrorFrameAndStaysLive(t *testing.T) {
 func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("noop", func(ctx *QueryCtx) interface{} { return "ok" })
+	e.RegisterQuery("noop", func(ctx *QueryCtx) (any, error) { return "ok", nil })
 	sub := e.tracker.SubscribeToQuery(client.ID, "noop", "k", map[string]interface{}{})
 
 	var err error
@@ -2131,7 +2174,7 @@ func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 func TestExecuteQueryUnserializableResultDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("bad", func(ctx *QueryCtx) interface{} { return make(chan int) })
+	e.RegisterQuery("bad", func(ctx *QueryCtx) (any, error) { return make(chan int), nil })
 	sub := e.tracker.SubscribeToQuery(client.ID, "bad", "k", map[string]interface{}{})
 
 	var err error
@@ -2217,14 +2260,14 @@ func TestStaleInvalidationOrdersTimestamps(t *testing.T) {
 	defer releaseQuery()
 
 	params := map[string]interface{}{}
-	e.RegisterQuery("counter", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("counter", func(ctx *QueryCtx) (any, error) {
 		ctx.TrackCollection("widgets", "id", "1")
 		v := version.Load()
 		if pause.CompareAndSwap(true, false) {
 			close(started)
 			<-release
 		}
-		return map[string]interface{}{"v": v}
+		return map[string]interface{}{"v": v}, nil
 	})
 
 	subscribe(t, e, client, "counter", "k", params)
@@ -2300,7 +2343,7 @@ func TestStaleExecutionDoesNotOverwriteDependencies(t *testing.T) {
 	defer releaseQuery()
 
 	var runs atomic.Int64
-	e.RegisterQuery("widget", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("widget", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		selected := dep.Load().(string)
 		ctx.TrackCollection("widgets", "id", selected)
@@ -2308,7 +2351,7 @@ func TestStaleExecutionDoesNotOverwriteDependencies(t *testing.T) {
 			close(started)
 			<-release
 		}
-		return selected
+		return selected, nil
 	})
 
 	sub := subscribe(t, e, client, "widget", "k", nil)
@@ -2381,8 +2424,8 @@ func TestStaleExecutionDoesNotOverwriteDependencies(t *testing.T) {
 func TestQueryResultIncludesLocationAndQueryKey(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("getThing", func(ctx *QueryCtx) interface{} {
-		return map[string]interface{}{"ok": true, "p": ctx.Params["id"]}
+	e.RegisterQuery("getThing", func(ctx *QueryCtx) (any, error) {
+		return map[string]interface{}{"ok": true, "p": ctx.Params["id"]}, nil
 	})
 	subscribe(t, e, client, "getThing", "thing-7", map[string]interface{}{"id": 7})
 
@@ -2460,12 +2503,12 @@ func TestQueryExposesIdentityOfTheSubscribedClient(t *testing.T) {
 	e.tracker.SetAuth(alice.ID, "user-alice", time.Now().Add(time.Hour))
 	e.tracker.SetAuth(bob.ID, "user-bob", time.Now().Add(time.Hour))
 
-	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("me", func(ctx *QueryCtx) (any, error) {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return map[string]interface{}{"id": id}
+		return map[string]interface{}{"id": id}, nil
 	})
 
 	subscribe(t, e, alice, "me", "alice", nil)
@@ -2493,9 +2536,9 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 	client := trackClient(t, e)
 	e.tracker.SetAuth(client.ID, "user-7", time.Now().Add(time.Hour))
 
-	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("me", func(ctx *QueryCtx) (any, error) {
 		id, _ := ctx.Auth.GetIdentity()
-		return id
+		return id, nil
 	})
 	sub := subscribe(t, e, client, "me", "me", nil)
 
@@ -2504,7 +2547,7 @@ func TestGetIdentityRegistersPermanentUserTag(t *testing.T) {
 	}
 
 	// Permanent tags should survive a later query that does not call GetIdentity.
-	e.queries["me"] = Query{Func: func(ctx *QueryCtx) interface{} { return "no-auth-call" }, Internal: false}
+	e.queries["me"] = query{Func: func(ctx *QueryCtx) (any, error) { return "no-auth-call", nil }, Internal: false}
 	if _, err := e.executeQuery("me", map[string]interface{}{}, sub); err != nil {
 		t.Fatalf("ExecuteQuery: %v", err)
 	}
@@ -2518,18 +2561,18 @@ func TestGuardIdentityDoesNotFingerprintTheQuery(t *testing.T) {
 	client := trackClient(t, e)
 	e.tracker.SetAuth(client.ID, "user-7", time.Now().Add(time.Hour))
 
-	e.RegisterGuard("allow", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("allow", func(ctx *GuardCtx) (any, error) {
 		id, _ := ctx.Auth.GetIdentity()
 		ctx.TrackCollection("room_members", "user_id", id)
-		return map[string]interface{}{"access": true}
+		return map[string]interface{}{"access": true}, nil
 	})
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		res, err := ctx.Auth.ExecuteGuard("allow", map[string]interface{}{"room": "lobby"})
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		ctx.TrackCollection("messages", "room_id", "lobby")
-		return res
+		return res, nil
 	})
 	sub := subscribe(t, e, client, "getMessages", "lobby", nil)
 
@@ -2564,19 +2607,19 @@ func TestGuardsBatchQueriesOnInvalidation(t *testing.T) {
 	e.tracker.SetAuth(b.ID, "user-b", time.Now().Add(time.Hour))
 
 	var guardRuns, queryRuns atomic.Int64
-	e.RegisterGuard("allow", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("allow", func(ctx *GuardCtx) (any, error) {
 		guardRuns.Add(1)
 		id, _ := ctx.Auth.GetIdentity()
 		ctx.TrackCollection("room_members", "user_id", id)
-		return map[string]interface{}{"ok": true}
+		return map[string]interface{}{"ok": true}, nil
 	})
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		queryRuns.Add(1)
 		if _, err := ctx.Auth.ExecuteGuard("allow", map[string]interface{}{"room": "lobby"}); err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		ctx.TrackCollection("messages", "room_id", "lobby")
-		return map[string]interface{}{"ok": true}
+		return map[string]interface{}{"ok": true}, nil
 	})
 	subscribe(t, e, a, "getMessages", "a", map[string]interface{}{"room": "lobby"})
 	subscribe(t, e, b, "getMessages", "b", map[string]interface{}{"room": "lobby"})
@@ -2604,11 +2647,11 @@ func TestInvalidateTagStillBatchesClientsWithTheSameIdentity(t *testing.T) {
 	e.tracker.SetAuth(b.ID, "alice", time.Now().Add(time.Hour))
 
 	var runs atomic.Int64
-	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("me", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("settings", "key", "me")
 		id, _ := ctx.Auth.GetIdentity()
-		return id
+		return id, nil
 	})
 	subscribe(t, e, a, "me", "a", map[string]interface{}{})
 	subscribe(t, e, b, "me", "b", map[string]interface{}{})
@@ -2638,13 +2681,13 @@ func TestInvalidateTagSplitsBatchWhenQueryBecomesIdentityDependent(t *testing.T)
 	e.tracker.SetAuth(bob.ID, "bob", time.Now().Add(time.Hour))
 
 	var private atomic.Bool
-	e.RegisterQuery("visibility", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("visibility", func(ctx *QueryCtx) (any, error) {
 		ctx.TrackCollection("settings", "key", "visibility")
 		if !private.Load() {
-			return "public"
+			return "public", nil
 		}
 		id, _ := ctx.Auth.GetIdentity()
-		return "private:" + id
+		return "private:" + id, nil
 	})
 	params := map[string]interface{}{"k": "visibility"}
 	aliceSub := subscribe(t, e, alice, "visibility", "alice", params)
@@ -2701,25 +2744,25 @@ func TestGuardInvalidationRerunsAttachedQuery(t *testing.T) {
 		t.Fatalf("seed membership: %v", err)
 	}
 
-	e.RegisterGuard("hasAccess", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("hasAccess", func(ctx *GuardCtx) (any, error) {
 		id, _ := ctx.Auth.GetIdentity()
 		ctx.TrackCollection("room_members", "user_id", id)
 		var member testRoomMember
 		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, ctx.Params["room"]).First(&member).Error; err != nil {
-			return map[string]interface{}{"error": "forbidden"}
+			return map[string]interface{}{"error": "forbidden"}, nil
 		}
-		return map[string]interface{}{"access": true}
+		return map[string]interface{}{"access": true}, nil
 	})
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		hasAccess, err := ctx.Auth.ExecuteGuard("hasAccess", map[string]interface{}{"room": "lobby"})
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		access, _ := hasAccess.(map[string]interface{})
 		if errMsg, _ := access["error"].(string); errMsg != "" {
-			return map[string]interface{}{"error": errMsg}
+			return map[string]interface{}{"error": errMsg}, nil
 		}
-		return map[string]interface{}{"ok": true}
+		return map[string]interface{}{"ok": true}, nil
 	})
 	subscribe(t, e, client, "getMessages", "lobby", nil)
 	drain(client)
@@ -2745,23 +2788,23 @@ func TestGuardPanicOnReevaluationDoesNotStopInvalidation(t *testing.T) {
 	e.tracker.SetAuth(other.ID, "user-ok", time.Now().Add(time.Hour))
 
 	var panicGuardEvals, okGuardEvals atomic.Int64
-	e.RegisterGuard("role", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("role", func(ctx *GuardCtx) (any, error) {
 		id, _ := ctx.Auth.GetIdentity()
 		ctx.TrackCollection("room_members", "user_id", "shared")
 		if id == "user-panic" {
 			if panicGuardEvals.Add(1) > 1 {
 				panic("guard boom")
 			}
-			return "first"
+			return "first", nil
 		}
-		return fmt.Sprintf("ok-%d", okGuardEvals.Add(1))
+		return fmt.Sprintf("ok-%d", okGuardEvals.Add(1)), nil
 	})
-	e.RegisterQuery("who", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("who", func(ctx *QueryCtx) (any, error) {
 		role, err := ctx.Auth.ExecuteGuard("role", map[string]interface{}{})
 		if err != nil {
-			return "ERROR"
+			return "ERROR", nil
 		}
-		return role
+		return role, nil
 	})
 	subscribe(t, e, panicker, "who", "panic", nil)
 	subscribe(t, e, other, "who", "ok", nil)
@@ -2784,10 +2827,11 @@ func TestGuardPanicOnReevaluationDoesNotStopInvalidation(t *testing.T) {
 func TestFailedGuardReevaluationRevokesCachedGrant(t *testing.T) {
 	cases := []struct {
 		name string
-		fail func() interface{}
+		fail func() (any, error)
 	}{
-		{"panic", func() interface{} { panic("guard boom") }},
-		{"unmarshalable result", func() interface{} { return func() {} }},
+		{"panic", func() (any, error) { panic("guard boom") }},
+		{"unmarshalable result", func() (any, error) { return func() {}, nil }},
+		{"error", func() (any, error) { return nil, errors.New("guard down") }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2796,22 +2840,22 @@ func TestFailedGuardReevaluationRevokesCachedGrant(t *testing.T) {
 			e.tracker.SetAuth(client.ID, "user-1", time.Now().Add(time.Hour))
 
 			var guardEvals atomic.Int64
-			e.RegisterGuard("canRead", func(ctx *GuardCtx) interface{} {
+			e.RegisterGuard("canRead", func(ctx *GuardCtx) (any, error) {
 				ctx.TrackTable("permissions")
 				if guardEvals.Add(1) > 1 {
 					return tc.fail()
 				}
-				return true
+				return true, nil
 			})
 			var secretVersion atomic.Int64
 			secretVersion.Store(1)
-			e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+			e.RegisterQuery("secret", func(ctx *QueryCtx) (any, error) {
 				ctx.TrackTable("secrets")
 				allowed, err := ctx.Auth.ExecuteGuard("canRead", map[string]interface{}{})
 				if err != nil || allowed != true {
-					return "DENIED"
+					return "DENIED", nil
 				}
-				return fmt.Sprintf("SECRET-%d", secretVersion.Load())
+				return fmt.Sprintf("SECRET-%d", secretVersion.Load()), nil
 			})
 			sub := subscribe(t, e, client, "secret", "secret", nil)
 			if data, n := lastQueryData(t, client); n != 1 || data != "SECRET-1" {
@@ -2903,6 +2947,95 @@ func TestAuthSuccessEncodesUserIDAsJSON(t *testing.T) {
 	}
 }
 
+func TestOutboundFramesIncludeProtocolVersion(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.SetAuth(&stubAuth{userID: "user-1", expiresAt: time.Now().Add(time.Hour)})
+	e.RegisterQuery("item", func(ctx *QueryCtx) (any, error) { return "ok", nil })
+	e.RegisterQuery("missing", func(ctx *QueryCtx) (any, error) {
+		return nil, errors.New("gone")
+	})
+	e.RegisterMutation("save", func(ctx *MutationCtx) (any, error) { return "saved", nil })
+	e.RegisterMutation("deny", func(ctx *MutationCtx) (any, error) {
+		return nil, errors.New("nope")
+	})
+
+	check := func(label string) {
+		t.Helper()
+		msgs := drain(client)
+		if len(msgs) == 0 {
+			t.Fatalf("%s: no frames", label)
+		}
+		for _, msg := range msgs {
+			if msg["protocol_version"] != float64(e.protocolVersion) {
+				t.Errorf("%s frame = %#v, want protocol_version %d", label, msg, e.protocolVersion)
+			}
+		}
+	}
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	check("auth success")
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type": "subscribe", "location": "item", "params": map[string]interface{}{}, "query_key": "item",
+	}); err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	check("query result")
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type": "subscribe", "location": "missing", "params": map[string]interface{}{}, "query_key": "missing",
+	}); err != nil {
+		t.Fatalf("subscribe error query: %v", err)
+	}
+	check("query error")
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type": "mutation", "location": "save", "params": map[string]interface{}{}, "mutation_id": "m1",
+	}); err != nil {
+		t.Fatalf("mutation: %v", err)
+	}
+	check("mutation result")
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type": "mutation", "location": "deny", "params": map[string]interface{}{}, "mutation_id": "m2",
+	}); err != nil {
+		t.Fatalf("mutation error: %v", err)
+	}
+	check("mutation error")
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type": "mutation", "location": "absent", "params": map[string]interface{}{}, "mutation_id": "m3",
+	}); err == nil {
+		t.Fatal("missing mutation returned nil error")
+	}
+	check("mutation failure")
+
+	_ = e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type": "subscribe", "location": "absent", "params": map[string]interface{}{}, "query_key": "absent",
+	})
+	check("query failure")
+
+	_ = e.onReceiveMessage(client.ID, map[string]interface{}{"type": "unsubscribe"})
+	check("invalid unsubscribe")
+
+	_ = e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth"})
+	check("invalid auth")
+
+	e.SetAuth(&stubAuth{err: errors.New("bad token")})
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "nope"}); err == nil {
+		t.Fatal("failed auth returned nil error")
+	}
+	check("auth failure")
+
+	expiresAt := time.Now().Add(time.Hour)
+	e.tracker.SetAuth(client.ID, "user-1", expiresAt)
+	e.tracker.ExpireAuth(client.ID, expiresAt)
+	check("identity expired")
+}
+
 // syncBuffer is a bytes.Buffer safe for concurrent use; websocket handler
 // goroutines keep logging while the test reads the captured output.
 type syncBuffer struct {
@@ -2933,10 +3066,10 @@ func TestAuthFrameDoesNotLeakToken(t *testing.T) {
 	e := newTestEngine(t)
 	auth := &stubAuth{userID: "user-1", expiresAt: time.Now().Add(time.Hour)}
 	e.SetAuth(auth)
-	if err := e.Profiler.Start(); err != nil {
+	if err := e.Profiler().Start(); err != nil {
 		t.Fatalf("start profiler: %v", err)
 	}
-	t.Cleanup(e.Profiler.Stop)
+	t.Cleanup(e.Profiler().Stop)
 
 	srv := httptest.NewServer(http.HandlerFunc(e.Handle))
 	t.Cleanup(srv.Close)
@@ -2965,7 +3098,7 @@ func TestAuthFrameDoesNotLeakToken(t *testing.T) {
 		t.Fatalf("VerifyToken tokens = %v, want the original secret", auth.tokens)
 	}
 
-	metrics := e.Profiler.DumpMetricsAndFlush()
+	metrics := e.Profiler().DumpMetricsAndFlush()
 	encoded, err := json.Marshal(metrics)
 	if err != nil {
 		t.Fatalf("encode metrics: %v", err)
@@ -2975,7 +3108,7 @@ func TestAuthFrameDoesNotLeakToken(t *testing.T) {
 	}
 	var sawAuth bool
 	for _, metric := range metrics {
-		if metric.Type != utilities.MetricTypeAuthentication {
+		if metric.Type != MetricTypeAuthentication {
 			continue
 		}
 		sawAuth = true
@@ -3012,14 +3145,14 @@ func TestParamsAndResultsDoNotLeakToLogs(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	e := newTestEngine(t)
-	e.RegisterMutation("login", func(ctx *MutationCtx) interface{} {
-		return map[string]interface{}{"refresh_token": resultSecret}
+	e.RegisterMutation("login", func(ctx *MutationCtx) (any, error) {
+		return map[string]interface{}{"refresh_token": resultSecret}, nil
 	})
-	e.RegisterMutation("internalLogin", func(ctx *MutationCtx) interface{} {
-		return map[string]interface{}{"refresh_token": resultSecret}
+	e.RegisterMutation("internalLogin", func(ctx *MutationCtx) (any, error) {
+		return map[string]interface{}{"refresh_token": resultSecret}, nil
 	}, Internal())
-	e.RegisterQuery("session", func(ctx *QueryCtx) interface{} {
-		return map[string]interface{}{"refresh_token": resultSecret}
+	e.RegisterQuery("session", func(ctx *QueryCtx) (any, error) {
+		return map[string]interface{}{"refresh_token": resultSecret}, nil
 	})
 	client := trackClient(t, e)
 	params := func() map[string]interface{} {
@@ -3068,9 +3201,9 @@ func TestMutationAuthMatchesTheCallingClient(t *testing.T) {
 		id string
 	}
 	var fromAuthed, fromAnon seen
-	e.RegisterMutation("whoami", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("whoami", func(ctx *MutationCtx) (any, error) {
 		id, _ := ctx.Auth.GetIdentity()
-		return map[string]interface{}{"id": id}
+		return map[string]interface{}{"id": id}, nil
 	})
 
 	mustNoPanic(t, "authed mutation", func() {
@@ -3128,21 +3261,25 @@ func TestAuthExpiryClearsOnlyThatClient(t *testing.T) {
 // allows only allowedUser; the query tracks table_refresh:mutated so tests can
 // force re-runs.
 func registerSecretQuery(e *Engine, allowedUser string, guardRuns *atomic.Int64) {
-	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) (any, error) {
 		guardRuns.Add(1)
 		id, _ := ctx.Auth.GetIdentity()
-		return id != "" && id == allowedUser
+		return id != "" && id == allowedUser, nil
 	})
-	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+	registerSecretQueryHandler(e)
+}
+
+func registerSecretQueryHandler(e *Engine) {
+	e.RegisterQuery("secret", func(ctx *QueryCtx) (any, error) {
 		ctx.TrackCollection("table", "refresh", "mutated")
 		allowed, err := ctx.Auth.ExecuteGuard("isAllowed", map[string]interface{}{})
 		if err != nil {
-			return "ERROR"
+			return "ERROR", nil
 		}
 		if ok, _ := allowed.(bool); ok {
-			return "SECRET"
+			return "SECRET", nil
 		}
-		return "DENIED"
+		return "DENIED", nil
 	})
 }
 
@@ -3268,9 +3405,9 @@ func TestTokenRefreshForSameUserKeepsGuardedSubscription(t *testing.T) {
 func TestAuthExpiryRerunsIdentityQuery(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
-	e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("me", func(ctx *QueryCtx) (any, error) {
 		id, _ := ctx.Auth.GetIdentity()
-		return id
+		return id, nil
 	})
 
 	e.SetAuth(&stubAuth{userID: "alice", expiresAt: time.Now().Add(60 * time.Millisecond)})
@@ -3317,12 +3454,12 @@ func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
 		e := newTestEngine(t)
 		client := trackClient(t, e)
 		var runs atomic.Int64
-		e.RegisterQuery("me", func(ctx *QueryCtx) interface{} {
+		e.RegisterQuery("me", func(ctx *QueryCtx) (any, error) {
 			if runs.Add(1) > 1 {
 				panic("expiry boom")
 			}
 			id, _ := ctx.Auth.GetIdentity()
-			return id
+			return id, nil
 		})
 		expiresAt := time.Now().Add(40 * time.Millisecond)
 		e.SetAuth(&stubAuth{userID: "alice", expiresAt: expiresAt})
@@ -3354,22 +3491,21 @@ func TestAuthExpiryQueryPanicIsRecovered(t *testing.T) {
 // closed once that invocation is parked; release lets it return.
 func registerBlockingSecretQuery(t *testing.T, e *Engine, blockOn int64) (entered <-chan struct{}, release func()) {
 	t.Helper()
-	var unused atomic.Int64
-	registerSecretQuery(e, "alice", &unused)
+	registerSecretQueryHandler(e)
 	enteredCh := make(chan struct{})
 	releaseCh := make(chan struct{})
 	var once sync.Once
 	release = func() { once.Do(func() { close(releaseCh) }) }
 	t.Cleanup(release)
 	var runs atomic.Int64
-	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) (any, error) {
 		ctx.TrackTable("guard")
 		id, _ := ctx.Auth.GetIdentity()
 		if runs.Add(1) == blockOn {
 			close(enteredCh)
 			<-releaseCh
 		}
-		return id == "alice"
+		return id == "alice", nil
 	})
 	return enteredCh, release
 }
@@ -3517,7 +3653,7 @@ func TestConcurrentFirstGuardRunsKeepOneResult(t *testing.T) {
 
 	var runs atomic.Int64
 	bothStarted := make(chan struct{})
-	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("isAllowed", func(ctx *GuardCtx) (any, error) {
 		n := runs.Add(1)
 		if n <= 2 {
 			if n == 2 {
@@ -3525,14 +3661,14 @@ func TestConcurrentFirstGuardRunsKeepOneResult(t *testing.T) {
 			}
 			<-releaseCh
 		}
-		return n
+		return n, nil
 	})
-	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("secret", func(ctx *QueryCtx) (any, error) {
 		result, err := ctx.Auth.ExecuteGuard("isAllowed", map[string]interface{}{})
 		if err != nil {
-			return "ERROR"
+			return "ERROR", nil
 		}
-		return result
+		return result, nil
 	})
 
 	sub := e.tracker.SubscribeToQuery(client.ID, "secret", "secret", map[string]interface{}{})
@@ -3582,7 +3718,7 @@ func TestStaleGuardExecutionDoesNotOverwriteState(t *testing.T) {
 	defer releaseGuard()
 
 	var runs atomic.Int64
-	e.RegisterGuard("allow", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("allow", func(ctx *GuardCtx) (any, error) {
 		runs.Add(1)
 		selected := dep.Load().(string)
 		decision := result.Load()
@@ -3591,14 +3727,14 @@ func TestStaleGuardExecutionDoesNotOverwriteState(t *testing.T) {
 			close(started)
 			<-release
 		}
-		return decision
+		return decision, nil
 	})
-	e.RegisterQuery("secret", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("secret", func(ctx *QueryCtx) (any, error) {
 		allowed, err := ctx.Auth.ExecuteGuard("allow", map[string]interface{}{})
 		if err != nil {
-			return "ERROR"
+			return "ERROR", nil
 		}
-		return allowed
+		return allowed, nil
 	})
 
 	sub := subscribe(t, e, client, "secret", "k", nil)
@@ -3662,20 +3798,20 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	client := trackClient(t, e)
 
 	var queryRuns atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		queryRuns.Add(1)
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
 		var msgs []testMessage
 		ctx.DB.Where("room_id = ?", room).Find(&msgs)
-		return len(msgs)
+		return len(msgs), nil
 	})
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		msg := testMessage{Body: ctx.Params["body"].(string), RoomID: ctx.Params["room"].(string)}
 		if err := ctx.DB.Create(&msg).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msg.ID
+		return msg.ID, nil
 	})
 
 	mustNoPanic(t, "subscribe", func() {
@@ -3732,11 +3868,11 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 	client := trackClient(t, e)
 
 	var queryRuns atomic.Int64
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		queryRuns.Add(1)
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
-		return room
+		return room, nil
 	})
 
 	params := map[string]interface{}{"room": "lobby"}
@@ -3808,11 +3944,11 @@ func TestSetCheckOrigin(t *testing.T) {
 
 func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir())
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	e.SetStorage(store)
+	e.SetStorage(store, "")
 	e.SetAllowedOrigins([]string{"https://app.example"})
 
 	upload, err := e.getUploadURL()
@@ -3933,11 +4069,11 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 
 func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir())
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	e.SetStorage(store)
+	e.SetStorage(store, "")
 
 	upload, err := e.getUploadURL()
 	if err != nil {
@@ -3966,11 +4102,11 @@ func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 
 func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir())
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	e.SetStorage(store)
+	e.SetStorage(store, "")
 	e.SetCheckOrigin(func(r *http.Request) bool {
 		return strings.HasSuffix(r.Header.Get("Origin"), ".example")
 	})
@@ -4000,12 +4136,12 @@ func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
 	e := newTestEngine(t)
 	root := t.TempDir()
 	uploadDir := filepath.Join(root, "uploads")
-	store, err := local.NewLocalStorage(uploadDir)
+	store, err := local.New(uploadDir)
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
 	recorder := &recordingStorage{local: store}
-	e.SetStorage(recorder)
+	e.SetStorage(recorder, "")
 
 	sibling := filepath.Join(root, "outside.txt")
 	if err := os.WriteFile(sibling, []byte("sibling"), 0o644); err != nil {
@@ -4080,13 +4216,13 @@ func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
 	})
 }
 
-func TestGetUploadURLUsesAdapterDefaultsAndCallOptions(t *testing.T) {
+func TestGetUploadURLUsesSetStorageDefaultsAndCallOptions(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir(), storage.WithMaxBytes(1234), storage.WithExpiresIn(time.Hour))
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	if err := e.SetStorage(store); err != nil {
+	if err := e.SetStorage(store, "", storage.WithMaxBytes(1234), storage.WithExpiresIn(time.Hour)); err != nil {
 		t.Fatalf("set storage: %v", err)
 	}
 
@@ -4098,6 +4234,9 @@ func TestGetUploadURLUsesAdapterDefaultsAndCallOptions(t *testing.T) {
 	var row TetherStorage
 	if err := e.db.Where("id = ?", upload.FileID).First(&row).Error; err != nil {
 		t.Fatalf("load upload: %v", err)
+	}
+	if !strings.HasPrefix(upload.UploadURL, "/storage/upload/") {
+		t.Fatalf("upload URL = %q, want /storage/upload/ prefix", upload.UploadURL)
 	}
 	if row.MaxBytes != 1234 {
 		t.Fatalf("default MaxBytes = %d, want 1234", row.MaxBytes)
@@ -4118,17 +4257,124 @@ func TestGetUploadURLUsesAdapterDefaultsAndCallOptions(t *testing.T) {
 		t.Fatalf("override MaxBytes = %d, want 99", row.MaxBytes)
 	}
 	if row.ExpiresAt.Before(started.Add(time.Hour-time.Second)) || row.ExpiresAt.After(time.Now().Add(time.Hour+time.Second)) {
-		t.Fatalf("override ExpiresAt = %s, want the adapter default of about 1h", row.ExpiresAt)
+		t.Fatalf("override ExpiresAt = %s, want the SetStorage default of about 1h", row.ExpiresAt)
+	}
+}
+
+func TestSetStorageBasePath(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, "/api/files/"); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	upload, err := e.getUploadURL()
+	if err != nil {
+		t.Fatalf("getUploadURL: %v", err)
+	}
+	if !strings.HasPrefix(upload.UploadURL, "/api/files/upload/") || strings.Contains(upload.UploadURL, "//") {
+		t.Fatalf("upload URL = %q, want /api/files/upload/{token}", upload.UploadURL)
+	}
+	rec := serveStorage(e, http.MethodPut, upload.UploadURL, strings.NewReader("hello"), map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if rec.Code != http.StatusOK {
+		t.Fatalf("custom upload status = %d, body %s", rec.Code, rec.Body.String())
+	}
+
+	other, err := e.getUploadURL()
+	if err != nil {
+		t.Fatalf("second getUploadURL: %v", err)
+	}
+	token := strings.TrimPrefix(other.UploadURL, "/api/files/upload/")
+	missed := serveStorage(e, http.MethodPut, "/storage/upload/"+token, strings.NewReader("nope"), map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if missed.Code == http.StatusOK && missed.Body.Len() != 0 {
+		t.Fatalf("default route handled a custom-prefix upload: status %d body %s", missed.Code, missed.Body.String())
+	}
+	var pending TetherStorage
+	if err := e.db.Where("id = ?", other.FileID).First(&pending).Error; err != nil {
+		t.Fatalf("load untouched upload: %v", err)
+	}
+	if pending.Status != "pending" {
+		t.Fatalf("default route status = %q, want pending", pending.Status)
+	}
+
+	download, err := e.getDownloadURL(upload.FileID)
+	if err != nil {
+		t.Fatalf("getDownloadURL: %v", err)
+	}
+	if !strings.HasPrefix(download, "/api/files/file/") || strings.Contains(download, "//") {
+		t.Fatalf("download URL = %q, want /api/files/file/{token}", download)
+	}
+	got := serveStorage(e, http.MethodGet, download, nil, nil)
+	if got.Code != http.StatusOK || got.Body.String() != "hello" {
+		t.Fatalf("custom download status = %d, body %q", got.Code, got.Body.String())
+	}
+
+	unset := newTestEngine(t)
+	if err := unset.SetStorage(store, "files"); err == nil {
+		t.Fatal("relative base path was accepted")
+	}
+	if err := unset.SetStorage(store, "/api/../secret"); err == nil {
+		t.Fatal("base path containing .. was accepted")
+	}
+	rejected := serveStorage(unset, http.MethodPut, "/files/upload/token", strings.NewReader("x"), nil)
+	if rejected.Code != http.StatusNotImplemented {
+		t.Fatalf("storage after rejected base path status = %d, want %d", rejected.Code, http.StatusNotImplemented)
+	}
+}
+
+func TestSetStorageTableErrorLeavesTheEngineRunning(t *testing.T) {
+	e := newTestEngine(t)
+	sqlDB, err := e.db.DB()
+	if err != nil {
+		t.Fatalf("sql db: %v", err)
+	}
+	if err := sqlDB.Close(); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, ""); err == nil {
+		t.Fatal("SetStorage with a closed database returned nil")
+	}
+	if e.isClosed() {
+		t.Fatal("SetStorage shut down the engine")
+	}
+	if e.storage != nil || e.storageBasePath != "" {
+		t.Fatal("storage was enabled after a table error")
+	}
+}
+
+func TestSetStorageAfterCloseReturnsErrEngineClosed(t *testing.T) {
+	e := newTestEngine(t)
+	e.Close()
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, ""); !errors.Is(err, ErrEngineClosed) {
+		t.Fatalf("SetStorage after Close = %v, want ErrEngineClosed", err)
+	}
+	if e.storage != nil {
+		t.Fatal("storage was enabled on a closed engine")
 	}
 }
 
 func TestDeleteFileRemovesStoredObject(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir())
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	e.SetStorage(store)
+	e.SetStorage(store, "")
 
 	upload, err := e.getUploadURL()
 	if err != nil {
@@ -4158,7 +4404,7 @@ func TestDeleteFileRemovesStoredObject(t *testing.T) {
 }
 
 type recordingStorage struct {
-	local   *local.LocalStorage
+	local   *local.Storage
 	deleted []string
 }
 
@@ -4170,23 +4416,19 @@ func (r *recordingStorage) ServeFile(fileID string, w http.ResponseWriter, req *
 	return r.local.ServeFile(fileID, w, req)
 }
 
-func (r *recordingStorage) Delete(fileID string) error {
+func (r *recordingStorage) Delete(ctx context.Context, fileID string) error {
 	r.deleted = append(r.deleted, fileID)
-	return r.local.Delete(fileID)
+	return r.local.Delete(ctx, fileID)
 }
 
 func (r *recordingStorage) Name() string {
 	return r.local.Name()
 }
 
-func (r *recordingStorage) DefaultUploadOptions() []storage.UploadOption {
-	return r.local.DefaultUploadOptions()
-}
-
 // cleanupStorage records whether upload metadata still existed when Delete ran,
 // and can fail a chosen id without touching its bytes.
 type cleanupStorage struct {
-	local    *local.LocalStorage
+	local    *local.Storage
 	db       *gorm.DB
 	fail     map[string]error
 	deleted  []string
@@ -4201,7 +4443,7 @@ func (c *cleanupStorage) ServeFile(fileID string, w http.ResponseWriter, r *http
 	return c.local.ServeFile(fileID, w, r)
 }
 
-func (c *cleanupStorage) Delete(fileID string) error {
+func (c *cleanupStorage) Delete(ctx context.Context, fileID string) error {
 	c.deleted = append(c.deleted, fileID)
 	var n int64
 	if err := c.db.Model(&TetherStorage{}).Where("id = ?", fileID).Count(&n).Error; err != nil {
@@ -4211,20 +4453,16 @@ func (c *cleanupStorage) Delete(fileID string) error {
 	if err, ok := c.fail[fileID]; ok {
 		return err
 	}
-	return c.local.Delete(fileID)
+	return c.local.Delete(ctx, fileID)
 }
 
 func (c *cleanupStorage) Name() string {
 	return c.local.Name()
 }
 
-func (c *cleanupStorage) DefaultUploadOptions() []storage.UploadOption {
-	return c.local.DefaultUploadOptions()
-}
-
 func TestCleanStorage(t *testing.T) {
 	e := newTestEngine(t)
-	store, err := local.NewLocalStorage(t.TempDir())
+	store, err := local.New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
@@ -4233,7 +4471,7 @@ func TestCleanStorage(t *testing.T) {
 		db:    e.db,
 		fail:  map[string]error{"delete-fail": errors.New("disk full")},
 	}
-	e.SetStorage(adapter)
+	e.SetStorage(adapter, "")
 
 	if !e.db.Migrator().HasIndex(&TetherStorage{}, "ExpiresAt") {
 		t.Fatal("TetherStorage.ExpiresAt has no cleanup index")
@@ -4379,7 +4617,7 @@ func TestSubscribeUnknownQueryViaMessageDoesNotPanic(t *testing.T) {
 
 func TestExecuteQueryWithoutTrackedClientDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
-	e.RegisterQuery("q", func(ctx *QueryCtx) interface{} { return "ok" })
+	e.RegisterQuery("q", func(ctx *QueryCtx) (any, error) { return "ok", nil })
 	ghost := &reactivity.Subscription{
 		SubID:    "ghost",
 		Client:   &reactivity.Client{ID: "missing", Send: make(chan []byte, 1)},
@@ -4394,7 +4632,7 @@ func TestExecuteQueryWithoutTrackedClientDoesNotPanic(t *testing.T) {
 
 func TestDefaultAuthVerifyToken(t *testing.T) {
 	var a defaultAuth
-	userID, expiresAt, err := a.VerifyToken(nil, "token")
+	userID, expiresAt, err := a.VerifyToken(context.Background(), nil, "token")
 	if err != nil {
 		t.Errorf("defaultAuth.VerifyToken error = %v", err)
 	}
@@ -4717,29 +4955,29 @@ func TestConcurrentWebsocketClientsEndToEnd(t *testing.T) {
 	nClients := nMutators + nWatchers + nDroppers
 
 	e := newConcurrentTestEngine(t)
-	e.Profiler.Start()
+	e.Profiler().Start()
 	defer func() {
-		metrics := e.Profiler.DumpMetricsAndFlush()
-		t.Log(utilities.SanitizeMetrics(metrics))
+		metrics := e.Profiler().DumpMetricsAndFlush()
+		t.Log(SanitizeMetrics(metrics))
 	}()
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
 		var msgs []testMessage
 		if err := ctx.DB.Where("room_id = ?", room).Order("id").Find(&msgs).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msgs
+		return msgs, nil
 	})
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		msg := testMessage{
 			Body:   ctx.Params["body"].(string),
 			RoomID: ctx.Params["room"].(string),
 		}
 		if err := ctx.DB.Create(&msg).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msg
+		return msg, nil
 	})
 
 	srv := httptest.NewServer(http.HandlerFunc(e.Handle))
@@ -4875,7 +5113,7 @@ func (testAuthoredMessage) TableName() string { return "messages" }
 // simple: the goal is to exercise Tether's auth plumbing, not a production token scheme.
 type accessTokenAuth struct{}
 
-func (accessTokenAuth) VerifyToken(db *gorm.DB, token string) (string, time.Time, error) {
+func (accessTokenAuth) VerifyToken(ctx context.Context, db *gorm.DB, token string) (string, time.Time, error) {
 	if token == "" {
 		return "", time.Time{}, errors.New("missing token")
 	}
@@ -5351,56 +5589,56 @@ func TestConcurrentWebsocketAuthGetIdentityEndToEnd(t *testing.T) {
 	nClients := nMembers + nOutsiders + nBadTokens + nUnauthed
 
 	e := newConcurrentAuthTestEngine(t)
-	e.Profiler.Start()
+	e.Profiler().Start()
 	defer func() {
-		metrics := e.Profiler.DumpMetricsAndFlush()
-		t.Log(utilities.SanitizeMetrics(metrics))
+		metrics := e.Profiler().DumpMetricsAndFlush()
+		t.Log(SanitizeMetrics(metrics))
 	}()
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		if id == "" {
-			return map[string]interface{}{"error": "unauthenticated"}
+			return map[string]interface{}{"error": "unauthenticated"}, nil
 		}
 		ctx.TrackCollection("room_members", "user_id", id)
 		var user testUser
 		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
-			return map[string]interface{}{"error": "unknown user", "identity": id}
+			return map[string]interface{}{"error": "unknown user", "identity": id}, nil
 		}
 		room, _ := ctx.Params["room"].(string)
 		var member testRoomMember
 		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
-			return map[string]interface{}{"error": "forbidden", "identity": id, "user_name": user.Name}
+			return map[string]interface{}{"error": "forbidden", "identity": id, "user_name": user.Name}, nil
 		}
 		ctx.TrackCollection("messages", "room_id", room)
 		msgs := make([]testAuthoredMessage, 0)
 		if err := ctx.DB.Where("room_id = ?", room).Order("id").Find(&msgs).Error; err != nil {
-			return map[string]interface{}{"error": err.Error(), "identity": id, "user_name": user.Name}
+			return map[string]interface{}{"error": err.Error(), "identity": id, "user_name": user.Name}, nil
 		}
 		return map[string]interface{}{
 			"identity":  id,
 			"user_name": user.Name,
 			"messages":  msgs,
-		}
+		}, nil
 	})
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		if id == "" {
-			return map[string]interface{}{"error": "unauthenticated"}
+			return map[string]interface{}{"error": "unauthenticated"}, nil
 		}
 		var user testUser
 		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
-			return map[string]interface{}{"error": "unknown user"}
+			return map[string]interface{}{"error": "unknown user"}, nil
 		}
 		room, _ := ctx.Params["room"].(string)
 		var member testRoomMember
 		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
-			return map[string]interface{}{"error": "forbidden"}
+			return map[string]interface{}{"error": "forbidden"}, nil
 		}
 		msg := testAuthoredMessage{
 			Body:     ctx.Params["body"].(string),
@@ -5408,9 +5646,9 @@ func TestConcurrentWebsocketAuthGetIdentityEndToEnd(t *testing.T) {
 			AuthorID: id,
 		}
 		if err := ctx.DB.Create(&msg).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msg
+		return msg, nil
 	})
 
 	expiresAt := time.Now().Add(time.Hour)
@@ -5593,69 +5831,69 @@ func TestConcurrentWebsocketAuthGuardsEndToEnd(t *testing.T) {
 	nClients := nMembers + nOutsiders + nBadTokens + nUnauthed
 
 	e := newConcurrentAuthTestEngine(t)
-	e.Profiler.Start()
+	e.Profiler().Start()
 	defer func() {
-		metrics := e.Profiler.DumpMetricsAndFlush()
-		t.Log(utilities.SanitizeMetrics(metrics))
+		metrics := e.Profiler().DumpMetricsAndFlush()
+		t.Log(SanitizeMetrics(metrics))
 	}()
-	e.RegisterGuard("hasAccess", func(ctx *GuardCtx) interface{} {
+	e.RegisterGuard("hasAccess", func(ctx *GuardCtx) (any, error) {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		if id == "" {
-			return map[string]interface{}{"error": "unauthenticated"}
+			return map[string]interface{}{"error": "unauthenticated"}, nil
 		}
 		var user testUser
 		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
-			return map[string]interface{}{"error": "unknown user"}
+			return map[string]interface{}{"error": "unknown user"}, nil
 		}
 		room, _ := ctx.Params["room"].(string)
 		var member testRoomMember
 		ctx.TrackCollection("room_members", "user_id", id)
 		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
-			return map[string]interface{}{"error": "forbidden"}
+			return map[string]interface{}{"error": "forbidden"}, nil
 		}
-		return map[string]interface{}{"access": true}
+		return map[string]interface{}{"access": true}, nil
 	})
-	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
 		hasAccess, err := ctx.Auth.ExecuteGuard("hasAccess", map[string]interface{}{"room": ctx.Params["room"]})
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		access, _ := hasAccess.(map[string]interface{})
 		if errMsg, _ := access["error"].(string); errMsg != "" {
-			return map[string]interface{}{"error": errMsg}
+			return map[string]interface{}{"error": errMsg}, nil
 		}
 		if access["access"] != true {
-			return map[string]interface{}{"error": "forbidden"}
+			return map[string]interface{}{"error": "forbidden"}, nil
 		}
 		room := ctx.Params["room"].(string)
 		ctx.TrackCollection("messages", "room_id", room)
 		msgs := make([]testAuthoredMessage, 0)
 		if err := ctx.DB.Where("room_id = ?", room).Order("id").Find(&msgs).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		return map[string]interface{}{
 			"messages": msgs,
-		}
+		}, nil
 	})
-	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
 		id, err := ctx.Auth.GetIdentity()
 		if err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
 		if id == "" {
-			return map[string]interface{}{"error": "unauthenticated"}
+			return map[string]interface{}{"error": "unauthenticated"}, nil
 		}
 		var user testUser
 		if err := ctx.DB.Where("id = ?", id).First(&user).Error; err != nil {
-			return map[string]interface{}{"error": "unknown user"}
+			return map[string]interface{}{"error": "unknown user"}, nil
 		}
 		room, _ := ctx.Params["room"].(string)
 		var member testRoomMember
 		if err := ctx.DB.Where("user_id = ? AND room_id = ?", id, room).First(&member).Error; err != nil {
-			return map[string]interface{}{"error": "forbidden"}
+			return map[string]interface{}{"error": "forbidden"}, nil
 		}
 		msg := testAuthoredMessage{
 			Body:     ctx.Params["body"].(string),
@@ -5663,9 +5901,9 @@ func TestConcurrentWebsocketAuthGuardsEndToEnd(t *testing.T) {
 			AuthorID: id,
 		}
 		if err := ctx.DB.Create(&msg).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return msg
+		return msg, nil
 	})
 
 	expiresAt := time.Now().Add(time.Hour)

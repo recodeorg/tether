@@ -11,39 +11,32 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/recodeorg/tether/storage"
 )
 
-// LocalStorage is a [storage.StorageAdapter] that stores each file in
+// Storage is a storage adapter that stores each file in
 // UploadDir under its file ID. It suits single-instance deployments; engines
 // on different servers cannot read each other's files.
-type LocalStorage struct {
+type Storage struct {
 	UploadDir string
-	defaults  []storage.UploadOption
 }
 
-// NewLocalStorage returns a LocalStorage that stores files in uploadDir,
-// creating the directory if it does not exist. It returns an error if the
-// directory cannot be created.
-//
-// defaults are applied to every upload URL from this adapter. Options passed
-// to GetUploadURL are applied after them, in order. Nil options are ignored.
-func NewLocalStorage(uploadDir string, defaults ...storage.UploadOption) (*LocalStorage, error) {
+// New returns a Storage that stores files in uploadDir, creating the
+// directory if it does not exist. It returns an error if the directory
+// cannot be created.
+func New(uploadDir string) (*Storage, error) {
 	err := os.MkdirAll(uploadDir, os.ModePerm)
 	if err != nil {
 		slog.Error("Failed to create directory", "error", err)
 		return nil, err
 	}
-	return &LocalStorage{
+	return &Storage{
 		UploadDir: uploadDir,
-		defaults:  append([]storage.UploadOption(nil), defaults...),
 	}, nil
 }
 
-// UploadStream writes the request body to the file fileID, removing the
-// partial file if the copy fails.
-func (l *LocalStorage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
+// UploadStream writes r.Body to the file fileID, removing the partial
+// file if the copy fails.
+func (l *Storage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
 	dstPath, err := l.safePath(fileID)
 	if err != nil {
 		return err
@@ -62,7 +55,7 @@ func (l *LocalStorage) UploadStream(ctx context.Context, fileID string, contentT
 }
 
 // ServeFile serves the file fileID with [http.ServeFile].
-func (l *LocalStorage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
+func (l *Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
 	filePath, err := l.safePath(fileID)
 	if err != nil {
 		return err
@@ -75,7 +68,7 @@ func (l *LocalStorage) ServeFile(fileID string, w http.ResponseWriter, r *http.R
 }
 
 // Delete removes the file fileID.
-func (l *LocalStorage) Delete(fileID string) error {
+func (l *Storage) Delete(ctx context.Context, fileID string) error {
 	path, err := l.safePath(fileID)
 	if err != nil {
 		return err
@@ -88,7 +81,7 @@ func (l *LocalStorage) Delete(fileID string) error {
 
 // safePath resolves fileID as a single file inside UploadDir. Parent segments
 // and absolute paths are rejected so Join cannot escape the upload root.
-func (l *LocalStorage) safePath(fileID string) (string, error) {
+func (l *Storage) safePath(fileID string) (string, error) {
 	if fileID == "" || fileID == "." || fileID == ".." || filepath.IsAbs(fileID) || fileID != filepath.Base(fileID) {
 		return "", fmt.Errorf("invalid file id")
 	}
@@ -109,11 +102,6 @@ func (l *LocalStorage) safePath(fileID string) (string, error) {
 }
 
 // Name returns "tether/storage/local".
-func (l *LocalStorage) Name() string {
+func (l *Storage) Name() string {
 	return "tether/storage/local"
-}
-
-// DefaultUploadOptions returns the defaults passed to [NewLocalStorage].
-func (l *LocalStorage) DefaultUploadOptions() []storage.UploadOption {
-	return l.defaults
 }

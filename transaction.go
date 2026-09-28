@@ -239,7 +239,7 @@ func (e *Engine) notifyRemote(ctx context.Context, conn execer, tags []string) {
 	if e.dbType != "postgres" {
 		return
 	}
-	for _, payload := range notifyPayloads(e.EphemeralID, tags) {
+	for _, payload := range notifyPayloads(e.ephemeralID, tags) {
 		if _, err := conn.ExecContext(ctx, "SELECT pg_notify('tether_sync', $1)", payload); err != nil {
 			slog.Error("Failed to send PostgreSQL notification", "error", err)
 		}

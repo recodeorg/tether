@@ -30,6 +30,10 @@ type Tracker struct {
 	// prefix. An older execution must not replace either.
 	depsAt  map[string]int64
 	guardAt map[string]map[string]int64
+
+	// protocolVersion is copied onto every JSON object frame in send.
+	// Zero leaves frames unchanged.
+	protocolVersion int
 }
 
 type Subscription struct {
@@ -40,6 +44,14 @@ type Subscription struct {
 	QueryKey     string // provided by the client to help with caching
 	ParamsHash   string // used for batching/deduplication on tag invalidation
 	Params       map[string]interface{}
+}
+
+// SetProtocolVersion sets the protocol number send writes into every JSON
+// object frame. Call it before any client is tracked.
+func (t *Tracker) SetProtocolVersion(version int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.protocolVersion = version
 }
 
 func NewTracker() *Tracker {
@@ -722,11 +734,34 @@ func (t *Tracker) SendMessage(clientID string, message []byte) {
 }
 
 // send queues message without blocking. Callers must hold t.mu.
+// A JSON object is stamped with protocol_version before it is queued.
 func (t *Tracker) send(client *Client, message []byte) {
+	message = stampProtocolVersion(message, t.protocolVersion)
 	select {
 	case client.Send <- message:
 	default:
 		slog.Error("Tracker: Client send channel is full", "clientID", client.ID)
 		client.Conn.Close() // Aggressively close the connection to force the client to reconnect
 	}
+}
+
+// stampProtocolVersion inserts protocol_version into a JSON object frame.
+// Payloads that are not objects, and a zero version, are returned unchanged
+// so callers can still queue raw bytes.
+func stampProtocolVersion(message []byte, version int) []byte {
+	if version == 0 || len(message) == 0 || message[0] != '{' {
+		return message
+	}
+	stamped := make([]byte, 0, len(message)+24)
+	stamped = append(stamped, `{"protocol_version":`...)
+	stamped = strconv.AppendInt(stamped, int64(version), 10)
+	rest := message[1:]
+	i := 0
+	for i < len(rest) && (rest[i] == ' ' || rest[i] == '\n' || rest[i] == '\t' || rest[i] == '\r') {
+		i++
+	}
+	if i < len(rest) && rest[i] != '}' {
+		stamped = append(stamped, ',')
+	}
+	return append(stamped, rest...)
 }

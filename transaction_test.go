@@ -16,7 +16,6 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/jackc/pgx/v5"
 	"github.com/recodeorg/tether/internal/reactivity"
-	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -64,13 +63,13 @@ func subscribeToBody(t *testing.T, e *Engine) (*reactivity.Client, testMessage, 
 		t.Fatalf("Create: %v", err)
 	}
 	runs := &atomic.Int64{}
-	e.RegisterQuery("getBody", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("getBody", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		var row testMessage
 		if err := ctx.DB.First(&row, msg.ID).Error; err != nil {
-			return "error: " + err.Error()
+			return "error: " + err.Error(), nil
 		}
-		return row.Body
+		return row.Body, nil
 	})
 	client := trackClient(t, e)
 	subscribe(t, e, client, "getBody", "body", nil)
@@ -125,14 +124,14 @@ func TestTransactionDeleteByIDPublishesCollectionCountOnCommit(t *testing.T) {
 	}
 
 	var runs atomic.Int64
-	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "r")
 		var n int64
 		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return n
+		return n, nil
 	})
 	subscribe(t, e, client, "countRoom", "count", nil)
 	drain(client)
@@ -168,14 +167,14 @@ func TestTransactionDeleteByIDRollbackDoesNotPublish(t *testing.T) {
 	}
 
 	var runs atomic.Int64
-	e.RegisterQuery("countRoom", func(ctx *QueryCtx) interface{} {
+	e.RegisterQuery("countRoom", func(ctx *QueryCtx) (any, error) {
 		runs.Add(1)
 		ctx.TrackCollection("messages", "room_id", "r")
 		var n int64
 		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "r").Count(&n).Error; err != nil {
-			return map[string]interface{}{"error": err.Error()}
+			return map[string]interface{}{"error": err.Error()}, nil
 		}
-		return n
+		return n, nil
 	})
 	subscribe(t, e, client, "countRoom", "count", nil)
 	drain(client)
@@ -377,9 +376,9 @@ func (r *recordingTx) Rollback() error {
 func TestPostgresNotifyIsSentInsideTheTransaction(t *testing.T) {
 	e := &Engine{
 		dbType:      "postgres",
-		EphemeralID: "sender",
+		ephemeralID: "sender",
 		tracker:     reactivity.NewTracker(),
-		Profiler:    utilities.NewProfiler(func(string) {}),
+		profiler:    newProfiler(func(string) {}),
 	}
 
 	committed := &recordingTx{}
@@ -465,7 +464,7 @@ func TestPostgresNotifyDeliveredOnlyOnCommit(t *testing.T) {
 				return "", false
 			}
 			var msg notifyMessage
-			if json.Unmarshal([]byte(n.Payload), &msg) == nil && msg.Sender == e.EphemeralID {
+			if json.Unmarshal([]byte(n.Payload), &msg) == nil && msg.Sender == e.ephemeralID {
 				return n.Payload, true
 			}
 		}

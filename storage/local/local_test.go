@@ -1,6 +1,7 @@
 package local
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -9,7 +10,7 @@ import (
 func TestDeleteRejectsPathEscape(t *testing.T) {
 	root := t.TempDir()
 	uploadDir := filepath.Join(root, "uploads")
-	store, err := NewLocalStorage(uploadDir)
+	store, err := New(uploadDir)
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
@@ -32,10 +33,10 @@ func TestDeleteRejectsPathEscape(t *testing.T) {
 		t.Fatalf("write absolute decoy: %v", err)
 	}
 
-	if err := store.Delete("../outside.txt"); err == nil {
+	if err := store.Delete(context.Background(), "../outside.txt"); err == nil {
 		t.Fatal("parent path delete returned nil")
 	}
-	if err := store.Delete(absTarget); err == nil {
+	if err := store.Delete(context.Background(), absTarget); err == nil {
 		t.Fatal("absolute path delete returned nil")
 	}
 
@@ -47,11 +48,11 @@ func TestDeleteRejectsPathEscape(t *testing.T) {
 }
 
 func TestDeletePropagatesMissingFile(t *testing.T) {
-	store, err := NewLocalStorage(t.TempDir())
+	store, err := New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
-	err = store.Delete("550e8400-e29b-41d4-a716-446655440000")
+	err = store.Delete(context.Background(), "550e8400-e29b-41d4-a716-446655440000")
 	if err == nil {
 		t.Fatal("delete of missing file returned nil")
 	}
@@ -61,7 +62,7 @@ func TestDeletePropagatesMissingFile(t *testing.T) {
 }
 
 func TestDeleteRemovesStoredObject(t *testing.T) {
-	store, err := NewLocalStorage(t.TempDir())
+	store, err := New(t.TempDir())
 	if err != nil {
 		t.Fatalf("create local storage: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestDeleteRemovesStoredObject(t *testing.T) {
 		t.Fatalf("write file: %v", err)
 	}
 
-	if err := store.Delete(fileID); err != nil {
+	if err := store.Delete(context.Background(), fileID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {

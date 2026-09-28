@@ -1,6 +1,4 @@
-// Package utilities provides the Tether profiler, available as
-// Engine.Profiler and MutationCtx.Profiler.
-package utilities
+package tether
 
 import (
 	"cmp"
@@ -56,10 +54,9 @@ type Profiler struct {
 	onFlush  func(mutationName string)
 }
 
-// NewProfiler returns a stopped profiler that calls onFlush on each tick
-// started by StartWithCallback. Applications normally use the engine's
-// profiler rather than creating their own.
-func NewProfiler(onFlush func(mutationName string)) *Profiler {
+// newProfiler returns a stopped profiler that calls onFlush on each tick
+// started by StartWithCallback.
+func newProfiler(onFlush func(mutationName string)) *Profiler {
 	return &Profiler{
 		metrics:  make([]Metric, 0, 2048),
 		capacity: 100_000, // Safe ceiling to prevent runaway RAM usage

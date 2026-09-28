@@ -694,3 +694,40 @@ func TestConcurrentSharedClients(t *testing.T) {
 	assertTrackerConsistent(t, tr)
 	assertTrackerEmpty(t, tr)
 }
+
+func TestStampProtocolVersion(t *testing.T) {
+	cases := []struct {
+		in      string
+		version int
+		want    string
+	}{
+		{`{"type":"query","data":1}`, 1, `{"protocol_version":1,"type":"query","data":1}`},
+		{`{"type": "error", "error": "Invalid message"}`, 1, `{"protocol_version":1,"type": "error", "error": "Invalid message"}`},
+		{`{}`, 1, `{"protocol_version":1}`},
+		{`{ }`, 1, `{"protocol_version":1 }`},
+		{`{"type":"auth"}`, 0, `{"type":"auth"}`},
+		{"new", 1, "new"},
+		{"", 1, ""},
+	}
+	for _, tc := range cases {
+		got := string(stampProtocolVersion([]byte(tc.in), tc.version))
+		if got != tc.want {
+			t.Errorf("stamp(%q, %d) = %q, want %q", tc.in, tc.version, got, tc.want)
+		}
+	}
+
+	tr := NewTracker()
+	tr.SetProtocolVersion(1)
+	client := NewClient(nil)
+	tr.Track(client)
+	tr.SendMessage(client.ID, []byte(`{"type":"auth","success":false,"data":"Identity expired"}`))
+	select {
+	case msg := <-client.Send:
+		want := `{"protocol_version":1,"type":"auth","success":false,"data":"Identity expired"}`
+		if string(msg) != want {
+			t.Fatalf("sent frame = %s, want %s", msg, want)
+		}
+	default:
+		t.Fatal("frame was not sent")
+	}
+}

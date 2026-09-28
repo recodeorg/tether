@@ -12,10 +12,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/recodeorg/tether/storage"
 )
 
-// Config configures an [S3Storage].
+// Config configures a [Storage].
 type Config struct {
 	Region string
 	Bucket string
@@ -24,22 +23,18 @@ type Config struct {
 	Endpoint string
 }
 
-// S3Storage is a [storage.StorageAdapter] that stores each file as an object
+// Storage is a storage adapter that stores each file as an object
 // in a bucket, keyed by its file ID. Requests use path-style URLs.
-type S3Storage struct {
+type Storage struct {
 	client        *s3.Client
 	presignClient *s3.PresignClient
 	bucket        string
-	defaults      []storage.UploadOption
 }
 
-// NewS3Storage returns an S3Storage for cfg. Credentials are loaded the
-// standard AWS SDK way, from environment variables, shared config files or
-// an instance role. It returns an error if cfg.Endpoint uses plain HTTP.
-//
-// defaults are applied to every upload URL from this adapter. Options passed
-// to GetUploadURL are applied after them, in order. Nil options are ignored.
-func NewS3Storage(ctx context.Context, cfg Config, defaults ...storage.UploadOption) (*S3Storage, error) {
+// New returns a Storage for cfg. Credentials are loaded the standard AWS
+// SDK way, from environment variables, shared config files or an instance
+// role. It returns an error if cfg.Endpoint uses plain HTTP.
+func New(ctx context.Context, cfg Config) (*Storage, error) {
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(cfg.Region),
 	}
@@ -62,17 +57,17 @@ func NewS3Storage(ctx context.Context, cfg Config, defaults ...storage.UploadOpt
 		o.UsePathStyle = true
 	})
 
-	return &S3Storage{
+	return &Storage{
 		client:        client,
 		presignClient: s3.NewPresignClient(client),
 		bucket:        cfg.Bucket,
-		defaults:      append([]storage.UploadOption(nil), defaults...),
 	}, nil
 }
 
-// UploadStream streams the request body to the object fileID without
-// buffering it in memory.
-func (s *S3Storage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
+// UploadStream streams r.Body to the object fileID without buffering it
+// in memory. r.ContentLength is sent as the object size and can be -1
+// for a chunked upload; the engine stores that same value as the file size.
+func (s *Storage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(fileID),
@@ -85,7 +80,7 @@ func (s *S3Storage) UploadStream(ctx context.Context, fileID string, contentType
 
 // ServeFile redirects to a presigned URL for the object fileID that is valid
 // for 15 minutes.
-func (s *S3Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
+func (s *Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
 	// Generate a short-lived AWS URL
 	presignedReq, err := s.presignClient.PresignGetObject(r.Context(), &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -101,8 +96,8 @@ func (s *S3Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Requ
 }
 
 // Delete removes the object fileID.
-func (s *S3Storage) Delete(fileID string) error {
-	_, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+func (s *Storage) Delete(ctx context.Context, fileID string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(fileID),
 	})
@@ -110,11 +105,6 @@ func (s *S3Storage) Delete(fileID string) error {
 }
 
 // Name returns "tether/storage/s3".
-func (s *S3Storage) Name() string {
+func (s *Storage) Name() string {
 	return "tether/storage/s3"
-}
-
-// DefaultUploadOptions returns the defaults passed to [NewS3Storage].
-func (s *S3Storage) DefaultUploadOptions() []storage.UploadOption {
-	return s.defaults
 }
