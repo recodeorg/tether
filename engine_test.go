@@ -1341,6 +1341,71 @@ func TestMapUpdatesInvalidateLoadedRecord(t *testing.T) {
 	}
 }
 
+// A predicate that names neither the primary key nor a tracked collection
+// still has to invalidate queries that auto-tracked the affected row.
+func TestPredicateUpdateInvalidatesAutoTrackedPrimaryKey(t *testing.T) {
+	e := newTestEngine(t)
+	if err := e.db.AutoMigrate(&testNote{}); err != nil {
+		t.Fatalf("AutoMigrate notes: %v", err)
+	}
+	client := trackClient(t, e)
+
+	note := testNote{Body: "old"}
+	other := testNote{Body: "keep"}
+	if err := e.db.Create(&note).Error; err != nil {
+		t.Fatalf("seed updated note: %v", err)
+	}
+	if err := e.db.Create(&other).Error; err != nil {
+		t.Fatalf("seed untouched note: %v", err)
+	}
+
+	var updatedRuns, otherRuns atomic.Int64
+	e.RegisterQuery("updatedNote", func(ctx *QueryCtx) interface{} {
+		updatedRuns.Add(1)
+		var got testNote
+		if err := ctx.DB.First(&got, note.NoteID).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return got
+	})
+	e.RegisterQuery("otherNote", func(ctx *QueryCtx) interface{} {
+		otherRuns.Add(1)
+		var got testNote
+		if err := ctx.DB.First(&got, other.NoteID).Error; err != nil {
+			return map[string]interface{}{"error": err.Error()}
+		}
+		return got
+	})
+	subscribe(t, e, client, "updatedNote", "updated", nil)
+	subscribe(t, e, client, "otherNote", "other", nil)
+	if updatedRuns.Load() != 1 || otherRuns.Load() != 1 {
+		t.Fatalf("subscribe runs updated=%d other=%d, want 1/1", updatedRuns.Load(), otherRuns.Load())
+	}
+	drain(client)
+
+	if err := e.db.Model(&testNote{}).Where("body = ?", "old").Update("body", "new").Error; err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	var stored testNote
+	if err := e.db.First(&stored, note.NoteID).Error; err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if stored.Body != "new" {
+		t.Fatalf("stored body = %q, want new", stored.Body)
+	}
+	if got := updatedRuns.Load(); got != 2 {
+		t.Errorf("primary-key query runs after predicate Update = %d, want 2", got)
+	}
+	if got := otherRuns.Load(); got != 1 {
+		t.Errorf("unrelated primary-key query runs after predicate Update = %d, want 1", got)
+	}
+	data, n := lastQueryData(t, client)
+	row, _ := data.(map[string]interface{})
+	if n != 1 || row["Body"] != "new" {
+		t.Errorf("query push after predicate Update = %v (%d messages), want one push with Body new", data, n)
+	}
+}
+
 func TestAutoTrackRecordsLoadedIDs(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)

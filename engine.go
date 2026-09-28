@@ -996,15 +996,18 @@ func hasTrackedFields(tx *gorm.DB) bool {
 }
 
 // snapshotOldTrackedTags loads the rows about to be updated or deleted and
-// stashes their tracked-field tags on the statement. GORM does not expose a
-// before-image, so this extra SELECT (same transaction, hooks skipped) is what
-// lets a collection move invalidate both sides and a delete of an unloaded
-// struct invalidate the deleted row's collections.
+// stashes their primary-key and tracked-field tags on the statement. GORM does
+// not expose a before-image, so this extra SELECT (same transaction, hooks
+// skipped) is what lets a predicate that names neither the primary key nor a
+// tracked collection still invalidate the affected rows, a collection move
+// invalidate both sides, and a delete of an unloaded struct invalidate the
+// deleted row's collections.
 func snapshotOldTrackedTags(tx *gorm.DB) {
 	if tx.Error != nil || tx.DryRun || tx.Statement == nil || tx.Statement.Schema == nil {
 		return
 	}
-	if !hasTrackedFields(tx) {
+	// Nothing on the row can become a tag, so the SELECT cannot help.
+	if len(tx.Statement.Schema.PrimaryFields) == 0 && !hasTrackedFields(tx) {
 		return
 	}
 
