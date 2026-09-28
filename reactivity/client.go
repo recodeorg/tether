@@ -23,8 +23,9 @@ type AuthCtx struct {
 	// tracker resets authorization state and re-runs the client's queries.
 	// Bumping it on a same-user refresh would reject in-flight results that
 	// nothing re-runs.
-	AuthEpoch int
-	ExpiresAt time.Time
+	AuthEpoch   int
+	ExpiresAt   time.Time
+	ExpiryTimer *time.Timer
 }
 
 func NewClient(conn *websocket.Conn) *Client {
@@ -39,6 +40,17 @@ func (c *Client) SetAuth(userID string, expiresAt time.Time) {
 	}
 	c.Auth.UserID = userID
 	c.Auth.ExpiresAt = expiresAt
+}
+
+// SetExpiryTimer stops the client's current auth-expiry timer and replaces it
+// with timer, which may be nil.
+func (c *Client) SetExpiryTimer(timer *time.Timer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Auth.ExpiryTimer != nil {
+		c.Auth.ExpiryTimer.Stop()
+	}
+	c.Auth.ExpiryTimer = timer
 }
 
 func (c *Client) GetAuth() AuthCtx {

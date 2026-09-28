@@ -67,6 +67,8 @@ type Engine struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
+	closeMu         sync.Mutex
+	closed          bool
 	db              *gorm.DB
 	dbType          string // sqlite or postgres
 	mutations       map[string]Mutation
@@ -253,6 +255,12 @@ func (e *Engine) reevaluateGuard(subscription *reactivity.Subscription, execID s
 }
 
 func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params map[string]interface{}) (string, error) {
+	// Counted in wg so Close releases the claim on a row inserted here even if
+	// the timer below is refused.
+	if !e.beginWork() {
+		return "", ErrEngineClosed
+	}
+	defer e.wg.Done()
 	paramsJSON, err := json.Marshal(params)
 	taskID := uuid.New().String()
 	if err != nil {
@@ -283,7 +291,11 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 		// Hold the mutex across AfterFunc so a zero-delay callback cannot
 		// remove the entry before it is stored.
 		e.timerMutex.Lock()
-		timer := time.AfterFunc(time.Until(timestamp), func() {
+		defer e.timerMutex.Unlock()
+		if e.isClosed() {
+			return taskID, nil
+		}
+		e.taskToTimer[taskID] = e.afterFunc(time.Until(timestamp), func() {
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Failed to execute scheduled task", "taskID", taskID, "error", r)
@@ -298,8 +310,6 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 				slog.Error("Failed to execute mutation internally", "error", err)
 			}
 		})
-		e.taskToTimer[taskID] = timer
-		e.timerMutex.Unlock()
 	} else {
 		// if it is not due within the schedule loop interval, we simply wait for the loop to catch it
 		// it is created without a claimant so that whatever instance is alive at the time of execution can claim it
@@ -432,6 +442,10 @@ func NewEngine(db *gorm.DB) *Engine {
 
 	// profiler initialization
 	e.Profiler = utilities.NewProfiler(func(mutationName string) {
+		if !e.beginWork() {
+			return
+		}
+		defer e.wg.Done()
 		_, err := e.executeMutationInternal(mutationName, map[string]interface{}{})
 		if err != nil {
 			slog.Error("Failed to execute mutation internally", "error", err)
@@ -565,11 +579,81 @@ func NewEngine(db *gorm.DB) *Engine {
 	return e
 }
 
-// Close cancels background work and waits for the scheduler, Postgres listener,
-// and storage cleanup loop to exit. It is safe to call more than once.
+var ErrEngineClosed = errors.New("tether: engine is closed")
+
+// Close shuts down all engine-owned background work. It is safe to call more
+// than once.
+//
+// It cancels the scheduler, Postgres listener and storage cleanup loops, stops
+// the profiler, and stops every pending scheduled-task and auth-expiry timer.
+// Timer and profiler-flush callbacks that are already running are waited for;
+// any that fire after Close has begun do nothing, and scheduling new tasks
+// returns ErrEngineClosed.
+//
+// Persisted tasks are never deleted by Close. Once in-flight callbacks have
+// finished, the claims this instance holds on tasks it did not run are
+// released so that another instance, or the next engine started on the same
+// database, runs them at their scheduled time (or immediately, if overdue).
+// If that release fails, the claims lapse when their lease expires.
 func (e *Engine) Close() {
+	e.closeMu.Lock()
+	first := !e.closed
+	e.closed = true
+	e.closeMu.Unlock()
+
 	e.cancel()
+	if e.Profiler != nil {
+		e.Profiler.Stop()
+	}
+	e.timerMutex.Lock()
+	for id, timer := range e.taskToTimer {
+		timer.Stop()
+		delete(e.taskToTimer, id)
+	}
+	e.timerMutex.Unlock()
+	e.tracker.StopAuthExpiryTimers()
 	e.wg.Wait()
+
+	if first {
+		err := e.db.Model(&TetherTask{}).Where("claimed_by = ?", e.EphemeralID).Updates(map[string]interface{}{
+			"claimed_by":   nil,
+			"locked_until": nil,
+		}).Error
+		if err != nil {
+			slog.Error("Failed to release scheduled task claims", "error", err)
+		}
+	}
+}
+
+// beginWork registers engine-owned work with wg so Close waits for it. It
+// returns false once Close has begun; the caller must then skip the work.
+// Otherwise the caller must call e.wg.Done when finished.
+func (e *Engine) beginWork() bool {
+	e.closeMu.Lock()
+	defer e.closeMu.Unlock()
+	if e.closed {
+		return false
+	}
+	e.wg.Add(1)
+	return true
+}
+
+func (e *Engine) isClosed() bool {
+	e.closeMu.Lock()
+	defer e.closeMu.Unlock()
+	return e.closed
+}
+
+// afterFunc is time.AfterFunc for engine-owned callbacks: Close waits for a
+// run in progress, and a run that starts after Close has begun is skipped.
+func (e *Engine) afterFunc(d time.Duration, f func()) *time.Timer {
+	return time.AfterFunc(d, func() {
+		if !e.beginWork() {
+			return
+		}
+		defer e.wg.Done()
+		f()
+	})
 }
 
 // contextSleep waits for d or until ctx is cancelled. It reports whether the
@@ -676,7 +760,9 @@ func (e *Engine) UseStorage(storage storage.StorageAdapter) {
 	e.storage = storage
 	e.CreateTable([]TetherStorage{})
 	e.CreateTable([]TetherDownloadToken{})
-	e.wg.Add(1)
+	if !e.beginWork() {
+		return
+	}
 	go func() {
 		defer e.wg.Done()
 		ticker := time.NewTicker(1 * time.Hour)
@@ -761,7 +847,11 @@ func (e *Engine) pollScheduledTasks() {
 		// Hold the mutex across AfterFunc so a zero-delay callback cannot
 		// remove the entry before it is stored.
 		e.timerMutex.Lock()
-		timer := time.AfterFunc(delay, func() {
+		if e.isClosed() {
+			e.timerMutex.Unlock()
+			return
+		}
+		e.taskToTimer[t.ID] = e.afterFunc(delay, func() {
 			e.timerMutex.Lock()
 			delete(e.taskToTimer, t.ID)
 			e.timerMutex.Unlock()
@@ -799,7 +889,6 @@ func (e *Engine) pollScheduledTasks() {
 				slog.Error("Failed to execute scheduled task", "taskID", t.ID, "error", err)
 			}
 		})
-		e.taskToTimer[t.ID] = timer
 		e.timerMutex.Unlock()
 	}
 }
@@ -2078,13 +2167,18 @@ func (e *Engine) onReceiveMessage(clientID string, msg map[string]interface{}) e
 			return fmt.Errorf("failed to get user ID: %w", err)
 		}
 		e.rerunSubscriptions(e.tracker.SetAuth(clientID, userID, expiresAt))
-		time.AfterFunc(time.Until(expiresAt), func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("Recovered from panic", "error", r)
-				}
-			}()
-			e.rerunSubscriptions(e.tracker.ExpireAuth(clientID, expiresAt))
+		e.tracker.ArmAuthExpiry(clientID, func() *time.Timer {
+			if e.isClosed() {
+				return nil
+			}
+			return e.afterFunc(time.Until(expiresAt), func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("Recovered from panic", "error", r)
+					}
+				}()
+				e.rerunSubscriptions(e.tracker.ExpireAuth(clientID, expiresAt))
+			})
 		})
 		message := map[string]interface{}{"type": "auth", "success": true, "data": map[string]interface{}{"user_id": userID}}
 		messageJSON, err := json.Marshal(message)

@@ -619,6 +619,191 @@ func TestCloseStopsBackgroundLoops(t *testing.T) {
 	}
 	e.Close()
 }
+
+// Close must stop timers armed by scheduleTask and by the schedule loop, keep
+// their rows, and release this instance's claims so another instance or the
+// next start runs them.
+func TestCloseStopsScheduledTaskTimers(t *testing.T) {
+	e := newConcurrentTestEngine(t)
+	var ran atomic.Int32
+	e.RegisterMutation("tick", func(ctx *MutationCtx) interface{} {
+		ran.Add(1)
+		return nil
+	})
+
+	// Long enough that neither timer fires before Close on a remote database.
+	const delay = time.Second
+	due := time.Now().Add(delay)
+	direct, err := e.scheduleTask(due, "tick", nil)
+	if err != nil {
+		t.Fatalf("schedule direct task: %v", err)
+	}
+	polled, err := e.scheduleTask(time.Now().Add(time.Hour), "tick", nil)
+	if err != nil {
+		t.Fatalf("schedule polled task: %v", err)
+	}
+	if err := e.db.Model(&TetherTask{}).Where("id = ?", polled).Update("execute_at", due).Error; err != nil {
+		t.Fatalf("move polled task into lookahead: %v", err)
+	}
+	e.pollScheduledTasks()
+	e.timerMutex.RLock()
+	armed := len(e.taskToTimer)
+	e.timerMutex.RUnlock()
+	if armed != 2 {
+		t.Fatalf("armed timers = %d, want 2", armed)
+	}
+
+	e.Close()
+	time.Sleep(time.Until(due) + 300*time.Millisecond)
+	if n := ran.Load(); n != 0 {
+		t.Fatalf("%d scheduled mutations ran after Close", n)
+	}
+	e.timerMutex.RLock()
+	left := len(e.taskToTimer)
+	e.timerMutex.RUnlock()
+	if left != 0 {
+		t.Fatalf("taskToTimer still holds %d timers after Close", left)
+	}
+
+	var tasks []TetherTask
+	if err := e.db.Where("id IN ?", []string{direct, polled}).Find(&tasks).Error; err != nil {
+		t.Fatalf("load tasks: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("Close removed persisted tasks: have %d, want 2", len(tasks))
+	}
+	for _, task := range tasks {
+		if task.ClaimedBy != nil || task.LockedUntil != nil {
+			t.Errorf("task %s still claimed after Close: claimed_by=%v locked_until=%v", task.ID, task.ClaimedBy, task.LockedUntil)
+		}
+	}
+
+	if id, err := e.scheduleTask(time.Now(), "tick", nil); !errors.Is(err, ErrEngineClosed) || id != "" {
+		t.Fatalf("scheduleTask after Close = (%q, %v), want ErrEngineClosed", id, err)
+	}
+}
+
+// A scheduled mutation already running when Close is called must finish
+// before Close returns, and its row is then removed as usual.
+func TestCloseWaitsForRunningScheduledTask(t *testing.T) {
+	e := newConcurrentTestEngine(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	e.RegisterMutation("slow", func(ctx *MutationCtx) interface{} {
+		close(started)
+		<-release
+		return nil
+	})
+	id, err := e.scheduleTask(time.Now(), "slow", nil)
+	if err != nil {
+		t.Fatalf("schedule: %v", err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("scheduled mutation did not start")
+	}
+
+	done := make(chan struct{})
+	go func() {
+		e.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("Close returned while a scheduled mutation was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not return after the scheduled mutation finished")
+	}
+
+	var n int64
+	e.db.Model(&TetherTask{}).Where("id = ?", id).Count(&n)
+	if n != 0 {
+		t.Fatal("completed task row was not removed")
+	}
+}
+
+func TestCloseStopsAuthExpiryTimers(t *testing.T) {
+	e := newConcurrentTestEngine(t)
+	client := trackClient(t, e)
+	expiresAt := time.Now().Add(500 * time.Millisecond)
+	e.SetAuth(&stubAuth{userID: "temp", expiresAt: expiresAt})
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+
+	e.Close()
+	time.Sleep(time.Until(expiresAt) + 200*time.Millisecond)
+	auth, ok := e.tracker.GetAuth(client.ID)
+	if !ok {
+		t.Fatal("client no longer tracked")
+	}
+	if auth.UserID != "temp" {
+		t.Fatalf("auth expiry ran after Close: user = %q", auth.UserID)
+	}
+	if auth.ExpiryTimer == nil {
+		return
+	}
+	if auth.ExpiryTimer.Stop() {
+		t.Fatal("auth expiry timer was still pending after Close")
+	}
+}
+
+// Re-authenticating and disconnecting must each stop the previous expiry
+// timer instead of leaving it to fire.
+func TestAuthExpiryTimerReplacedAndStoppedOnUntrack(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.SetAuth(&stubAuth{userID: "temp", expiresAt: time.Now().Add(time.Hour)})
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("auth: %v", err)
+	}
+	first, _ := e.tracker.GetAuth(client.ID)
+	if first.ExpiryTimer == nil {
+		t.Fatal("auth did not arm an expiry timer")
+	}
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{"type": "auth", "token": "t"}); err != nil {
+		t.Fatalf("re-auth: %v", err)
+	}
+	second, _ := e.tracker.GetAuth(client.ID)
+	if first.ExpiryTimer.Stop() {
+		t.Fatal("re-auth left the previous expiry timer pending")
+	}
+	e.tracker.Untrack(client)
+	if second.ExpiryTimer.Stop() {
+		t.Fatal("Untrack left the expiry timer pending")
+	}
+}
+
+func TestCloseStopsProfilerFlush(t *testing.T) {
+	e := newConcurrentTestEngine(t)
+	var flushes atomic.Int32
+	e.RegisterMutation("flush", func(ctx *MutationCtx) interface{} {
+		flushes.Add(1)
+		return nil
+	})
+	if err := e.Profiler.StartWithCallback(10*time.Millisecond, "flush"); err != nil {
+		t.Fatalf("start profiler: %v", err)
+	}
+	if !waitUntil(t, 2*time.Second, func() bool { return flushes.Load() > 0 }) {
+		t.Fatal("profiler never flushed")
+	}
+
+	e.Close()
+	if e.Profiler.IsActive() {
+		t.Fatal("profiler still active after Close")
+	}
+	after := flushes.Load()
+	time.Sleep(100 * time.Millisecond)
+	if n := flushes.Load(); n != after {
+		t.Fatalf("profiler flushed %d more times after Close", n-after)
+	}
+}
 func TestTrackCollectionAndTrackTableTagFormat(t *testing.T) {
 	ctx := &QueryCtx{}
 	ctx.TrackCollection("messages", "room_id", "lobby")

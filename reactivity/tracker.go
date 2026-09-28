@@ -203,6 +203,7 @@ func (t *Tracker) Untrack(c *Client) {
 	}
 	delete(t.clientToSubs, c.ID)
 	delete(t.clients, c.ID)
+	c.SetExpiryTimer(nil)
 	slog.Debug("Tracker: Untracked client", "clientID", c.ID)
 }
 
@@ -275,6 +276,29 @@ func (t *Tracker) ExpireAuth(clientID string, expiresAt time.Time) []*Subscripti
 	// would take that lock again and stall the expiry rerun.
 	t.send(client, []byte(`{"type": "auth", "success": false, "data": "Identity expired"}`))
 	return t.resetAuthorization(clientID)
+}
+
+// ArmAuthExpiry replaces the client's auth-expiry timer with the one returned
+// by arm. arm runs under t.mu, so a caller that checks for shutdown inside arm
+// cannot store a timer after StopAuthExpiryTimers has swept the clients. arm
+// may return nil to leave the client without a timer.
+func (t *Tracker) ArmAuthExpiry(clientID string, arm func() *time.Timer) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	client, exists := t.clients[clientID]
+	if !exists {
+		return
+	}
+	client.SetExpiryTimer(arm())
+}
+
+// StopAuthExpiryTimers stops the auth-expiry timer of every tracked client.
+func (t *Tracker) StopAuthExpiryTimers() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, client := range t.clients {
+		client.SetExpiryTimer(nil)
+	}
 }
 
 func (t *Tracker) GetAuth(clientID string) (AuthCtx, bool) {
