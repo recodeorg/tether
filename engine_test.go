@@ -25,7 +25,7 @@ import (
 	"github.com/cespare/xxhash"
 	"github.com/glebarez/sqlite"
 	"github.com/gorilla/websocket"
-	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/internal/reactivity"
 	"github.com/recodeorg/tether/storage"
 	"github.com/recodeorg/tether/storage/local"
 	"github.com/recodeorg/tether/utilities"
@@ -35,7 +35,7 @@ import (
 )
 
 // postgresTestDSN is the server used when tests are run with -postgres.
-const postgresTestDSN = "host=cheetah user=postgres password=secret dbname=mydb port=5432 sslmode=disable"
+const postgresTestDSN = "host=localhost user=postgres password=secret dbname=mydb port=5432 sslmode=disable"
 
 // usePostgres swaps the engine test suite from in-memory SQLite to Postgres.
 var usePostgres = flag.Bool("postgres", false, "run the engine test suite against Postgres instead of SQLite")
@@ -152,7 +152,10 @@ func newTestEngine(t *testing.T) *Engine {
 
 func newTestEngineWithType(t *testing.T) *Engine {
 	t.Helper()
-	e := NewEngine(newTestDB(t))
+	e, err := NewEngine(newTestDB(t))
+	if err != nil {
+		t.Fatalf("create engine: %v", err)
+	}
 	t.Cleanup(e.Close)
 	e.CreateTable(&testMessage{})
 	return e
@@ -592,7 +595,10 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 					t.Fatalf("NewEngine(%q) panicked: %v", dbType, r)
 				}
 			}()
-			e := NewEngine(newTestDB(t))
+			e, err := NewEngine(newTestDB(t))
+			if err != nil {
+				t.Fatalf("create engine: %v", err)
+			}
 			if e != nil {
 				t.Cleanup(e.Close)
 			}
@@ -602,7 +608,11 @@ func TestNewEngineAcceptsSQLiteAndPostgres(t *testing.T) {
 
 func TestCloseStopsBackgroundLoops(t *testing.T) {
 	e := newTestEngine(t)
-	e.UseStorage(local.NewLocalStorage(t.TempDir()))
+	store, err := local.NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	e.SetStorage(store)
 
 	done := make(chan struct{})
 	go func() {
@@ -2004,6 +2014,105 @@ func TestMutationFailureDoesNotPanicOrInvalidate(t *testing.T) {
 	}
 }
 
+func TestMutationReturningErrorSendsErrorFrame(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.RegisterMutation("denied", func(ctx *MutationCtx) interface{} {
+		return errors.New("not logged in")
+	})
+
+	if _, err := e.executeMutation("denied", map[string]interface{}{}, client.ID, "m-denied"); err != nil {
+		t.Fatalf("executeMutation: %v", err)
+	}
+	msgs := drain(client)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %#v, want one error frame", msgs)
+	}
+	msg := msgs[0]
+	if msg["type"] != "error" || msg["error"] != "not logged in" || msg["mutation_id"] != "m-denied" || msg["mutation"] != "denied" {
+		t.Errorf("message = %#v, want error frame for m-denied", msg)
+	}
+}
+
+func TestInternalOptionHidesFunctionsFromClients(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterQuery("hidden", func(ctx *QueryCtx) interface{} { return "secret" }, Internal())
+	e.RegisterMutation("hidden", func(ctx *MutationCtx) interface{} { return "secret" }, Internal())
+	e.RegisterGuard("plain", func(ctx *GuardCtx) interface{} { return true })
+
+	client := trackClient(t, e)
+	sub := e.tracker.SubscribeToQuery(client.ID, "hidden", "k", map[string]interface{}{})
+	if sub == nil {
+		t.Fatal("SubscribeToQuery returned nil")
+	}
+	if _, err := e.executeQuery("hidden", map[string]interface{}{}, sub); err == nil || err.Error() != "query not found" {
+		t.Errorf("internal query error = %v, want query not found", err)
+	}
+	if _, err := e.executeMutation("hidden", map[string]interface{}{}, client.ID, "m"); err == nil || err.Error() != "mutation not found" {
+		t.Errorf("internal mutation error = %v, want mutation not found", err)
+	}
+	got, err := e.executeMutationInternal("hidden", map[string]interface{}{})
+	if err != nil || got != "secret" {
+		t.Errorf("executeMutationInternal() = %#v, %v; want secret, nil", got, err)
+	}
+}
+
+func TestInternalMutationReturningErrorReturnsIt(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterMutation("fails", func(ctx *MutationCtx) interface{} {
+		return errors.New("boom")
+	})
+
+	result, err := e.executeMutationInternal("fails", map[string]interface{}{})
+	if err == nil || err.Error() != "boom" {
+		t.Errorf("executeMutationInternal error = %v, want boom", err)
+	}
+	if result != nil {
+		t.Errorf("executeMutationInternal result = %#v, want nil", result)
+	}
+}
+
+func TestQueryReturningErrorSendsErrorFrameAndStaysLive(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) interface{} {
+		ctx.TrackCollection("messages", "room_id", "lobby")
+		var msgs []testMessage
+		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
+		if len(msgs) == 0 {
+			return errors.New("room is empty")
+		}
+		return len(msgs)
+	})
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) interface{} {
+		ctx.DB.Create(&testMessage{Body: "hi", RoomID: "lobby"})
+		return nil
+	})
+
+	subscribe(t, e, client, "getMessages", "lobby-key", nil)
+	msgs := drain(client)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %#v, want one error frame", msgs)
+	}
+	msg := msgs[0]
+	if msg["type"] != "error" || msg["error"] != "room is empty" || msg["query_key"] != "lobby-key" || msg["timestamp"] == nil {
+		t.Errorf("message = %#v, want timestamped error frame for lobby-key", msg)
+	}
+
+	if _, err := e.executeMutation("createMessage", map[string]interface{}{}, client.ID, "m1"); err != nil {
+		t.Fatalf("executeMutation: %v", err)
+	}
+	var sawData bool
+	for _, msg := range drain(client) {
+		if msg["type"] == "query" && msg["query_key"] == "lobby-key" && msg["data"] == float64(1) {
+			sawData = true
+		}
+	}
+	if !sawData {
+		t.Error("query that returned an error was not re-run after its dependencies changed")
+	}
+}
+
 func TestExecuteQueryUnserializableParamsDoesNotPanic(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
@@ -2908,7 +3017,7 @@ func TestParamsAndResultsDoNotLeakToLogs(t *testing.T) {
 	})
 	e.RegisterMutation("internalLogin", func(ctx *MutationCtx) interface{} {
 		return map[string]interface{}{"refresh_token": resultSecret}
-	}, MutationOptions{Internal: true})
+	}, Internal())
 	e.RegisterQuery("session", func(ctx *QueryCtx) interface{} {
 		return map[string]interface{}{"refresh_token": resultSecret}
 	})
@@ -3699,8 +3808,11 @@ func TestSetCheckOrigin(t *testing.T) {
 
 func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir())
-	e.UseStorage(store)
+	store, err := local.NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	e.SetStorage(store)
 	e.SetAllowedOrigins([]string{"https://app.example"})
 
 	upload, err := e.getUploadURL(storage.UploadOptions{})
@@ -3821,8 +3933,11 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 
 func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir())
-	e.UseStorage(store)
+	store, err := local.NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	e.SetStorage(store)
 
 	upload, err := e.getUploadURL(storage.UploadOptions{})
 	if err != nil {
@@ -3851,8 +3966,11 @@ func TestStorageRoutesDefaultToSameOrigin(t *testing.T) {
 
 func TestStorageRoutesCustomCheckOrigin(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir())
-	e.UseStorage(store)
+	store, err := local.NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	e.SetStorage(store)
 	e.SetCheckOrigin(func(r *http.Request) bool {
 		return strings.HasSuffix(r.Header.Get("Origin"), ".example")
 	})
@@ -3882,9 +4000,12 @@ func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
 	e := newTestEngine(t)
 	root := t.TempDir()
 	uploadDir := filepath.Join(root, "uploads")
-	store := local.NewLocalStorage(uploadDir)
+	store, err := local.NewLocalStorage(uploadDir)
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
 	recorder := &recordingStorage{local: store}
-	e.UseStorage(recorder)
+	e.SetStorage(recorder)
 
 	sibling := filepath.Join(root, "outside.txt")
 	if err := os.WriteFile(sibling, []byte("sibling"), 0o644); err != nil {
@@ -3961,8 +4082,11 @@ func TestDeleteFileRequiresStoredObjectAndRejectsPathEscape(t *testing.T) {
 
 func TestDeleteFileRemovesStoredObject(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir())
-	e.UseStorage(store)
+	store, err := local.NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	e.SetStorage(store)
 
 	upload, err := e.getUploadURL(storage.UploadOptions{})
 	if err != nil {
@@ -4009,6 +4133,10 @@ func (r *recordingStorage) Delete(fileID string) error {
 	return r.local.Delete(fileID)
 }
 
+func (r *recordingStorage) Name() string {
+	return r.local.Name()
+}
+
 // cleanupStorage records whether upload metadata still existed when Delete ran,
 // and can fail a chosen id without touching its bytes.
 type cleanupStorage struct {
@@ -4040,15 +4168,22 @@ func (c *cleanupStorage) Delete(fileID string) error {
 	return c.local.Delete(fileID)
 }
 
+func (c *cleanupStorage) Name() string {
+	return c.local.Name()
+}
+
 func TestCleanStorage(t *testing.T) {
 	e := newTestEngine(t)
-	store := local.NewLocalStorage(t.TempDir())
+	store, err := local.NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
 	adapter := &cleanupStorage{
 		local: store,
 		db:    e.db,
 		fail:  map[string]error{"delete-fail": errors.New("disk full")},
 	}
-	e.UseStorage(adapter)
+	e.SetStorage(adapter)
 
 	if !e.db.Migrator().HasIndex(&TetherStorage{}, "ExpiresAt") {
 		t.Fatal("TetherStorage.ExpiresAt has no cleanup index")
@@ -4245,7 +4380,10 @@ func newConcurrentTestEngine(t *testing.T) *Engine {
 		t.Cleanup(func() { _ = sqlDB.Close() })
 	}
 
-	e := NewEngine(db)
+	e, err := NewEngine(db)
+	if err != nil {
+		t.Fatalf("create engine: %v", err)
+	}
 	t.Cleanup(e.Close)
 	e.CreateTable(&testMessage{})
 	e.SetCheckOrigin(func(*http.Request) bool { return true })

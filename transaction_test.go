@@ -15,7 +15,7 @@ import (
 
 	"github.com/glebarez/sqlite"
 	"github.com/jackc/pgx/v5"
-	"github.com/recodeorg/tether/reactivity"
+	"github.com/recodeorg/tether/internal/reactivity"
 	"github.com/recodeorg/tether/utilities"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
@@ -46,7 +46,10 @@ func newPooledEngine(t *testing.T, maxConns int) *Engine {
 	sqlDB.SetMaxOpenConns(maxConns)
 	sqlDB.SetMaxIdleConns(maxConns)
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	e := NewEngine(db)
+	e, err := NewEngine(db)
+	if err != nil {
+		t.Fatalf("create engine: %v", err)
+	}
 	t.Cleanup(e.Close)
 	e.CreateTable(&testMessage{})
 	return e

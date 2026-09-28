@@ -1,3 +1,5 @@
+// Package s3 provides a storage adapter for Amazon S3 and S3-compatible
+// services such as MinIO, Cloudflare R2 and DigitalOcean Spaces.
 package s3
 
 import (
@@ -12,18 +14,26 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+// Config configures an [S3Storage].
 type Config struct {
-	Region   string
-	Bucket   string
+	Region string
+	Bucket string
+	// Endpoint is the base URL of an S3-compatible service. Leave it empty
+	// for Amazon S3. It must use HTTPS.
 	Endpoint string
 }
 
+// S3Storage is a [storage.StorageAdapter] that stores each file as an object
+// in a bucket, keyed by its file ID. Requests use path-style URLs.
 type S3Storage struct {
 	client        *s3.Client
 	presignClient *s3.PresignClient
 	bucket        string
 }
 
+// NewS3Storage returns an S3Storage for cfg. Credentials are loaded the
+// standard AWS SDK way, from environment variables, shared config files or
+// an instance role. It returns an error if cfg.Endpoint uses plain HTTP.
 func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(cfg.Region),
@@ -54,6 +64,8 @@ func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
 	}, nil
 }
 
+// UploadStream streams the request body to the object fileID without
+// buffering it in memory.
 func (s *S3Storage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
@@ -65,6 +77,8 @@ func (s *S3Storage) UploadStream(ctx context.Context, fileID string, contentType
 	return err
 }
 
+// ServeFile redirects to a presigned URL for the object fileID that is valid
+// for 15 minutes.
 func (s *S3Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
 	// Generate a short-lived AWS URL
 	presignedReq, err := s.presignClient.PresignGetObject(r.Context(), &s3.GetObjectInput{
@@ -80,10 +94,16 @@ func (s *S3Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Requ
 	return nil
 }
 
+// Delete removes the object fileID.
 func (s *S3Storage) Delete(fileID string) error {
 	_, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(fileID),
 	})
 	return err
+}
+
+// Name returns "tether/storage/s3".
+func (s *S3Storage) Name() string {
+	return "tether/storage/s3"
 }

@@ -9,7 +9,10 @@ import (
 func TestDeleteRejectsPathEscape(t *testing.T) {
 	root := t.TempDir()
 	uploadDir := filepath.Join(root, "uploads")
-	store := NewLocalStorage(uploadDir)
+	store, err := NewLocalStorage(uploadDir)
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
 
 	sibling := filepath.Join(root, "outside.txt")
 	if err := os.WriteFile(sibling, []byte("sibling"), 0o644); err != nil {
@@ -44,8 +47,11 @@ func TestDeleteRejectsPathEscape(t *testing.T) {
 }
 
 func TestDeletePropagatesMissingFile(t *testing.T) {
-	store := NewLocalStorage(t.TempDir())
-	err := store.Delete("550e8400-e29b-41d4-a716-446655440000")
+	store, err := NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	err = store.Delete("550e8400-e29b-41d4-a716-446655440000")
 	if err == nil {
 		t.Fatal("delete of missing file returned nil")
 	}
@@ -55,7 +61,10 @@ func TestDeletePropagatesMissingFile(t *testing.T) {
 }
 
 func TestDeleteRemovesStoredObject(t *testing.T) {
-	store := NewLocalStorage(t.TempDir())
+	store, err := NewLocalStorage(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
 	fileID := "550e8400-e29b-41d4-a716-446655440000"
 	path := filepath.Join(store.UploadDir, fileID)
 	if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {

@@ -1,26 +1,41 @@
+// Package local provides a storage adapter that keeps files in a directory
+// on the server's disk.
 package local
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
+// LocalStorage is a [storage.StorageAdapter] that stores each file in
+// UploadDir under its file ID. It suits single-instance deployments; engines
+// on different servers cannot read each other's files.
 type LocalStorage struct {
 	UploadDir string
 }
 
-func NewLocalStorage(uploadDir string) *LocalStorage {
-	os.MkdirAll(uploadDir, os.ModePerm)
+// NewLocalStorage returns a LocalStorage that stores files in uploadDir,
+// creating the directory if it does not exist. It returns an error if the
+// directory cannot be created.
+func NewLocalStorage(uploadDir string) (*LocalStorage, error) {
+	err := os.MkdirAll(uploadDir, os.ModePerm)
+	if err != nil {
+		slog.Error("Failed to create directory", "error", err)
+		return nil, err
+	}
 	return &LocalStorage{
 		UploadDir: uploadDir,
-	}
+	}, nil
 }
 
+// UploadStream writes the request body to the file fileID, removing the
+// partial file if the copy fails.
 func (l *LocalStorage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
 	dstPath, err := l.safePath(fileID)
 	if err != nil {
@@ -39,6 +54,7 @@ func (l *LocalStorage) UploadStream(ctx context.Context, fileID string, contentT
 	return nil
 }
 
+// ServeFile serves the file fileID with [http.ServeFile].
 func (l *LocalStorage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
 	filePath, err := l.safePath(fileID)
 	if err != nil {
@@ -51,6 +67,7 @@ func (l *LocalStorage) ServeFile(fileID string, w http.ResponseWriter, r *http.R
 	return nil
 }
 
+// Delete removes the file fileID.
 func (l *LocalStorage) Delete(fileID string) error {
 	path, err := l.safePath(fileID)
 	if err != nil {
@@ -82,4 +99,9 @@ func (l *LocalStorage) safePath(fileID string) (string, error) {
 		return "", fmt.Errorf("invalid file id")
 	}
 	return candidate, nil
+}
+
+// Name returns "tether/storage/local".
+func (l *LocalStorage) Name() string {
+	return "tether/storage/local"
 }

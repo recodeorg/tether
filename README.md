@@ -1,147 +1,158 @@
 # Tether
 
-Tether is an experimental reactive backend framework for Go. It automatically syncs your database queries with your frontend in real-time. No need to write custom WebSocket logic or manage complex state. Just write your queries, and Tether keeps your UI up to date.
+Tether is a reactive backend framework for Go. Write your queries and mutations as plain Go functions, and Tether keeps every connected client in sync with your database in real time. You don't write WebSocket code, cache invalidation logic, or pub/sub plumbing.
 
-> [!WARNING]
-> Tether is in early alpha. Its API may change without notice, and it has not been tested in production. Use it for experimentation, not production workloads.
-
-## Features
-
-- **Real-time UI**: Queries automatically update over WebSockets when data changes.
-- **Smart Tracking**: Automatically tracks dependencies for records loaded through GORM.
-- **Client Libraries**: First-class support for TypeScript and React.
-- **Authentication**: Built-in support for optional token-based auth (JWTs, session tokens, etc).
-- **Database Support**: Currently supports SQLite (PostgreSQL planned).
-
-## Getting started
-
-Install the Go package:
+**[Read the docs →](https://docs.tetherdb.dev)**
 
 ```sh
 go get github.com/recodeorg/tether
 ```
 
-### 1. Define your models
+## Why Tether?
 
-Define a GORM model. Mark fields used to group records with `tether:"track"`:
+### Reactive by default
+
+In Tether, every query is live. When a client subscribes to a query, Tether records which rows and collections the query read. When a mutation changes any of that data, Tether reruns the affected queries and pushes the new results to every subscribed client. You don't opt in and you don't wire up events; it's how the framework works.
+
+Identical subscriptions are batched automatically. If a thousand clients are watching the same chat room, the query runs once and the result is fanned out to all of them.
+
+### Secure by design
+
+Tether assumes your code will eventually make a mistake, so its defaults are safe:
+
+- **Guards** are reusable, reactive authorization checks. You write "can this user see this room?" once and call it from any query. Guards are cached per user and re-evaluated automatically when the data behind them changes, so revoking access takes effect immediately on every open subscription. Clients who pass the same guard with the same result still share one batched query execution, so you get per-user authorization without per-user query cost.
+- **Queries and guards are read-only.** Any attempt to write to the database from a query or guard is rejected at the connection level.
+- **Internal functions stay internal.** Pass `Internal()` when registering a query or mutation and clients cannot call it. An internal mutation can still be run from your server code, such as a scheduled task.
+- **Hardened defaults** include WebSocket message and subscription limits, origin checks, redaction of auth tokens from logs and metrics, and path-traversal and content-sniffing protection for file storage.
+
+### Scales horizontally with no extra code
+
+Swap SQLite for PostgreSQL and you can run as many Tether instances as you like behind a load balancer. Instances coordinate through Postgres, so a mutation on one server updates clients connected to any other server, and scheduled tasks run exactly once across the cluster. There's no Redis, message broker, or extra configuration.
+
+### Batteries included
+
+- **Authentication**: bring your own tokens (JWTs, session tokens, and so on) by implementing a single `VerifyToken` method.
+- **File storage**: signed upload and download URLs, with local disk and S3-compatible adapters.
+- **Scheduling**: run mutations after a delay or on a cron schedule. Tasks persist across restarts.
+- **Transactions**: writes inside a database transaction only notify clients once the transaction commits. Rolled-back writes never reach clients.
+- **Profiling**: built-in performance profiling for queries, mutations, guards, and database calls.
+- **Client libraries**: first-class TypeScript and React clients.
+
+## Philosophy
+
+Tether is built around a few principles:
+
+- **Radical simplicity.** The public API should stay small and obvious. If a feature needs a lot of explanation, it probably doesn't belong in Tether.
+- **Effortless infrastructure changes.** Switching from SQLite to PostgreSQL, or from local disk to S3, should be a one-line change.
+- **No vendor lock-in.** Tether always runs as a single, self-contained Go binary on any server you control.
+- **Pluggable, not hard-coded.** Features that depend on outside infrastructure, like storage, come in through adapters instead of being baked into the core.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for more on how these principles guide the project.
+
+## A quick look
+
+A chat room where only members can read messages, and new messages appear for everyone instantly:
 
 ```go
 type Message struct {
-	ID     uint   `gorm:"primaryKey"`
+	ID     uint `gorm:"primaryKey"`
 	Body   string
 	RoomID string `tether:"track"`
 }
-```
 
-### 2. Set up the backend
-
-Create an engine, register your queries and mutations, and expose the WebSocket handler:
-
-```go
-db, err := gorm.Open(sqlite.Open("app.db"), &gorm.Config{})
-if err != nil {
-	log.Fatal(err)
+type RoomMember struct {
+	UserID string `gorm:"primaryKey"`
+	RoomID string `gorm:"primaryKey"`
 }
 
-engine := tether.NewEngine(db, "sqlite")
-engine.CreateTable("messages", &Message{})
-
-// Queries automatically re-run and push updates when their dependencies change
-engine.RegisterQuery("getMessages", func(ctx *tether.QueryCtx) interface{} {
-	roomID := ctx.Params["room"].(string)
-	ctx.TrackCollection("messages", "room_id", roomID)
-
-	var messages []Message
-	if err := ctx.DB.Where("room_id = ?", roomID).Find(&messages).Error; err != nil {
-		return map[string]interface{}{"error": err.Error()}
+func main() {
+	db, err := gorm.Open(sqlite.Open("app.db"), &gorm.Config{})
+	if err != nil {
+		log.Fatal(err)
 	}
-	return messages
-}, []string{"messages"})
 
-// Mutations automatically trigger updates for any affected queries
-engine.RegisterMutation("createMessage", func(ctx *tether.MutationCtx) interface{} {
-	message := Message{
-		Body:   ctx.Params["body"].(string),
-		RoomID: ctx.Params["room"].(string),
-	}
-	if err := ctx.DB.Create(&message).Error; err != nil {
-		return map[string]interface{}{"error": err.Error()}
-	}
-	return message
-})
+	engine := tether.NewEngine(db)
+	defer engine.Close()
+	engine.CreateTable(&Message{})
+	engine.CreateTable(&RoomMember{})
 
-http.HandleFunc("/tether", engine.Handle)
-log.Fatal(http.ListenAndServe(":8080", nil))
+	// A reusable authorization check. Its result is cached per user and
+	// re-evaluated automatically when room membership changes.
+	engine.RegisterGuard("isMember", func(ctx *tether.GuardCtx) interface{} {
+		userID, err := ctx.Auth.GetIdentity()
+		if err != nil {
+			return false
+		}
+		ctx.TrackCollection("room_members", "user_id", userID)
+
+		var member RoomMember
+		err = ctx.DB.Where("user_id = ? AND room_id = ?", userID, ctx.Params["room"]).First(&member).Error
+		return err == nil
+	})
+
+	// A live query. Subscribers get a fresh result whenever the messages
+	// in this room change.
+	engine.RegisterQuery("getMessages", func(ctx *tether.QueryCtx) interface{} {
+		room := ctx.Params["room"].(string)
+		allowed, err := ctx.Auth.ExecuteGuard("isMember", map[string]interface{}{"room": room})
+		if err != nil || allowed != true {
+			return errors.New("forbidden")
+		}
+
+		ctx.TrackCollection("messages", "room_id", room)
+		var messages []Message
+		ctx.DB.Where("room_id = ?", room).Find(&messages)
+		return messages
+	})
+
+	// Mutations don't need to notify anyone. Tether sees the write and
+	// updates every affected query on its own.
+	engine.RegisterMutation("sendMessage", func(ctx *tether.MutationCtx) interface{} {
+		message := Message{
+			Body:   ctx.Params["body"].(string),
+			RoomID: ctx.Params["room"].(string),
+		}
+		if err := ctx.DB.Create(&message).Error; err != nil {
+			return errors.New(err.Error())
+		}
+		return message
+	})
+
+	http.HandleFunc("/tether", engine.Handle)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
 ```
 
-### 3. Connect your frontend
-
-You can use the companion React library to automatically bind queries to your UI:
+On the frontend, `useQuery` stays in sync with the backend automatically:
 
 ```tsx
-import { useState } from "react"
 import { useMutation, useQuery } from "@tetherdb/react"
 
-export const App = () => {
-	// useQuery automatically reflects the backend state in real-time!
-    const data = useQuery("getMessages", { room: "1" })
-	
-    const [message, setMessage] = useState("")
-    const [localError, setLocalError] = useState<string | null>(null)
-    const { mutate, isPending } = useMutation("createMessage")
+export const Room = () => {
+	const { data: messages, error } = useQuery("getMessages", { room: "general" })
+	const { mutate } = useMutation("sendMessage")
 
-    const handleSendMessage = async () => {
-        const result = await mutate({ room: "1", message })
-        if (result.error) {
-            setLocalError(result.error)
-        }
-        setMessage("")
-    }
-
-    return (
-        <div>
-            {data?.map((msg) => (
-                <div key={msg.id}>{msg.sender?.name}: {msg.message}</div>
-            ))}
-            <input type="text" value={message} onChange={(e) => setMessage(e.target.value)} />
-            <button onClick={handleSendMessage}>Send Message</button>
-            {isPending && <div>Sending...</div>}
-            {localError && <div>Error: {localError}</div>}
-        </div>
-    )
+	return (
+		<div>
+			{messages?.map((msg) => <p key={msg.id}>{msg.body}</p>)}
+			<button onClick={() => mutate({ room: "general", body: "Hello!" })}>Say hello</button>
+		</div>
+	)
 }
 ```
 
-Or use the vanilla TypeScript client:
+To scale this app horizontally, replace `sqlite.Open("app.db")` with `postgres.Open(dsn)` and run as many copies as you need.
 
-```ts
-import { TetherClient } from "@tetherdb/client";
+The [documentation](https://docs.tetherdb.dev) covers authentication, file storage, scheduling, transactions, profiling, deployment, and the full client API.
 
-const client = new TetherClient();
-client.connect("ws://localhost:8080/tether");
+## Requirements
 
-// The callback runs again whenever a message in the `general` room is created, updated, or deleted
-client.subscribe("getMessages", { room: "general" }, (messages) => {
-	console.log("Messages updated:", messages);
-});
+- Go 1.26 or newer
+- SQLite or PostgreSQL. PostgreSQL is required for horizontal scaling.
 
-await client.sendMutation("createMessage", {
-	room: "general",
-	body: "Hello, Tether!",
-});
-```
+## Contributing
 
-## How it works
-
-Clients subscribe to named queries with a set of parameters. While a query runs, Tether records the rows and collections it depends on. When a mutation changes one of those dependencies, Tether reruns the affected query and sends the new result to each subscribed client.
-
-### Authentication
-
-Authentication is optional. Implement the `tether.Auth` interface and pass it to `engine.SetAuth`. Tether associates the returned user ID and expiration time with the client's WebSocket connection.
-
-## Current status
-
-Tether currently targets SQLite. PostgreSQL support, broader client support, API stabilization, and production hardening are still in progress.
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request, and report security issues privately through GitHub's vulnerability reporting.
 
 ## License
 
