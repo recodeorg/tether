@@ -296,14 +296,19 @@ func (e *Engine) scheduleTask(timestamp time.Time, functionName string, params m
 			return taskID, nil
 		}
 		e.taskToTimer[taskID] = e.afterFunc(time.Until(timestamp), func() {
+			e.timerMutex.Lock()
+			delete(e.taskToTimer, taskID)
+			e.timerMutex.Unlock()
+			var check TetherTask
+			if err := e.db.Where("id = ?", taskID).First(&check).Error; err != nil {
+				slog.Error("Task removed before execution", "taskID", taskID, "error", err)
+				return
+			}
 			defer func() {
 				if r := recover(); r != nil {
 					slog.Error("Failed to execute scheduled task", "taskID", taskID, "error", r)
 				}
 				e.db.Delete(&TetherTask{}, "id = ?", taskID)
-				e.timerMutex.Lock()
-				delete(e.taskToTimer, taskID)
-				e.timerMutex.Unlock()
 			}()
 			_, err := e.executeMutationInternal(functionName, params)
 			if err != nil {
