@@ -2450,8 +2450,17 @@ func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
 func (e *Engine) onReceiveMessage(clientID string, msg map[string]interface{}) error {
 	// Frames carry application params (passwords, refresh tokens, ...), so only
 	// the frame type is ever logged.
-	msgType, _ := msg["type"].(string)
-	slog.Debug("Received message", "from", clientID, "type", msgType)
+	msgType, ok := msg["type"].(string)
+	if !ok {
+		slog.Error("Could not get message type", "from", clientID)
+		return nil
+	}
+	protocolVersion, ok := msg["protocol_version"].(float64)
+	if !ok {
+		slog.Error("Could not get protocol version", "from", clientID)
+		return nil
+	}
+	slog.Debug("Received message", "from", clientID, "type", msgType, "protocol_version", protocolVersion)
 	switch msgType {
 	case "subscribe":
 		query, ok := msg["location"].(string)
