@@ -2457,8 +2457,7 @@ func (e *Engine) onReceiveMessage(clientID string, msg map[string]interface{}) e
 	}
 	protocolVersion, ok := msg["protocol_version"].(float64)
 	if !ok {
-		slog.Error("Could not get protocol version", "from", clientID)
-		return nil
+		slog.Error("Could not get protocol version, assuming latest", "from", clientID)
 	}
 	slog.Debug("Received message", "from", clientID, "type", msgType, "protocol_version", protocolVersion)
 	switch msgType {
