@@ -1,7 +1,8 @@
-package utilities
+package tether
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -236,5 +237,26 @@ func TestSanitizeMetricsUnattributedEmptyID(t *testing.T) {
 	}
 	if len(exec.DatabaseOps) != 2 {
 		t.Fatalf("database ops = %d, want 2 sibling spans", len(exec.DatabaseOps))
+	}
+}
+
+func TestStartWithCallbackRecoversFlushPanic(t *testing.T) {
+	var calls atomic.Int32
+	p := newProfiler(func(string) {
+		if calls.Add(1) == 1 {
+			panic("flush boom")
+		}
+	})
+	if err := p.StartWithCallback(15*time.Millisecond, "flushMetrics"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.Stop)
+
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("flushes = %d, want the callback to keep running after a panic", calls.Load())
 	}
 }

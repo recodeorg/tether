@@ -9,17 +9,12 @@ import (
 )
 
 // MessageReceiver receives decoded WebSocket payloads. Implemented by tether.Engine.
-type EngineHandler interface {
-	OnConnect(clientID string) error
-	OnDisconnect(clientID string) error
-	OnReceiveMessage(clientID string, msg map[string]interface{}) error
-}
 
 type WebsocketHelper struct {
 	CheckOrigin func(r *http.Request) bool
 }
 
-func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tracker, helper *WebsocketHelper) {
+func Handle(w http.ResponseWriter, r *http.Request, onReceiveMessage func(clientID string, msg map[string]interface{}) error, tracker *Tracker, helper *WebsocketHelper) {
 	upgrader := websocket.Upgrader{
 		CheckOrigin: helper.CheckOrigin,
 	}
@@ -30,34 +25,27 @@ func Handle(w http.ResponseWriter, r *http.Request, e EngineHandler, tracker *Tr
 	}
 
 	client := NewClient(ws)
-	err = e.OnConnect(client.ID)
-	if err != nil {
-		slog.Error("WS: Failed to call onConnect handler", "error", err)
-		return
-	}
-	defer e.OnDisconnect(client.ID)
 	tracker.Track(client)
 	defer func() {
 		tracker.Untrack(client)
 		close(client.Send)
 	}()
 	go client.WritePump()
+	ws.SetReadLimit(1024 * 8) // 8KB
 	for {
 		_, message, err := ws.ReadMessage()
 		if err != nil {
 			slog.Error("WS: Failed to read message", "error", err)
 			return
 		}
-		slog.Debug("WS: Received message", "message", string(message))
-
 		var msg map[string]interface{}
 		err = json.Unmarshal(message, &msg)
 		if err != nil {
 			slog.Error("WS: Failed to unmarshal message", "error", err)
 			return
 		}
-		slog.Debug("WS: Unmarshalled message", "message", msg)
-		err = e.OnReceiveMessage(client.ID, msg)
+		slog.Debug("WS: Received message", "client", client.ID, "bytes", len(message))
+		err = onReceiveMessage(client.ID, msg)
 		if err != nil {
 			slog.Error("WS: Failed to on receive message", "error", err)
 			continue

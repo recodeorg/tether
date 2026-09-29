@@ -1,9 +1,10 @@
-package utilities
+package tether
 
 import (
 	"cmp"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -11,8 +12,10 @@ import (
 	"time"
 )
 
+// MetricType is the kind of work a [Metric] measures.
 type MetricType string
 
+// Metric types recorded by the engine.
 const (
 	MetricTypeQuery          MetricType = "query"
 	MetricTypeMutation       MetricType = "mutation"
@@ -22,6 +25,9 @@ const (
 	MetricTypeAuthentication MetricType = "authentication"
 )
 
+// Metric is one raw timing span recorded by the [Profiler]. Spans from the
+// same query, mutation or guard execution share an ID. Use [SanitizeMetrics]
+// to turn a batch of metrics into a report.
 type Metric struct {
 	ID       string        // The id of the metric
 	Name     string        // The name of the metric
@@ -32,8 +38,13 @@ type Metric struct {
 	Tags     []string      // The tracking tags of the metric
 }
 
+// ErrProfilerRunning is returned when starting a profiler that is already
+// running.
 var ErrProfilerRunning = errors.New("tether: profiler is already running")
 
+// Profiler collects [Metric] values while it is running. Recording is nearly
+// free while it is stopped. At most 100,000 metrics are buffered between
+// flushes; later ones are dropped. A Profiler is safe for concurrent use.
 type Profiler struct {
 	active   atomic.Bool
 	mu       sync.Mutex
@@ -43,7 +54,9 @@ type Profiler struct {
 	onFlush  func(mutationName string)
 }
 
-func NewProfiler(onFlush func(mutationName string)) *Profiler {
+// newProfiler returns a stopped profiler that calls onFlush on each tick
+// started by StartWithCallback.
+func newProfiler(onFlush func(mutationName string)) *Profiler {
 	return &Profiler{
 		metrics:  make([]Metric, 0, 2048),
 		capacity: 100_000, // Safe ceiling to prevent runaway RAM usage
@@ -51,10 +64,13 @@ func NewProfiler(onFlush func(mutationName string)) *Profiler {
 	}
 }
 
+// IsActive reports whether the profiler is running.
 func (p *Profiler) IsActive() bool {
 	return p.active.Load()
 }
 
+// Start starts recording metrics. Collect them with DumpMetricsAndFlush. It
+// returns [ErrProfilerRunning] if the profiler is already running.
 func (p *Profiler) Start() error {
 	if !p.active.CompareAndSwap(false, true) {
 		return ErrProfilerRunning
@@ -62,6 +78,12 @@ func (p *Profiler) Start() error {
 	return nil
 }
 
+// StartWithCallback starts recording metrics and, every flushInterval, calls
+// the profiler's flush callback with mutationName. On the engine's profiler
+// this runs the mutation mutationName with no params and no caller; that
+// mutation (usually Internal) should call ctx.Profiler.DumpMetricsAndFlush
+// and store or log the result. It returns [ErrProfilerRunning] if the
+// profiler is already running.
 func (p *Profiler) StartWithCallback(flushInterval time.Duration, mutationName string) error {
 	if !p.active.CompareAndSwap(false, true) {
 		return ErrProfilerRunning
@@ -81,9 +103,16 @@ func (p *Profiler) StartWithCallback(flushInterval time.Duration, mutationName s
 			case <-stop:
 				return
 			case <-ticker.C:
-				if p.onFlush != nil {
-					p.onFlush(mutationName)
-				}
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							slog.Error("Recovered from panic", "error", r)
+						}
+					}()
+					if p.onFlush != nil {
+						p.onFlush(mutationName)
+					}
+				}()
 			}
 		}
 	}()
@@ -91,6 +120,7 @@ func (p *Profiler) StartWithCallback(flushInterval time.Duration, mutationName s
 	return nil
 }
 
+// Add records m if the profiler is running, and does nothing otherwise.
 func (p *Profiler) Add(m Metric) {
 	// Ultra-fast path: lock-free when inactive
 	if !p.active.Load() {
@@ -106,6 +136,8 @@ func (p *Profiler) Add(m Metric) {
 	}
 }
 
+// DumpMetricsAndFlush returns the metrics recorded since the last call and
+// clears the buffer. It returns nil if there are none.
 func (p *Profiler) DumpMetricsAndFlush() []Metric {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -119,6 +151,9 @@ func (p *Profiler) DumpMetricsAndFlush() []Metric {
 	return flushed
 }
 
+// Stop stops recording and stops the flush callback, if any. Metrics already
+// recorded stay buffered until DumpMetricsAndFlush is called. Stopping a
+// stopped profiler does nothing.
 func (p *Profiler) Stop() {
 	if !p.active.CompareAndSwap(true, false) {
 		return
@@ -146,11 +181,11 @@ type ProfileOp struct {
 // non-overlapping components. Logic is the parent query/mutation wall time
 // minus nested database (and cache/routing/auth) time.
 type ProfiledExecution struct {
-	ID        string        `json:"id"`
-	Name      string        `json:"name"`
-	Type      MetricType    `json:"type"`
-	StartedAt time.Time     `json:"started_at"`
-	Tags      []string      `json:"tags,omitempty"`
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Type      MetricType `json:"type"`
+	StartedAt time.Time  `json:"started_at"`
+	Tags      []string   `json:"tags,omitempty"`
 
 	Total    time.Duration `json:"total"`
 	Logic    time.Duration `json:"logic"`
@@ -274,6 +309,8 @@ func (r ProfileReport) Slowest(n int) []ProfiledExecution {
 	return ranked[:n]
 }
 
+// String formats the report as a human-readable summary: overall totals, a
+// breakdown by name, and the 15 slowest executions.
 func (r ProfileReport) String() string {
 	if len(r.Executions) == 0 {
 		return "Profiler report (empty)"

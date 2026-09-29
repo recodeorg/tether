@@ -18,8 +18,14 @@ type Client struct {
 }
 
 type AuthCtx struct {
-	UserID    string
-	ExpiresAt time.Time
+	UserID string
+	// AuthEpoch advances only when UserID changes, which is exactly when the
+	// tracker resets authorization state and re-runs the client's queries.
+	// Bumping it on a same-user refresh would reject in-flight results that
+	// nothing re-runs.
+	AuthEpoch   int
+	ExpiresAt   time.Time
+	ExpiryTimer *time.Timer
 }
 
 func NewClient(conn *websocket.Conn) *Client {
@@ -29,8 +35,22 @@ func NewClient(conn *websocket.Conn) *Client {
 func (c *Client) SetAuth(userID string, expiresAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.Auth.UserID != userID {
+		c.Auth.AuthEpoch++
+	}
 	c.Auth.UserID = userID
 	c.Auth.ExpiresAt = expiresAt
+}
+
+// SetExpiryTimer stops the client's current auth-expiry timer and replaces it
+// with timer, which may be nil.
+func (c *Client) SetExpiryTimer(timer *time.Timer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Auth.ExpiryTimer != nil {
+		c.Auth.ExpiryTimer.Stop()
+	}
+	c.Auth.ExpiryTimer = timer
 }
 
 func (c *Client) GetAuth() AuthCtx {
@@ -40,10 +60,13 @@ func (c *Client) GetAuth() AuthCtx {
 	return copy
 }
 
+const writeWait = 10 * time.Second
+
 func (c *Client) WritePump() {
 	defer c.Conn.Close()
 
 	for message := range c.Send {
+		c.Conn.SetWriteDeadline(time.Now().Add(writeWait))
 		err := c.Conn.WriteMessage(websocket.TextMessage, message)
 		if err != nil {
 			slog.Error("Client write pump failed", "error", err, "client", c.ID)

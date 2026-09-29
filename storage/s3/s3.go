@@ -1,8 +1,12 @@
+// Package s3 provides a storage adapter for Amazon S3 and S3-compatible
+// services such as MinIO, Cloudflare R2 and DigitalOcean Spaces.
 package s3
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -10,25 +14,37 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
+// Config configures a [Storage].
 type Config struct {
-	Region   string
-	Bucket   string
+	Region string
+	Bucket string
+	// Endpoint is the base URL of an S3-compatible service. Leave it empty
+	// for Amazon S3. It must use HTTPS.
 	Endpoint string
 }
 
-type S3Storage struct {
+// Storage is a storage adapter that stores each file as an object
+// in a bucket, keyed by its file ID. Requests use path-style URLs.
+type Storage struct {
 	client        *s3.Client
 	presignClient *s3.PresignClient
 	bucket        string
 }
 
-func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
+// New returns a Storage for cfg. Credentials are loaded the standard AWS
+// SDK way, from environment variables, shared config files or an instance
+// role. It returns an error if cfg.Endpoint uses plain HTTP.
+func New(ctx context.Context, cfg Config) (*Storage, error) {
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(cfg.Region),
 	}
 
 	if cfg.Endpoint != "" {
 		opts = append(opts, config.WithBaseEndpoint(cfg.Endpoint))
+	}
+
+	if strings.HasPrefix(cfg.Endpoint, "http://") {
+		return nil, errors.New("tether: S3 custom endpoints must use HTTPS to support streaming uploads without memory buffering")
 	}
 
 	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
@@ -41,14 +57,17 @@ func NewS3Storage(ctx context.Context, cfg Config) (*S3Storage, error) {
 		o.UsePathStyle = true
 	})
 
-	return &S3Storage{
+	return &Storage{
 		client:        client,
 		presignClient: s3.NewPresignClient(client),
 		bucket:        cfg.Bucket,
 	}, nil
 }
 
-func (s *S3Storage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
+// UploadStream streams r.Body to the object fileID without buffering it
+// in memory. r.ContentLength is sent as the object size and can be -1
+// for a chunked upload; the engine stores that same value as the file size.
+func (s *Storage) UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error {
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(fileID),
@@ -59,7 +78,9 @@ func (s *S3Storage) UploadStream(ctx context.Context, fileID string, contentType
 	return err
 }
 
-func (s *S3Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
+// ServeFile redirects to a presigned URL for the object fileID that is valid
+// for 15 minutes.
+func (s *Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
 	// Generate a short-lived AWS URL
 	presignedReq, err := s.presignClient.PresignGetObject(r.Context(), &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
@@ -74,10 +95,16 @@ func (s *S3Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Requ
 	return nil
 }
 
-func (s *S3Storage) Delete(fileID string) error {
-	_, err := s.client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
+// Delete removes the object fileID.
+func (s *Storage) Delete(ctx context.Context, fileID string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(fileID),
 	})
 	return err
+}
+
+// Name returns "tether/storage/s3".
+func (s *Storage) Name() string {
+	return "tether/storage/s3"
 }
