@@ -1,3 +1,15 @@
+## [1.1.0] - 2026-09-30
+
+### Added
+- `Engine.ExecuteQuery` to run a registered query once from server code, including queries registered with `Internal()`. The run is not subscribed and does not push to clients; `ctx.DB` is read-only. There is no caller: `GetIdentity` returns `ErrNoCaller` and `ExecuteGuard` returns an error
+- `Engine.ExecuteMutation` to run a registered mutation from server code, including `Internal()` mutations. Writes through `ctx.DB` invalidate subscribed queries the same way as a client mutation. There is no caller, with the same auth behavior as `ExecuteQuery`
+
+### Changed
+- Documentation for no-caller contexts (`ErrNoCaller`, `ExecuteGuard`, `Internal`) now covers `ExecuteQuery` and `ExecuteMutation` alongside scheduled tasks and crons
+
+### Fixed
+- Internally executed mutations (including scheduler and cron runs) now properly attach execution ID and action name to the database context for profiler attribution
+
 ## [1.0.0] - 2026-09-28
 
 First stable release. Focuses on correct auth/reactivity under batching and transactions, a smaller public API, and hardening around storage, scheduling, and WebSockets.
