@@ -86,6 +86,7 @@ type TetherStorage struct {
 	MaxBytes  int64     // maximum size allowed at upload time
 	MimeType  string    // MIME type of the file
 	Adapter   string    // adapter used to store the file (local, s3, etc.), helpful for migrations
+	Public    bool      // whether the file is public (can be accessed without a token)
 	ExpiresAt time.Time `gorm:"index"` // time when the upload token expires
 	CreatedAt time.Time // time when the upload token was created
 }
@@ -1871,7 +1872,7 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 
 	fileID := uuid.NewString()
 	token := uuid.NewString()
-	maxBytes, expiresIn := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+	maxBytes, expiresIn, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	err := e.db.Create(&TetherStorage{
 		ID:        fileID,
@@ -1879,6 +1880,7 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 		Status:    "pending",
 		MaxBytes:  maxBytes,
 		ExpiresAt: time.Now().Add(expiresIn),
+		Public:    public,
 	}).Error
 	if err != nil {
 		return storage.UploadInfo{}, err
@@ -2407,7 +2409,14 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 		Cancel: func(taskID string) bool {
 			return e.cancelTask(taskID)
 		},
-	}}
+	},
+		ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteMutation(mutationName, params)
+		},
+		ExecuteQuery: func(queryName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteQuery(queryName, params)
+		},
+	}
 	start := time.Now()
 	result, err := normalizeHandlerResult(e.mutations[mutation].Func(mutationCtx))
 	e.Profiler().Add(Metric{
@@ -2482,8 +2491,14 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 		},
 		Cancel: func(taskID string) bool {
 			return e.cancelTask(taskID)
+		}},
+		ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteMutation(mutationName, params)
 		},
-	}}
+		ExecuteQuery: func(queryName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteQuery(queryName, params)
+		},
+	}
 	start := time.Now()
 	result, err := normalizeHandlerResult(e.mutations[mutation].Func(mutationCtx))
 	e.Profiler().Add(Metric{

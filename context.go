@@ -125,6 +125,28 @@ type MutationCtx struct {
 	// Profiler is the engine's profiler, the same value [Engine.Profiler] returns.
 	Profiler *Profiler
 	Storage  *StorageCtx
+	// ExecuteMutation runs the mutation name with params and returns its result.
+	//
+	// It is safe to call from code that is not itself inside a mutation, including
+	// a goroutine that holds the engine. Writes made through the mutation's ctx.DB
+	// re-run subscribed queries the same way a client mutation does.
+	//
+	// name may be registered with [Internal]. There is no caller:
+	// ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard returns
+	// an error. A non-nil error from the mutation, including a returned value that
+	// implements error, is returned to the caller. params are passed through
+	// unchanged.
+	ExecuteMutation func(mutationName string, params map[string]interface{}) (any, error)
+	// ExecuteQuery runs the query name once with params and returns its result.
+	//
+	// The query is not subscribed and its result is not sent to clients. It is
+	// safe to call from code that is not inside a mutation, including a goroutine
+	// that holds the engine. name may be registered with [Internal]. There is no
+	// caller: ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard
+	// returns an error. ctx.DB is read-only. A non-nil error from the query,
+	// including a returned value that implements error, is returned to the caller.
+	// params are passed through unchanged.
+	ExecuteQuery func(queryName string, params map[string]interface{}) (any, error)
 }
 
 // GuardCtx is passed to guard functions registered with
