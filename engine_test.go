@@ -2084,6 +2084,245 @@ func TestScheduledMutationGetIdentityReturnsErrNoCaller(t *testing.T) {
 	}
 }
 
+func TestExecuteMutationReturnsResult(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterMutation("hidden", func(ctx *MutationCtx) (any, error) {
+		return ctx.Params["n"], nil
+	}, Internal())
+
+	got, err := e.ExecuteMutation("hidden", map[string]interface{}{"n": 3})
+	if err != nil || got != 3 {
+		t.Errorf("ExecuteMutation() = %#v, %v; want 3, nil", got, err)
+	}
+}
+
+func TestExecuteMutationReturnsHandlerError(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterMutation("fails", func(ctx *MutationCtx) (any, error) {
+		return nil, errors.New("boom")
+	})
+
+	result, err := e.ExecuteMutation("fails", nil)
+	if err == nil || err.Error() != "boom" {
+		t.Errorf("ExecuteMutation error = %v, want boom", err)
+	}
+	if result != nil {
+		t.Errorf("ExecuteMutation result = %#v, want nil", result)
+	}
+}
+
+func TestExecuteMutationAuthHasNoCaller(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterGuard("plain", func(ctx *GuardCtx) (any, error) { return true, nil })
+	e.RegisterMutation("who", func(ctx *MutationCtx) (any, error) {
+		if _, err := ctx.Auth.GetIdentity(); !errors.Is(err, ErrNoCaller) {
+			return nil, fmt.Errorf("GetIdentity error = %v, want ErrNoCaller", err)
+		}
+		_, err := ctx.Auth.ExecuteGuard("plain", nil)
+		return nil, err
+	})
+
+	_, err := e.ExecuteMutation("who", nil)
+	if err == nil || err.Error() != "guards cannot be executed internally" {
+		t.Fatalf("ExecuteGuard error = %v, want guards cannot be executed internally", err)
+	}
+}
+
+func TestExecuteMutationUnknownName(t *testing.T) {
+	e := newTestEngine(t)
+	_, err := e.ExecuteMutation("missing", nil)
+	if err == nil || err.Error() != "mutation not found" {
+		t.Errorf("ExecuteMutation error = %v, want mutation not found", err)
+	}
+}
+
+func TestExecuteMutationInvalidatesSubscribers(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	var runs atomic.Int64
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
+		runs.Add(1)
+		ctx.TrackCollection("messages", "room_id", "lobby")
+		var msgs []testMessage
+		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
+		return msgs, nil
+	})
+	subscribe(t, e, client, "getMessages", "lobby", nil)
+	drain(client)
+
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
+		return nil, ctx.DB.Create(&testMessage{Body: "hi", RoomID: "lobby"}).Error
+	}, Internal())
+	if _, err := e.ExecuteMutation("createMessage", nil); err != nil {
+		t.Fatalf("ExecuteMutation: %v", err)
+	}
+	if got := runs.Load(); got != 2 {
+		t.Errorf("query runs after ExecuteMutation = %d, want 2", got)
+	}
+	if got := queryMessages(t, drain(client)); len(got) != 1 {
+		t.Errorf("query pushes after ExecuteMutation = %d, want 1", len(got))
+	}
+}
+
+func TestExecuteMutationTracesDatabaseWrites(t *testing.T) {
+	e := newTestEngine(t)
+	if err := e.Profiler().Start(); err != nil {
+		t.Fatalf("start profiler: %v", err)
+	}
+	t.Cleanup(e.Profiler().Stop)
+
+	var execID, actionName string
+	e.RegisterMutation("createMessage", func(ctx *MutationCtx) (any, error) {
+		execID, _ = ctx.DB.Statement.Context.Value(ContextKeyExecutionID).(string)
+		actionName, _ = ctx.DB.Statement.Context.Value(ContextKeyActionName).(string)
+		return nil, ctx.DB.Create(&testMessage{Body: "hi", RoomID: "lobby"}).Error
+	}, Internal())
+
+	if _, err := e.ExecuteMutation("createMessage", nil); err != nil {
+		t.Fatalf("ExecuteMutation: %v", err)
+	}
+	if execID == "" {
+		t.Fatal("mutation DB context has no execution ID")
+	}
+	if actionName != "createMessage" {
+		t.Fatalf("action name = %q, want createMessage", actionName)
+	}
+
+	var sawMutation, sawDB, sawInvalidate bool
+	for _, m := range e.Profiler().DumpMetricsAndFlush() {
+		switch {
+		case m.Type == MetricTypeMutation && m.Name == "mutation:createMessage":
+			sawMutation = true
+			if m.ID != execID {
+				t.Errorf("mutation metric ID = %q, want %q", m.ID, execID)
+			}
+		case m.Type == MetricTypeDatabase && m.ID == execID:
+			sawDB = true
+			if m.Name == "" || !strings.HasPrefix(m.Name, "gorm:") {
+				t.Errorf("database metric name = %q, want gorm:<model>", m.Name)
+			}
+		case m.Type == MetricTypeRouting && m.Name == "invalidate_tags:createMessage":
+			sawInvalidate = true
+			if m.ID != execID {
+				t.Errorf("invalidate metric ID = %q, want %q", m.ID, execID)
+			}
+		}
+	}
+	if !sawMutation {
+		t.Error("profiler did not record the mutation")
+	}
+	if !sawDB {
+		t.Error("profiler did not attribute the write to the mutation execution")
+	}
+	if !sawInvalidate {
+		t.Error("profiler did not attribute invalidation to the mutation")
+	}
+}
+
+func TestExecuteQueryReturnsResult(t *testing.T) {
+	e := newTestEngine(t)
+	if err := e.db.Create(&testMessage{Body: "hello", RoomID: "lobby"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	e.RegisterQuery("hidden", func(ctx *QueryCtx) (any, error) {
+		if ctx.Params["n"] != 3 {
+			return nil, fmt.Errorf("params[n] = %#v, want 3", ctx.Params["n"])
+		}
+		var msg testMessage
+		if err := ctx.DB.Where("room_id = ?", "lobby").First(&msg).Error; err != nil {
+			return nil, err
+		}
+		return msg.Body, nil
+	}, Internal())
+
+	got, err := e.ExecuteQuery("hidden", map[string]interface{}{"n": 3})
+	if err != nil || got != "hello" {
+		t.Errorf("ExecuteQuery() = %#v, %v; want hello, nil", got, err)
+	}
+}
+
+func TestExecuteQueryReturnsHandlerError(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterQuery("fails", func(ctx *QueryCtx) (any, error) {
+		return nil, errors.New("boom")
+	})
+
+	result, err := e.ExecuteQuery("fails", nil)
+	if err == nil || err.Error() != "boom" {
+		t.Errorf("ExecuteQuery error = %v, want boom", err)
+	}
+	if result != nil {
+		t.Errorf("ExecuteQuery result = %#v, want nil", result)
+	}
+}
+
+func TestExecuteQueryAuthHasNoCaller(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterGuard("plain", func(ctx *GuardCtx) (any, error) { return true, nil })
+	e.RegisterQuery("who", func(ctx *QueryCtx) (any, error) {
+		if _, err := ctx.Auth.GetIdentity(); !errors.Is(err, ErrNoCaller) {
+			return nil, fmt.Errorf("GetIdentity error = %v, want ErrNoCaller", err)
+		}
+		if _, err := ctx.Auth.ExecuteGuard("plain", nil); err == nil || err.Error() != "guards cannot be executed internally" {
+			return nil, fmt.Errorf("ExecuteGuard error = %v, want guards cannot be executed internally", err)
+		}
+		_, err := ctx.Storage.GetUploadURL()
+		if err == nil {
+			return nil, errors.New("GetUploadURL error = nil, want an error")
+		}
+		return nil, ctx.Storage.DeleteFile("nope")
+	}, Internal())
+
+	_, err := e.ExecuteQuery("who", nil)
+	if err == nil || err.Error() != "tether: this capability is not available in this context" {
+		t.Fatalf("DeleteFile error = %v, want capability denied", err)
+	}
+}
+
+func TestExecuteQueryUnknownName(t *testing.T) {
+	e := newTestEngine(t)
+	_, err := e.ExecuteQuery("missing", nil)
+	if err == nil || err.Error() != "query not found" {
+		t.Errorf("ExecuteQuery error = %v, want query not found", err)
+	}
+}
+
+func TestExecuteQueryRejectsWrites(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterQuery("writer", func(ctx *QueryCtx) (any, error) {
+		return nil, ctx.DB.Create(&testMessage{Body: "nope", RoomID: "lobby"}).Error
+	})
+
+	_, err := e.ExecuteQuery("writer", nil)
+	if !errors.Is(err, errReadOnly) {
+		t.Fatalf("ExecuteQuery write error = %v, want errReadOnly", err)
+	}
+	var count int64
+	if err := e.db.Model(&testMessage{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Errorf("messages after rejected write = %d, want 0", count)
+	}
+}
+
+func TestExecuteQueryDoesNotPushToSubscribers(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.RegisterQuery("item", func(ctx *QueryCtx) (any, error) { return "live", nil })
+	subscribe(t, e, client, "item", "k", nil)
+	drain(client)
+
+	got, err := e.ExecuteQuery("item", nil)
+	if err != nil || got != "live" {
+		t.Fatalf("ExecuteQuery() = %#v, %v; want live, nil", got, err)
+	}
+	if msgs := drain(client); len(msgs) != 0 {
+		t.Errorf("ExecuteQuery pushed %#v", msgs)
+	}
+}
+
 func TestRegisteringANameTwicePanics(t *testing.T) {
 	e := newTestEngine(t)
 	e.RegisterQuery("q", func(*QueryCtx) (any, error) { return nil, nil })
