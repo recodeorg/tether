@@ -15,17 +15,19 @@ type AuthCtx struct {
 	// GetIdentity returns the caller's user ID, or "" for an anonymous
 	// client. In a query or guard, calling it makes the result depend on the
 	// caller's identity: it re-runs when the client's identity changes, and
-	// is shared only with clients of the same identity. In a mutation run by
-	// the scheduler or a cron there is no caller, and GetIdentity returns
-	// [ErrNoCaller].
+	// is shared only with clients of the same identity. When there is no
+	// caller — a mutation run by the scheduler or a cron, or a query or
+	// mutation run with [Engine.ExecuteQuery] or [Engine.ExecuteMutation] —
+	// GetIdentity returns [ErrNoCaller].
 	GetIdentity func() (string, error)
 	// ExecuteGuard runs the guard registered as guardName with params and
 	// returns its value. In a query the value is cached and passed through
 	// JSON, so numbers come back as float64 and structs as
 	// map[string]interface{}; compare simple values such as bools. It returns
 	// an error if the guard is not registered, if the guard returns an error,
-	// when called from a guard, and in a mutation run by the scheduler or a
-	// cron.
+	// when called from a guard, and when there is no caller (a mutation run
+	// by the scheduler or a cron, or a query or mutation run with
+	// [Engine.ExecuteQuery] or [Engine.ExecuteMutation]).
 	ExecuteGuard func(guardName string, params map[string]interface{}) (interface{}, error)
 }
 
@@ -182,8 +184,9 @@ type GuardOption func(*guardConfig)
 type guardConfig struct{}
 
 // Internal hides a query or mutation from clients. They receive the same
-// error as for an unknown name. An internal mutation can still be run by
-// the scheduler and by crons.
+// error as for an unknown name. [Engine.ExecuteQuery] and
+// [Engine.ExecuteMutation] can still run it, and an internal mutation can
+// still be run by the scheduler and by crons.
 func Internal() Option {
 	return func(cfg *optionConfig) {
 		cfg.internal = true

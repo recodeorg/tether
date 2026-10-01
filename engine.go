@@ -750,8 +750,9 @@ func (e *Engine) EphemeralID() string {
 // has been called, and by [Engine.SetStorage] if it is called after close.
 var ErrEngineClosed = errors.New("tether: engine is closed")
 
-// ErrNoCaller is returned by [AuthCtx.GetIdentity] when a mutation runs
-// without a caller, as scheduled tasks and crons do.
+// ErrNoCaller is returned by [AuthCtx.GetIdentity] when a query or mutation
+// runs without a caller: scheduled tasks, crons, and calls to
+// [Engine.ExecuteQuery] or [Engine.ExecuteMutation].
 var ErrNoCaller = errors.New("tether: no caller")
 
 // Close shuts down all engine-owned background work. It is safe to call more
@@ -1608,8 +1609,8 @@ func (e *Engine) SetAuth(auth Auth) {
 // encoded as JSON. A non-nil error is sent as an error frame containing
 // err.Error() instead; that text is sent verbatim, so it should not reveal
 // internal details. A value that implements error is treated the same way.
-// An internal mutation has no client, so its error is returned to the
-// scheduler or cron that ran it.
+// An internal mutation has no client, so its error is returned to whoever
+// ran it: [Engine.ExecuteMutation], the scheduler, or a cron.
 //
 // Writes made through ctx.DB with GORM's Create, Save, Update(s) and Delete
 // re-run every subscribed query that depends on the changed rows. Writes
@@ -1618,7 +1619,7 @@ func (e *Engine) SetAuth(auth Auth) {
 //
 // Options are applied in order. [Internal] hides the mutation from clients,
 // who receive the same error as for an unknown name, but it can still be run
-// with [SchedulerCtx.RunAfter] or [Engine.RegisterCron].
+// with [Engine.ExecuteMutation], [SchedulerCtx.RunAfter], or [Engine.RegisterCron].
 func (e *Engine) RegisterMutation(name string, fn func(ctx *MutationCtx) (any, error), opts ...Option) {
 	cfg := applyOptions(opts)
 	// check if the mutation is already registered
@@ -1654,6 +1655,7 @@ func (e *Engine) RegisterMutation(name string, fn func(ctx *MutationCtx) (any, e
 //
 // Options are applied in order. Clients cannot subscribe to a query
 // registered with [Internal] and receive the same error as for an unknown name.
+// [Engine.ExecuteQuery] can still run it.
 func (e *Engine) RegisterQuery(name string, fn func(ctx *QueryCtx) (any, error), opts ...Option) {
 	cfg := applyOptions(opts)
 	// check if the query is already registered
@@ -2309,19 +2311,92 @@ func (e *Engine) executeQuery(query string, params map[string]interface{}, subsc
 	return responseJSON, nil
 }
 
+// noCallerAuth is the auth context for a query or mutation that has no
+// client: scheduled tasks, crons, and [Engine.ExecuteQuery] or
+// [Engine.ExecuteMutation].
+func noCallerAuth() *AuthCtx {
+	return &AuthCtx{
+		GetIdentity: func() (string, error) {
+			return "", ErrNoCaller
+		},
+		ExecuteGuard: func(string, map[string]interface{}) (interface{}, error) {
+			return nil, fmt.Errorf("guards cannot be executed internally")
+		},
+	}
+}
+
+// ExecuteMutation runs the mutation name with params and returns its result.
+//
+// It is safe to call from code that is not itself inside a mutation, including
+// a goroutine that holds the engine. Writes made through the mutation's ctx.DB
+// re-run subscribed queries the same way a client mutation does.
+//
+// name may be registered with [Internal]. There is no caller:
+// ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard returns
+// an error. A non-nil error from the mutation, including a returned value that
+// implements error, is returned to the caller. params are passed through
+// unchanged.
+func (e *Engine) ExecuteMutation(name string, params map[string]interface{}) (any, error) {
+	return e.executeMutationInternal(name, params)
+}
+
+// ExecuteQuery runs the query name once with params and returns its result.
+//
+// The query is not subscribed and its result is not sent to clients. It is
+// safe to call from code that is not inside a mutation, including a goroutine
+// that holds the engine. name may be registered with [Internal]. There is no
+// caller: ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard
+// returns an error. ctx.DB is read-only. A non-nil error from the query,
+// including a returned value that implements error, is returned to the caller.
+// params are passed through unchanged.
+func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, error) {
+	if _, exists := e.queries[name]; !exists {
+		return nil, fmt.Errorf("query not found")
+	}
+	queryCtx := &QueryCtx{
+		Params:       params,
+		dependencies: []string{},
+		Auth:         noCallerAuth(),
+		Storage: &StorageCtx{
+			GetUploadURL: func(opts ...storage.UploadOption) (storage.UploadInfo, error) {
+				return storage.UploadInfo{}, e.denyCapability()
+			},
+			GetDownloadURL: e.getDownloadURL,
+			DeleteFile:     func(fileID string) error { return e.denyCapability() },
+		},
+	}
+	execID := uuid.NewString()
+	gormCtx := context.WithValue(context.Background(), tetherCtxKey, queryCtx)
+	gormCtx = context.WithValue(gormCtx, ContextKeyExecutionID, execID)
+	gormCtx = context.WithValue(gormCtx, ContextKeyActionName, name)
+	queryCtx.DB = e.readOnlyDB(gormCtx)
+
+	start := time.Now()
+	result, err := normalizeHandlerResult(e.queries[name].Func(queryCtx))
+	e.Profiler().Add(Metric{
+		ID:       execID,
+		Name:     "query:" + name,
+		Type:     MetricTypeQuery,
+		Time:     start,
+		Duration: time.Since(start),
+		Tags:     []string{},
+	})
+	slog.Debug("Executed query internally", "query", name)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
 func (e *Engine) executeMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
 	if _, exists := e.mutations[mutation]; !exists {
 		return nil, fmt.Errorf("mutation not found")
 	}
-	authCtx := &AuthCtx{
-		GetIdentity: func() (string, error) {
-			return "", ErrNoCaller
-		},
-		ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
-			return nil, fmt.Errorf("guards cannot be executed internally")
-		},
-	}
-	mutationCtx := &MutationCtx{DB: e.db, Storage: &StorageCtx{
+	execID := uuid.NewString()
+	traceCtx := context.WithValue(context.Background(), ContextKeyExecutionID, execID)
+	traceCtx = context.WithValue(traceCtx, ContextKeyActionName, mutation)
+	authCtx := noCallerAuth()
+	mutationCtx := &MutationCtx{DB: e.db.WithContext(traceCtx), Storage: &StorageCtx{
 		GetUploadURL:   e.getUploadURL,
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
@@ -2333,7 +2408,6 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 			return e.cancelTask(taskID)
 		},
 	}}
-	execID := uuid.NewString()
 	start := time.Now()
 	result, err := normalizeHandlerResult(e.mutations[mutation].Func(mutationCtx))
 	e.Profiler().Add(Metric{
