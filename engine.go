@@ -1832,16 +1832,7 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
-		if record.MimeType != "" {
-			w.Header().Set("Content-Type", record.MimeType)
-
-			if !isSafeInlineMime(record.MimeType) {
-				w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
-			} else {
-				w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
-			}
-		}
-
+		setSafeFileHeaders(w, record)
 		err = e.storage.ServeFile(dlToken.FileID, w, r)
 		if err != nil {
 			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
@@ -1857,21 +1848,25 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
-		if record.MimeType != "" {
-			w.Header().Set("Content-Type", record.MimeType)
-
-			if !isSafeInlineMime(record.MimeType) {
-				w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
-			} else {
-				w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
-			}
-		}
-
+		setSafeFileHeaders(w, record)
 		err = e.storage.ServeFile(record.ID, w, r)
 		if err != nil {
 			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
 		}
 		return
+	}
+}
+
+func setSafeFileHeaders(w http.ResponseWriter, record TetherStorage) {
+	if record.MimeType != "" {
+		w.Header().Set("Content-Type", record.MimeType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		if !isSafeInlineMime(record.MimeType) {
+			w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
+		} else {
+			w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
+		}
 	}
 }
 
