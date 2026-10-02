@@ -1,3 +1,13 @@
+## [Unreleased]
+
+### Added
+- `StorageCtx.PutFile` stores a file from server code and returns its ID. The record is active immediately. `storage.WithMaxBytes` and `storage.WithExpiresIn` are ignored; `storage.Public` is honored. Not available in queries
+- `storage.Public` marks an upload public. Public files are served at `GET {basePath}/public/{fileID}` with no download token. Private, missing, and not-yet-active files are not found. Passing `storage.Public` to `SetStorage` makes every later upload public
+- `MutationCtx.ExecuteMutation` and `MutationCtx.ExecuteQuery` run another mutation or a one-shot query from inside a mutation, including functions registered with `Internal()`. The nested run has no caller, even when the outer mutation does. Nested query results are not subscribed or pushed to clients
+
+### Security
+- File responses set `X-Content-Type-Options: nosniff`. Types that are not safe to display in the browser, including SVG, are still sent as attachments
+
 ## [1.1.0] - 2026-09-30
 
 ### Added

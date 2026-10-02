@@ -4498,6 +4498,445 @@ func TestGetUploadURLUsesSetStorageDefaultsAndCallOptions(t *testing.T) {
 	if row.ExpiresAt.Before(started.Add(time.Hour-time.Second)) || row.ExpiresAt.After(time.Now().Add(time.Hour+time.Second)) {
 		t.Fatalf("override ExpiresAt = %s, want the SetStorage default of about 1h", row.ExpiresAt)
 	}
+	if row.Public {
+		t.Fatal("upload without storage.Public was public")
+	}
+}
+
+func TestPublicFilesAreServedByID(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, ""); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	upload, err := e.getUploadURL(storage.Public())
+	if err != nil {
+		t.Fatalf("getUploadURL: %v", err)
+	}
+	put := serveStorage(e, http.MethodPut, upload.UploadURL, strings.NewReader("hello"), map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if put.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body %s", put.Code, put.Body.String())
+	}
+
+	var row TetherStorage
+	if err := e.db.Where("id = ?", upload.FileID).First(&row).Error; err != nil {
+		t.Fatalf("load upload: %v", err)
+	}
+	if !row.Public || row.Status != "active" || row.MimeType != "text/plain" {
+		t.Fatalf("public upload = %+v, want active public text/plain", row)
+	}
+
+	got := serveStorage(e, http.MethodGet, "/storage/public/"+upload.FileID, nil, nil)
+	if got.Code != http.StatusOK || got.Body.String() != "hello" {
+		t.Fatalf("public file status = %d, body %q", got.Code, got.Body.String())
+	}
+	if ct := got.Header().Get("Content-Type"); ct != "text/plain" {
+		t.Fatalf("Content-Type = %q, want text/plain", ct)
+	}
+	if nosniff := got.Header().Get("X-Content-Type-Options"); nosniff != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", nosniff)
+	}
+	if disp := got.Header().Get("Content-Disposition"); disp != `inline; filename="`+upload.FileID+`"` {
+		t.Fatalf("Content-Disposition = %q, want inline", disp)
+	}
+
+	download, err := e.getDownloadURL(upload.FileID)
+	if err != nil {
+		t.Fatalf("getDownloadURL: %v", err)
+	}
+	tokenDownload := serveStorage(e, http.MethodGet, download, nil, nil)
+	if tokenDownload.Code != http.StatusOK || tokenDownload.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("token download status = %d, nosniff = %q", tokenDownload.Code, tokenDownload.Header().Get("X-Content-Type-Options"))
+	}
+
+	private, err := e.getUploadURL()
+	if err != nil {
+		t.Fatalf("private getUploadURL: %v", err)
+	}
+	privPut := serveStorage(e, http.MethodPut, private.UploadURL, strings.NewReader("secret"), map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if privPut.Code != http.StatusOK {
+		t.Fatalf("private upload status = %d, body %s", privPut.Code, privPut.Body.String())
+	}
+	hidden := serveStorage(e, http.MethodGet, "/storage/public/"+private.FileID, nil, nil)
+	if hidden.Code != http.StatusNotFound {
+		t.Fatalf("private public-route status = %d, want 404", hidden.Code)
+	}
+	escaped := serveStorage(e, http.MethodGet, "/storage/public/../file/"+strings.TrimPrefix(download, "/storage/file/"), nil, nil)
+	if escaped.Code != http.StatusNotFound || escaped.Body.String() == "hello" {
+		t.Fatalf("escaped public path status = %d, body %q", escaped.Code, escaped.Body.String())
+	}
+
+	pending, err := e.getUploadURL(storage.Public())
+	if err != nil {
+		t.Fatalf("pending getUploadURL: %v", err)
+	}
+	notReady := serveStorage(e, http.MethodGet, "/storage/public/"+pending.FileID, nil, nil)
+	if notReady.Code != http.StatusNotFound {
+		t.Fatalf("pending public file status = %d, want 404", notReady.Code)
+	}
+	missing := serveStorage(e, http.MethodGet, "/storage/public/missing", nil, nil)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("missing public file status = %d, want 404", missing.Code)
+	}
+
+	svg, err := e.getUploadURL(storage.Public())
+	if err != nil {
+		t.Fatalf("svg getUploadURL: %v", err)
+	}
+	svgPut := serveStorage(e, http.MethodPut, svg.UploadURL, strings.NewReader("<svg></svg>"), map[string]string{
+		"Content-Type": "image/svg+xml",
+	})
+	if svgPut.Code != http.StatusOK {
+		t.Fatalf("svg upload status = %d, body %s", svgPut.Code, svgPut.Body.String())
+	}
+	svgGot := serveStorage(e, http.MethodGet, "/storage/public/"+svg.FileID, nil, nil)
+	if svgGot.Code != http.StatusOK {
+		t.Fatalf("svg status = %d, body %s", svgGot.Code, svgGot.Body.String())
+	}
+	if ct := svgGot.Header().Get("Content-Type"); ct != "image/svg+xml" {
+		t.Fatalf("svg Content-Type = %q", ct)
+	}
+	if disp := svgGot.Header().Get("Content-Disposition"); disp != `attachment; filename="`+svg.FileID+`"` {
+		t.Fatalf("svg Content-Disposition = %q, want attachment", disp)
+	}
+	if svgGot.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("svg response missing nosniff")
+	}
+
+	if err := e.db.Create(&TetherStorage{ID: "ghost", Status: "active", Public: true, MimeType: "text/plain"}).Error; err != nil {
+		t.Fatalf("create ghost row: %v", err)
+	}
+	ghost := serveStorage(e, http.MethodGet, "/storage/public/ghost", nil, nil)
+	if ghost.Code != http.StatusInternalServerError {
+		t.Fatalf("missing bytes status = %d, want 500", ghost.Code)
+	}
+}
+
+func TestPublicUploadDefaultAndCustomBasePath(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, "/api/files", storage.Public()); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	upload, err := e.getUploadURL()
+	if err != nil {
+		t.Fatalf("getUploadURL: %v", err)
+	}
+	var row TetherStorage
+	if err := e.db.Where("id = ?", upload.FileID).First(&row).Error; err != nil {
+		t.Fatalf("load upload: %v", err)
+	}
+	if !row.Public {
+		t.Fatal("SetStorage Public() default left the upload private")
+	}
+	put := serveStorage(e, http.MethodPut, upload.UploadURL, strings.NewReader("shared"), map[string]string{
+		"Content-Type": "text/plain",
+	})
+	if put.Code != http.StatusOK {
+		t.Fatalf("upload status = %d, body %s", put.Code, put.Body.String())
+	}
+
+	got := serveStorage(e, http.MethodGet, "/api/files/public/"+upload.FileID, nil, nil)
+	if got.Code != http.StatusOK || got.Body.String() != "shared" {
+		t.Fatalf("custom public route status = %d, body %q", got.Code, got.Body.String())
+	}
+	missed := serveStorage(e, http.MethodGet, "/storage/public/"+upload.FileID, nil, nil)
+	if missed.Body.String() == "shared" {
+		t.Fatal("default public route served a custom-prefix file")
+	}
+}
+
+func TestPutFile(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, ""); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	e.RegisterMutation("save", func(ctx *MutationCtx) (any, error) {
+		return ctx.Storage.PutFile("text/plain", strings.NewReader("hello-from-mutation"), storage.WithMaxBytes(1), storage.WithExpiresIn(time.Second))
+	}, Internal())
+	saved, err := e.ExecuteMutation("save", nil)
+	if err != nil {
+		t.Fatalf("PutFile: %v", err)
+	}
+	fileID, ok := saved.(string)
+	if !ok || fileID == "" {
+		t.Fatalf("PutFile result = %#v, want a file ID", saved)
+	}
+
+	body, err := os.ReadFile(filepath.Join(store.UploadDir, fileID))
+	if err != nil {
+		t.Fatalf("read stored file: %v", err)
+	}
+	if string(body) != "hello-from-mutation" {
+		t.Fatalf("stored body = %q", body)
+	}
+	var row TetherStorage
+	if err := e.db.Where("id = ?", fileID).First(&row).Error; err != nil {
+		t.Fatalf("load file: %v", err)
+	}
+	if row.Status != "active" || row.MimeType != "text/plain" || row.Public || row.MaxBytes != 0 || !row.ExpiresAt.IsZero() {
+		t.Fatalf("file row = %+v, want active private text/plain with size and lifetime options ignored", row)
+	}
+	hidden := serveStorage(e, http.MethodGet, "/storage/public/"+fileID, nil, nil)
+	if hidden.Code != http.StatusNotFound {
+		t.Fatalf("private PutFile public-route status = %d, want 404", hidden.Code)
+	}
+	download, err := e.getDownloadURL(fileID)
+	if err != nil {
+		t.Fatalf("getDownloadURL: %v", err)
+	}
+	got := serveStorage(e, http.MethodGet, download, nil, nil)
+	if got.Code != http.StatusOK || got.Body.String() != "hello-from-mutation" {
+		t.Fatalf("download status = %d, body %q", got.Code, got.Body.String())
+	}
+
+	client := trackClient(t, e)
+	e.RegisterMutation("savePublic", func(ctx *MutationCtx) (any, error) {
+		return ctx.Storage.PutFile("text/plain", strings.NewReader("public-bytes"), storage.Public())
+	})
+	clientSaved, err := e.executeMutation("savePublic", nil, client.ID, "m-put")
+	if err != nil {
+		t.Fatalf("client PutFile: %v", err)
+	}
+	publicID, ok := clientSaved.(string)
+	if !ok {
+		t.Fatalf("client PutFile result = %#v, want a file ID", clientSaved)
+	}
+	publicGot := serveStorage(e, http.MethodGet, "/storage/public/"+publicID, nil, nil)
+	if publicGot.Code != http.StatusOK || publicGot.Body.String() != "public-bytes" {
+		t.Fatalf("public PutFile status = %d, body %q", publicGot.Code, publicGot.Body.String())
+	}
+	if disp := publicGot.Header().Get("Content-Disposition"); disp != `inline; filename="`+publicID+`"` {
+		t.Fatalf("Content-Disposition = %q, want inline", disp)
+	}
+
+	e.RegisterMutation("remove", func(ctx *MutationCtx) (any, error) {
+		return nil, ctx.Storage.DeleteFile(publicID)
+	}, Internal())
+	if _, err := e.ExecuteMutation("remove", nil); err != nil {
+		t.Fatalf("DeleteFile: %v", err)
+	}
+	afterDelete := serveStorage(e, http.MethodGet, "/storage/public/"+publicID, nil, nil)
+	if afterDelete.Code != http.StatusNotFound {
+		t.Fatalf("deleted public file status = %d, want 404", afterDelete.Code)
+	}
+}
+
+func TestPutFileHonorsPublicDefault(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, "", storage.Public()); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+	e.RegisterMutation("save", func(ctx *MutationCtx) (any, error) {
+		return ctx.Storage.PutFile("application/octet-stream", strings.NewReader("bin"))
+	}, Internal())
+	saved, err := e.ExecuteMutation("save", nil)
+	if err != nil {
+		t.Fatalf("PutFile: %v", err)
+	}
+	fileID := saved.(string)
+	got := serveStorage(e, http.MethodGet, "/storage/public/"+fileID, nil, nil)
+	if got.Code != http.StatusOK || got.Body.String() != "bin" {
+		t.Fatalf("default-public file status = %d, body %q", got.Code, got.Body.String())
+	}
+	if disp := got.Header().Get("Content-Disposition"); disp != `attachment; filename="`+fileID+`"` {
+		t.Fatalf("Content-Disposition = %q, want attachment", disp)
+	}
+	if got.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatal("public file response missing nosniff")
+	}
+}
+
+func TestPutFileRequiresStorage(t *testing.T) {
+	e := newTestEngine(t)
+	e.RegisterMutation("save", func(ctx *MutationCtx) (any, error) {
+		_, err := ctx.Storage.PutFile("text/plain", strings.NewReader("nope"))
+		return nil, err
+	}, Internal())
+	_, err := e.ExecuteMutation("save", nil)
+	if err == nil || err.Error() != "storage not configured" {
+		t.Fatalf("PutFile error = %v, want storage not configured", err)
+	}
+}
+
+func TestPutFileDeniedInQueries(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, ""); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+	e.RegisterQuery("save", func(ctx *QueryCtx) (any, error) {
+		_, err := ctx.Storage.PutFile("text/plain", strings.NewReader("nope"))
+		return nil, err
+	})
+
+	client := trackClient(t, e)
+	sub := e.tracker.SubscribeToQuery(client.ID, "save", "k", map[string]interface{}{})
+	raw, err := e.executeQuery("save", map[string]interface{}{}, sub)
+	if err != nil {
+		t.Fatalf("executeQuery: %v", err)
+	}
+	var msg map[string]interface{}
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		t.Fatalf("decode query frame: %v", err)
+	}
+	if msg["type"] != "error" || msg["error"] != "tether: this capability is not available in this context" {
+		t.Fatalf("client query frame = %#v, want capability denied", msg)
+	}
+	_, err = e.ExecuteQuery("save", nil)
+	if err == nil || err.Error() != "tether: this capability is not available in this context" {
+		t.Fatalf("ExecuteQuery PutFile error = %v, want capability denied", err)
+	}
+	entries, err := os.ReadDir(store.UploadDir)
+	if err != nil {
+		t.Fatalf("read upload dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("query PutFile wrote %d files", len(entries))
+	}
+	var rows int64
+	if err := e.db.Model(&TetherStorage{}).Count(&rows).Error; err != nil {
+		t.Fatalf("count storage rows: %v", err)
+	}
+	if rows != 0 {
+		t.Fatalf("storage rows = %d, want 0", rows)
+	}
+}
+
+func TestMutationCtxCanRunMutationsAndQueries(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+	e.tracker.SetAuth(client.ID, "alice", time.Now().Add(time.Hour))
+
+	var runs atomic.Int64
+	e.RegisterQuery("getMessages", func(ctx *QueryCtx) (any, error) {
+		runs.Add(1)
+		ctx.TrackCollection("messages", "room_id", "lobby")
+		var msgs []testMessage
+		ctx.DB.Where("room_id = ?", "lobby").Find(&msgs)
+		return len(msgs), nil
+	})
+	subscribe(t, e, client, "getMessages", "lobby", nil)
+	drain(client)
+
+	e.RegisterQuery("hiddenRead", func(ctx *QueryCtx) (any, error) {
+		if ctx.Params["room"] != "lobby" {
+			return nil, fmt.Errorf("room = %#v, want lobby", ctx.Params["room"])
+		}
+		if _, err := ctx.Auth.GetIdentity(); !errors.Is(err, ErrNoCaller) {
+			return nil, fmt.Errorf("GetIdentity error = %v, want ErrNoCaller", err)
+		}
+		err := ctx.DB.Create(&testMessage{Body: "nope", RoomID: "lobby"}).Error
+		if !errors.Is(err, errReadOnly) {
+			return nil, fmt.Errorf("query write error = %v, want errReadOnly", err)
+		}
+		var n int64
+		if err := ctx.DB.Model(&testMessage{}).Where("room_id = ?", "lobby").Count(&n).Error; err != nil {
+			return nil, err
+		}
+		return n, nil
+	}, Internal())
+	e.RegisterMutation("hiddenWrite", func(ctx *MutationCtx) (any, error) {
+		if _, err := ctx.Auth.GetIdentity(); !errors.Is(err, ErrNoCaller) {
+			return nil, fmt.Errorf("GetIdentity error = %v, want ErrNoCaller", err)
+		}
+		if _, err := ctx.Auth.ExecuteGuard("unused", nil); err == nil || err.Error() != "guards cannot be executed internally" {
+			return nil, fmt.Errorf("ExecuteGuard error = %v", err)
+		}
+		if ctx.Params["body"] != "hi" {
+			return nil, fmt.Errorf("body = %#v, want hi", ctx.Params["body"])
+		}
+		if err := ctx.DB.Create(&testMessage{Body: "hi", RoomID: "lobby"}).Error; err != nil {
+			return nil, err
+		}
+		return "written", nil
+	}, Internal())
+	e.RegisterMutation("fails", func(ctx *MutationCtx) (any, error) {
+		return nil, errors.New("boom")
+	}, Internal())
+	e.RegisterMutation("send", func(ctx *MutationCtx) (any, error) {
+		id, err := ctx.Auth.GetIdentity()
+		if err != nil || id != "alice" {
+			return nil, fmt.Errorf("outer identity = %q, %v", id, err)
+		}
+		written, err := ctx.ExecuteMutation("hiddenWrite", map[string]interface{}{"body": "hi"})
+		if err != nil {
+			return nil, err
+		}
+		count, err := ctx.ExecuteQuery("hiddenRead", map[string]interface{}{"room": "lobby"})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := ctx.ExecuteMutation("missing", nil); err == nil || err.Error() != "mutation not found" {
+			return nil, fmt.Errorf("missing mutation error = %v", err)
+		}
+		if _, err := ctx.ExecuteQuery("missing", nil); err == nil || err.Error() != "query not found" {
+			return nil, fmt.Errorf("missing query error = %v", err)
+		}
+		if _, err := ctx.ExecuteMutation("fails", nil); err == nil || err.Error() != "boom" {
+			return nil, fmt.Errorf("nested mutation error = %v", err)
+		}
+		return map[string]any{"written": written, "count": count}, nil
+	})
+
+	if _, err := e.executeMutation("hiddenWrite", nil, client.ID, "direct"); err == nil || err.Error() != "mutation not found" {
+		t.Fatalf("client call of internal mutation error = %v, want mutation not found", err)
+	}
+
+	result, err := e.executeMutation("send", nil, client.ID, "m1")
+	if err != nil {
+		t.Fatalf("executeMutation: %v", err)
+	}
+	got, ok := result.(map[string]any)
+	if !ok || got["written"] != "written" || got["count"] != int64(1) {
+		t.Fatalf("send result = %#v, want written and count 1", result)
+	}
+	if runs.Load() != 2 {
+		t.Fatalf("query runs after nested mutation = %d, want 2", runs.Load())
+	}
+	var sawUpdate bool
+	for _, msg := range queryMessages(t, drain(client)) {
+		if msg["query_key"] == "lobby" && msg["data"] == float64(1) {
+			sawUpdate = true
+		}
+		if msg["location"] == "hiddenRead" {
+			t.Fatalf("nested query was pushed: %#v", msg)
+		}
+	}
+	if !sawUpdate {
+		t.Fatal("nested mutation write did not update subscribers")
+	}
+	var count int64
+	if err := e.db.Model(&testMessage{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("messages = %d, want 1", count)
+	}
 }
 
 func TestSetStorageBasePath(t *testing.T) {

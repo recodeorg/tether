@@ -77,11 +77,17 @@ type StorageCtx struct {
 	// download URLs. Not available in queries.
 	DeleteFile func(fileID string) error
 
-	// PutFile creates a file record, uploads the data, and returns its ID.
-	// Store the FileID in your own tables to refer to the file later.
-	// The upload is unlimited in size and lifetime, and [storage.WithMaxByes]
-	// and [storage.WithExpiresIn] are ignored.
-	// Not available in queries.
+	// PutFile stores data and returns the file's ID. The record is active
+	// immediately. Store that ID in your own tables to refer to the file later.
+	//
+	// contentType is saved as the file's MIME type and sent when the file is
+	// served. data is read to completion. The upload has no size or lifetime
+	// limit: [storage.WithMaxBytes] and [storage.WithExpiresIn] are ignored.
+	// [storage.Public] is honored, including when it was passed to
+	// [Engine.SetStorage], and a public file can be fetched at
+	// {basePath}/public/{fileID} with no download token.
+	//
+	// Returns an error if storage is not configured. Not available in queries.
 	PutFile func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error)
 }
 
@@ -133,27 +139,16 @@ type MutationCtx struct {
 	// Profiler is the engine's profiler, the same value [Engine.Profiler] returns.
 	Profiler *Profiler
 	Storage  *StorageCtx
-	// ExecuteMutation runs the mutation name with params and returns its result.
-	//
-	// It is safe to call from code that is not itself inside a mutation, including
-	// a goroutine that holds the engine. Writes made through the mutation's ctx.DB
-	// re-run subscribed queries the same way a client mutation does.
-	//
-	// name may be registered with [Internal]. There is no caller:
-	// ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard returns
-	// an error. A non-nil error from the mutation, including a returned value that
-	// implements error, is returned to the caller. params are passed through
+	// ExecuteMutation runs another mutation and returns its result. It is
+	// [Engine.ExecuteMutation]: the nested run has no caller, even when this
+	// mutation does, writes through its ctx.DB re-run subscribed queries, and
+	// name may be registered with [Internal]. params are passed through
 	// unchanged.
 	ExecuteMutation func(mutationName string, params map[string]interface{}) (any, error)
-	// ExecuteQuery runs the query name once with params and returns its result.
-	//
-	// The query is not subscribed and its result is not sent to clients. It is
-	// safe to call from code that is not inside a mutation, including a goroutine
-	// that holds the engine. name may be registered with [Internal]. There is no
-	// caller: ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard
-	// returns an error. ctx.DB is read-only. A non-nil error from the query,
-	// including a returned value that implements error, is returned to the caller.
-	// params are passed through unchanged.
+	// ExecuteQuery runs a query once and returns its result. It is
+	// [Engine.ExecuteQuery]: the query is not subscribed, its result is not
+	// sent to clients, its ctx.DB is read-only, and there is no caller. name
+	// may be registered with [Internal]. params are passed through unchanged.
 	ExecuteQuery func(queryName string, params map[string]interface{}) (any, error)
 }
 
@@ -214,9 +209,10 @@ type GuardOption func(*guardConfig)
 type guardConfig struct{}
 
 // Internal hides a query or mutation from clients. They receive the same
-// error as for an unknown name. [Engine.ExecuteQuery] and
-// [Engine.ExecuteMutation] can still run it, and an internal mutation can
-// still be run by the scheduler and by crons.
+// error as for an unknown name. [Engine.ExecuteQuery],
+// [Engine.ExecuteMutation], [MutationCtx.ExecuteQuery], and
+// [MutationCtx.ExecuteMutation] can still run it, and an internal mutation
+// can still be run by the scheduler and by crons.
 func Internal() Option {
 	return func(cfg *optionConfig) {
 		cfg.internal = true

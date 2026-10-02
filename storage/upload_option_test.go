@@ -35,3 +35,23 @@ func TestEffectiveUploadLimits(t *testing.T) {
 		t.Fatalf("zero call option = %d, want built-in default", maxBytes)
 	}
 }
+
+func TestPublicUploadOption(t *testing.T) {
+	_, _, public := EffectiveUploadLimits(nil, []UploadOption{Public()})
+	if !public {
+		t.Fatal("Public() call option was not public")
+	}
+
+	_, _, public = EffectiveUploadLimits([]UploadOption{Public()}, nil)
+	if !public {
+		t.Fatal("Public() default was not public")
+	}
+
+	maxBytes, _, public := EffectiveUploadLimits(
+		[]UploadOption{Public(), WithMaxBytes(5)},
+		[]UploadOption{WithMaxBytes(9)},
+	)
+	if !public || maxBytes != 9 {
+		t.Fatalf("public = %v, maxBytes = %d; want true and 9", public, maxBytes)
+	}
+}

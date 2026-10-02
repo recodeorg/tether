@@ -23,9 +23,10 @@ type uploadLimits struct {
 	public    bool
 }
 
-// UploadOption configures an upload URL created by StorageCtx.GetUploadURL.
-// The same options may be passed to Engine.SetStorage as the defaults for
-// every upload.
+// UploadOption configures an upload created by StorageCtx.GetUploadURL or
+// StorageCtx.PutFile. The same options may be passed to Engine.SetStorage as
+// the defaults for every upload. PutFile honors Public and ignores
+// WithMaxBytes and WithExpiresIn.
 type UploadOption func(*uploadLimits)
 
 // WithMaxBytes sets the largest file the upload accepts. Zero selects the
@@ -44,9 +45,10 @@ func WithExpiresIn(d time.Duration) UploadOption {
 	}
 }
 
-// Public sets whether the file is public. If a file is public, it
-// can be accessed directly by the file ID without a server-minted token.
-// Default is false.
+// Public marks the file public. A public file can be read at
+// {basePath}/public/{fileID} without a download token. Files are private
+// unless Public is passed here or to Engine.SetStorage. There is no option
+// that turns publicity back off.
 func Public() UploadOption {
 	return func(cfg *uploadLimits) {
 		cfg.public = true
@@ -56,7 +58,8 @@ func Public() UploadOption {
 // EffectiveUploadLimits applies defaults and then opts, in order. Nil options
 // are ignored. A zero size or lifetime selects the built-in default of 20 MB
 // or 15 minutes, including when a later option clears an earlier one.
-// defaults are the options passed to Engine.SetStorage.
+// public is true when [Public] was among the options. defaults are the
+// options passed to Engine.SetStorage.
 func EffectiveUploadLimits(defaults []UploadOption, opts []UploadOption) (maxBytes int64, expiresIn time.Duration, public bool) {
 	cfg := uploadLimits{}
 	for _, opt := range defaults {
@@ -105,8 +108,8 @@ type StorageAdapter interface {
 	// file size.
 	UploadStream(ctx context.Context, fileID string, contentType string, r *http.Request) error
 	// ServeFile writes the file fileID to w, or redirects to where it can be
-	// downloaded. The engine sets Content-Type and Content-Disposition
-	// beforehand.
+	// downloaded. The engine sets Content-Type, Content-Disposition, and
+	// X-Content-Type-Options beforehand.
 	ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error
 	// Delete removes the file fileID. If the file does not exist, it should
 	// return nil or an error wrapping os.ErrNotExist; for any other error the
