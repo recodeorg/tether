@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -2390,6 +2391,38 @@ func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, 
 	return result, nil
 }
 
+func (e *Engine) putFile(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
+	fileID := uuid.NewString()
+	_, _, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+
+	record := &TetherStorage{
+		ID:        fileID,
+		Status:    "active",
+		Public:    public,
+		MimeType:  contentType,
+		CreatedAt: time.Now(),
+	}
+
+	req, err := http.NewRequestWithContext(e.ctx, http.MethodPut, "http://internal.tether/upload", data)
+	if err != nil {
+		return "", fmt.Errorf("failed to create synthetic request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", contentType)
+
+	err = e.storage.UploadStream(e.ctx, fileID, contentType, req)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload file: %w", err)
+	}
+
+	err = e.db.Create(record).Error
+	if err != nil {
+		return "", fmt.Errorf("failed to create file record: %w", err)
+	}
+
+	return fileID, nil
+}
+
 func (e *Engine) executeMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
 	if _, exists := e.mutations[mutation]; !exists {
 		return nil, fmt.Errorf("mutation not found")
@@ -2402,6 +2435,7 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 		GetUploadURL:   e.getUploadURL,
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
+		PutFile:        e.putFile,
 	}, Auth: authCtx, Params: params, Profiler: e.Profiler(), Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
@@ -2485,6 +2519,7 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 		GetUploadURL:   e.getUploadURL,
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
+		PutFile:        e.putFile,
 	}, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)

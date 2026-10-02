@@ -3,6 +3,7 @@ package tether
 import (
 	"context"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/recodeorg/tether/storage"
@@ -75,6 +76,13 @@ type StorageCtx struct {
 	// DeleteFile deletes the file's contents and record, and invalidates its
 	// download URLs. Not available in queries.
 	DeleteFile func(fileID string) error
+
+	// PutFile creates a file record, uploads the data, and returns its ID.
+	// Store the FileID in your own tables to refer to the file later.
+	// The upload is unlimited in size and lifetime, and [storage.WithMaxByes]
+	// and [storage.WithExpiresIn] are ignored.
+	// Not available in queries.
+	PutFile func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error)
 }
 
 // QueryCtx is passed to query functions registered with
