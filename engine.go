@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"mime"
 	"net/http"
@@ -77,7 +78,8 @@ type TetherTask struct {
 }
 
 // TetherStorage is the database model for a stored file, created by
-// [StorageCtx.GetUploadURL] in the table set up by [Engine.SetStorage].
+// [StorageCtx.GetUploadURL] or [StorageCtx.PutFile] in the table set up by
+// [Engine.SetStorage].
 type TetherStorage struct {
 	ID        string `gorm:"primaryKey"`  // file ID
 	Token     string `gorm:"uniqueIndex"` // token used to upload the file
@@ -86,6 +88,7 @@ type TetherStorage struct {
 	MaxBytes  int64     // maximum size allowed at upload time
 	MimeType  string    // MIME type of the file
 	Adapter   string    // adapter used to store the file (local, s3, etc.), helpful for migrations
+	Public    bool      // whether the file is public (can be accessed without a token)
 	ExpiresAt time.Time `gorm:"index"` // time when the upload token expires
 	CreatedAt time.Time // time when the upload token was created
 }
@@ -935,17 +938,19 @@ func (e *Engine) startScheduler() {
 const defaultStorageBasePath = "/storage"
 
 // SetStorage enables file storage through the given adapter, such as
-// local.New or s3.New. basePath is the URL prefix for the upload and
-// download routes. An empty basePath uses "/storage", so those routes are
-// PUT {basePath}/upload/{token} and GET {basePath}/file/{token}. Mount
-// [Engine.StorageHandler] at that prefix, without http.StripPrefix, so
-// clients can reach the URLs. The path must start with "/" and must not
-// contain "..". A trailing slash is removed.
+// local.New or s3.New. basePath is the URL prefix for the upload, download,
+// and public routes. An empty basePath uses "/storage", so those routes are
+// PUT {basePath}/upload/{token}, GET {basePath}/file/{token}, and
+// GET {basePath}/public/{fileID}. Mount [Engine.StorageHandler] at that
+// prefix, without http.StripPrefix, so clients can reach the URLs. The path
+// must start with "/" and must not contain "..". A trailing slash is removed.
 //
-// defaults apply to every upload URL. Options passed to
-// [StorageCtx.GetUploadURL] apply after them, in order. Nil options are
-// ignored. A zero size or lifetime selects the built-in default of 20 MB or
-// 15 minutes.
+// defaults apply to every upload. Options passed to
+// [StorageCtx.GetUploadURL] or [StorageCtx.PutFile] apply after them, in
+// order. Nil options are ignored. A zero size or lifetime selects the
+// built-in default of 20 MB or 15 minutes. [storage.Public] among the
+// defaults marks every upload public. PutFile honors that flag and ignores
+// size and lifetime defaults.
 //
 // It creates the storage tables and starts an hourly cleanup of expired
 // download links and abandoned uploads. Call it at most once. An invalid
@@ -1009,7 +1014,8 @@ func normalizeStorageBasePath(basePath string) (string, error) {
 }
 
 // storageKindPrefix is the path prefix for one storage route, including the
-// trailing slash before the token. kind is "upload" or "file".
+// trailing slash before the token or file ID. kind is "upload", "file", or
+// "public".
 func storageKindPrefix(base, kind string) string {
 	if base == "/" {
 		return "/" + kind + "/"
@@ -1740,15 +1746,20 @@ func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
 	reactivity.Handle(w, r, e.onReceiveMessage, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
 }
 
-// StorageHandler serves the upload and download URLs returned by
-// [StorageCtx]. By default those are PUT /storage/upload/{token}, which
-// stores the request body as the file, and GET /storage/file/{token}, which
-// serves it. [Engine.SetStorage] can replace the "/storage" prefix. The
+// StorageHandler serves upload, download, and public file URLs. By default
+// those are PUT /storage/upload/{token}, which stores the request body as
+// the file, GET /storage/file/{token}, which serves a file to anyone holding
+// a download link from [StorageCtx.GetDownloadURL], and
+// GET /storage/public/{fileID}, which serves a file marked public with
+// [storage.Public]. A file that is missing, private, or not yet active is
+// not found. [Engine.SetStorage] can replace the "/storage" prefix. The
 // handler matches the full request path, so mount it at that prefix without
 // http.StripPrefix:
 //
 //	http.HandleFunc("/storage/", engine.StorageHandler)
 //
+// Served files include X-Content-Type-Options: nosniff. Types that are not
+// safe to display in the browser, including SVG, are sent as attachments.
 // Browser requests are subject to the same origin policy as [Engine.Handle],
 // and allowed origins receive the CORS headers they need. Responds with 501
 // Not Implemented if [Engine.SetStorage] has not been called.
@@ -1830,21 +1841,41 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "File not found", http.StatusNotFound)
 			return
 		}
-		if record.MimeType != "" {
-			w.Header().Set("Content-Type", record.MimeType)
-
-			if !isSafeInlineMime(record.MimeType) {
-				w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
-			} else {
-				w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
-			}
-		}
-
+		setSafeFileHeaders(w, record)
 		err = e.storage.ServeFile(dlToken.FileID, w, r)
 		if err != nil {
 			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
 		}
 		return
+	}
+
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, storageKindPrefix(e.storageBasePath, "public")) {
+		fileID := filepath.Base(r.URL.Path)
+		var record TetherStorage
+		err := e.db.Where("id = ? AND status = 'active' AND public = true", fileID).First(&record).Error
+		if err != nil {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		setSafeFileHeaders(w, record)
+		err = e.storage.ServeFile(record.ID, w, r)
+		if err != nil {
+			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
+		}
+		return
+	}
+}
+
+func setSafeFileHeaders(w http.ResponseWriter, record TetherStorage) {
+	if record.MimeType != "" {
+		w.Header().Set("Content-Type", record.MimeType)
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+
+		if !isSafeInlineMime(record.MimeType) {
+			w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
+		} else {
+			w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
+		}
 	}
 }
 
@@ -1871,7 +1902,7 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 
 	fileID := uuid.NewString()
 	token := uuid.NewString()
-	maxBytes, expiresIn := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+	maxBytes, expiresIn, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	err := e.db.Create(&TetherStorage{
 		ID:        fileID,
@@ -1879,6 +1910,7 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 		Status:    "pending",
 		MaxBytes:  maxBytes,
 		ExpiresAt: time.Now().Add(expiresIn),
+		Public:    public,
 	}).Error
 	if err != nil {
 		return storage.UploadInfo{}, err
@@ -2225,6 +2257,9 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		},
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     func(fileID string) error { return e.denyCapability() },
+		PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
+			return "", e.denyCapability()
+		},
 	}
 	queryCtx.Auth = &AuthCtx{
 		GetIdentity: func() (string, error) {
@@ -2312,8 +2347,9 @@ func (e *Engine) executeQuery(query string, params map[string]interface{}, subsc
 }
 
 // noCallerAuth is the auth context for a query or mutation that has no
-// client: scheduled tasks, crons, and [Engine.ExecuteQuery] or
-// [Engine.ExecuteMutation].
+// client: scheduled tasks, crons, [Engine.ExecuteQuery],
+// [Engine.ExecuteMutation], [MutationCtx.ExecuteQuery], and
+// [MutationCtx.ExecuteMutation].
 func noCallerAuth() *AuthCtx {
 	return &AuthCtx{
 		GetIdentity: func() (string, error) {
@@ -2363,6 +2399,9 @@ func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, 
 			},
 			GetDownloadURL: e.getDownloadURL,
 			DeleteFile:     func(fileID string) error { return e.denyCapability() },
+			PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
+				return "", e.denyCapability()
+			},
 		},
 	}
 	execID := uuid.NewString()
@@ -2388,6 +2427,60 @@ func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, 
 	return result, nil
 }
 
+func (e *Engine) putFile(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
+	if e.storage == nil {
+		return "", fmt.Errorf("storage not configured")
+	}
+
+	fileID := uuid.NewString()
+	_, _, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+
+	record := &TetherStorage{
+		ID: fileID,
+		// Token is unused once the file is active. The column is unique, so
+		// an empty token would reject every file after the first.
+		Token:     fileID,
+		Status:    "active",
+		Public:    public,
+		MimeType:  contentType,
+		Adapter:   e.storage.Name(),
+		CreatedAt: time.Now(),
+	}
+
+	req, err := http.NewRequestWithContext(e.ctx, http.MethodPut, "http://internal.tether/upload", data)
+	if err != nil {
+		return "", fmt.Errorf("failed to create synthetic request: %w", err)
+	}
+
+	if req.ContentLength == 0 && data != nil {
+		if seeker, ok := data.(io.Seeker); ok {
+			if currentPos, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+				if size, err := seeker.Seek(0, io.SeekEnd); err == nil {
+					seeker.Seek(currentPos, io.SeekStart)
+					req.ContentLength = size - currentPos
+				}
+			}
+		}
+	}
+
+	req.Header.Set("Content-Type", contentType)
+	if req.ContentLength > 0 {
+		req.Header.Set("Content-Length", strconv.FormatInt(req.ContentLength, 10))
+	}
+
+	err = e.storage.UploadStream(e.ctx, fileID, contentType, req)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload file: %w", err)
+	}
+
+	err = e.db.Create(record).Error
+	if err != nil {
+		return "", fmt.Errorf("failed to create file record: %w", err)
+	}
+
+	return fileID, nil
+}
+
 func (e *Engine) executeMutationInternal(mutation string, params map[string]interface{}) (interface{}, error) {
 	if _, exists := e.mutations[mutation]; !exists {
 		return nil, fmt.Errorf("mutation not found")
@@ -2400,6 +2493,7 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 		GetUploadURL:   e.getUploadURL,
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
+		PutFile:        e.putFile,
 	}, Auth: authCtx, Params: params, Profiler: e.Profiler(), Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
@@ -2407,7 +2501,14 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 		Cancel: func(taskID string) bool {
 			return e.cancelTask(taskID)
 		},
-	}}
+	},
+		ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteMutation(mutationName, params)
+		},
+		ExecuteQuery: func(queryName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteQuery(queryName, params)
+		},
+	}
 	start := time.Now()
 	result, err := normalizeHandlerResult(e.mutations[mutation].Func(mutationCtx))
 	e.Profiler().Add(Metric{
@@ -2476,14 +2577,21 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 		GetUploadURL:   e.getUploadURL,
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
+		PutFile:        e.putFile,
 	}, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
 		},
 		Cancel: func(taskID string) bool {
 			return e.cancelTask(taskID)
+		}},
+		ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteMutation(mutationName, params)
 		},
-	}}
+		ExecuteQuery: func(queryName string, params map[string]interface{}) (any, error) {
+			return e.ExecuteQuery(queryName, params)
+		},
+	}
 	start := time.Now()
 	result, err := normalizeHandlerResult(e.mutations[mutation].Func(mutationCtx))
 	e.Profiler().Add(Metric{
