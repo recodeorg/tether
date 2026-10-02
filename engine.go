@@ -2452,7 +2452,21 @@ func (e *Engine) putFile(contentType string, data io.Reader, opts ...storage.Upl
 		return "", fmt.Errorf("failed to create synthetic request: %w", err)
 	}
 
+	if req.ContentLength == 0 && data != nil {
+		if seeker, ok := data.(io.Seeker); ok {
+			if currentPos, err := seeker.Seek(0, io.SeekCurrent); err == nil {
+				if size, err := seeker.Seek(0, io.SeekEnd); err == nil {
+					seeker.Seek(currentPos, io.SeekStart)
+					req.ContentLength = size - currentPos
+				}
+			}
+		}
+	}
+
 	req.Header.Set("Content-Type", contentType)
+	if req.ContentLength > 0 {
+		req.Header.Set("Content-Length", strconv.FormatInt(req.ContentLength, 10))
+	}
 
 	err = e.storage.UploadStream(e.ctx, fileID, contentType, req)
 	if err != nil {
