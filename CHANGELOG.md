@@ -1,4 +1,4 @@
-## [Unreleased]
+## [1.2.0] - 2026-10-2
 
 ### Added
 - `StorageCtx.PutFile` stores a file from server code and returns its ID. The record is active immediately. `storage.WithMaxBytes` and `storage.WithExpiresIn` are ignored; `storage.Public` is honored. Not available in queries
