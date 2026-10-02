@@ -1848,6 +1848,31 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, storageKindPrefix(e.storageBasePath, "public")) {
+		fileID := filepath.Base(r.URL.Path)
+		var record TetherStorage
+		err := e.db.Where("id = ? AND status = 'active' AND public = true", fileID).First(&record).Error
+		if err != nil {
+			http.Error(w, "File not found", http.StatusNotFound)
+			return
+		}
+		if record.MimeType != "" {
+			w.Header().Set("Content-Type", record.MimeType)
+
+			if !isSafeInlineMime(record.MimeType) {
+				w.Header().Set("Content-Disposition", "attachment; filename=\""+record.ID+"\"")
+			} else {
+				w.Header().Set("Content-Disposition", "inline; filename=\""+record.ID+"\"")
+			}
+		}
+
+		err = e.storage.ServeFile(record.ID, w, r)
+		if err != nil {
+			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
+		}
+		return
+	}
 }
 
 // Checks if the mime type is safe to inline in the browser.
