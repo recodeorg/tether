@@ -72,7 +72,7 @@ type StorageCtx struct {
 	// the caller may read it, so authorize the caller first. The URL uses the
 	// base path passed to [Engine.SetStorage], or /storage when that path is
 	// empty.
-	GetDownloadURL func(fileID string) (string, error)
+	GetDownloadURL func(fileID string, opts ...storage.UploadOption) (string, error)
 	// DeleteFile deletes the file's contents and record, and invalidates its
 	// download URLs. Not available in queries.
 	DeleteFile func(fileID string) error

@@ -1904,7 +1904,7 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 
 	fileID := uuid.NewString()
 	token := uuid.NewString()
-	maxBytes, expiresIn, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+	maxBytes, expiresIn, _, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	err := e.db.Create(&TetherStorage{
 		ID:        fileID,
@@ -1923,18 +1923,18 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 	}, nil
 }
 
-func (e *Engine) getDownloadURL(fileID string) (string, error) {
+func (e *Engine) getDownloadURL(fileID string, opts ...storage.UploadOption) (string, error) {
 	if e.storage == nil {
 		return "", fmt.Errorf("storage not configured")
 	}
 
 	token := uuid.NewString()
-	expiresIn := time.Minute * 15 // 15 minutes
+	_, _, downloadExpiresIn, _ := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	err := e.db.Create(&TetherDownloadToken{
 		Token:     token,
 		FileID:    fileID,
-		ExpiresAt: time.Now().Add(expiresIn),
+		ExpiresAt: time.Now().Add(downloadExpiresIn),
 	}).Error
 	if err != nil {
 		return "", err
@@ -2435,7 +2435,7 @@ func (e *Engine) putFile(contentType string, data io.Reader, opts ...storage.Upl
 	}
 
 	fileID := uuid.NewString()
-	_, _, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+	_, _, _, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	record := &TetherStorage{
 		ID: fileID,
