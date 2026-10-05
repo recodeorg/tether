@@ -1640,8 +1640,10 @@ func (e *Engine) RegisterMutation(name string, fn func(ctx *MutationCtx) (any, e
 // already registered.
 //
 // When a client subscribes, fn runs and its return value is encoded as JSON
-// and sent to the client. fn runs again, and the new result is pushed,
-// whenever something it depends on changes. A query depends on:
+// and sent to the client. That first run does not block the connection, so
+// other subscriptions on the same connection are evaluated at the same time.
+// fn runs again, and the new result is pushed, whenever something it depends
+// on changes. A query depends on:
 //
 //   - the primary keys of every row it loads through ctx.DB (automatic);
 //   - collections and tables named with [QueryCtx.TrackCollection] and
@@ -2629,6 +2631,39 @@ func (e *Engine) rerunSubscriptions(subscriptions []*reactivity.Subscription) {
 	}
 }
 
+// runInitialSubscription evaluates a subscription that was just registered and
+// sends the result. It returns immediately. The evaluation runs alongside
+// other initial subscriptions on the same connection. Close waits for it.
+// A result for a subscription removed before it is published, including by
+// unsubscribe, is not sent.
+func (e *Engine) runInitialSubscription(clientID, query string, params map[string]interface{}, subscription *reactivity.Subscription) {
+	if !e.beginWork() {
+		return
+	}
+	go func() {
+		defer e.wg.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("Recovered from panic", "error", r)
+			}
+		}()
+		queryKey := subscription.QueryKey
+		_, err := e.executeQuery(query, params, subscription)
+		if err != nil {
+			slog.Error("Failed to execute query", "query", query, "error", err)
+			if _, ok := e.tracker.GetSubscription(subscription.SubID); !ok {
+				return
+			}
+			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute query", "query_key": queryKey, "params": params})
+			if err != nil {
+				slog.Error("Failed to encode error message", "error", err)
+				return
+			}
+			e.tracker.SendMessage(clientID, responseJSON)
+		}
+	}()
+}
+
 func (e *Engine) onReceiveMessage(clientID string, msg map[string]interface{}) error {
 	// Frames carry application params (passwords, refresh tokens, ...), so only
 	// the frame type is ever logged.
@@ -2665,17 +2700,11 @@ func (e *Engine) onReceiveMessage(clientID string, msg map[string]interface{}) e
 			e.tracker.SendMessage(clientID, []byte(`{"type": "error", "error": "Failed to subscribe to query"}`))
 			return nil
 		}
-		_, err := e.executeQuery(query, params, subscription)
-		if err != nil {
-			slog.Error("Failed to execute query", "query", query, "error", err)
-			responseJSON, err := json.Marshal(map[string]interface{}{"type": "error", "error": "Failed to execute query", "query_key": queryKey, "params": params})
-			if err != nil {
-				slog.Error("Failed to encode error message", "error", err)
-				return fmt.Errorf("failed to encode error message: %w", err)
-			}
-			e.tracker.SendMessage(clientID, responseJSON)
-			return err
-		}
+		// Registration stays on this goroutine so a following unsubscribe or
+		// auth frame observes the subscription. Only the evaluation is
+		// concurrent: a slow query must not delay other subscriptions on this
+		// connection.
+		e.runInitialSubscription(clientID, query, params, subscription)
 	case "unsubscribe":
 		query, ok := msg["location"].(string)
 		if !ok {
