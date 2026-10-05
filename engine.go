@@ -1844,7 +1844,8 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setSafeFileHeaders(w, record)
-		err = e.storage.ServeFile(dlToken.FileID, w, r)
+		ctx := context.WithValue(r.Context(), "expires_at", dlToken.ExpiresAt)
+		err = e.storage.ServeFile(dlToken.FileID, w, r.WithContext(ctx))
 		if err != nil {
 			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
 		}
@@ -1928,8 +1929,9 @@ func (e *Engine) getDownloadURL(fileID string, opts ...storage.UploadOption) (st
 		return "", fmt.Errorf("storage not configured")
 	}
 
-	token := uuid.NewString()
 	_, _, downloadExpiresIn, _ := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+
+	token := uuid.NewString()
 
 	err := e.db.Create(&TetherDownloadToken{
 		Token:     token,

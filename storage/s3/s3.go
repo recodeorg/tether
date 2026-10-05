@@ -82,10 +82,14 @@ func (s *Storage) UploadStream(ctx context.Context, fileID string, contentType s
 // for 15 minutes.
 func (s *Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
 	// Generate a short-lived AWS URL
+	ttl, ok := r.Context().Value("expires_at").(time.Time)
+	if !ok {
+		ttl = time.Now().Add(15 * time.Minute)
+	}
 	presignedReq, err := s.presignClient.PresignGetObject(r.Context(), &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(fileID),
-	}, s3.WithPresignExpires(15*time.Minute))
+	}, s3.WithPresignExpires(time.Until(ttl.Add(1*time.Minute)))) // add a slight buffer to allow the client to generate a new URL before it expires
 
 	if err != nil {
 		return err
