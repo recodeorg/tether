@@ -1,3 +1,12 @@
+## [1.3.0]
+
+### Added
+- `StorageCtx.GetDownloadURL` takes `...storage.UploadOption`. `storage.WithDownloadExpiresIn` sets how long the download URL stays valid (15 minutes by default). `storage.UseCachedURLs` reuses an existing URL for the same file when more than five minutes remain. Either option may be passed to `SetStorage` as a default
+- A subscribed query that calls `GetDownloadURL` is re-run when that URL expires, so clients receive a fresh link
+
+### Changed
+- The S3 adapter signs a download redirect until one minute after the download token expires
+
 ## [1.2.1] - 2026-10-04
 
 ### Fixed

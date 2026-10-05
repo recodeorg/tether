@@ -36,6 +36,42 @@ func TestEffectiveUploadLimits(t *testing.T) {
 	}
 }
 
+func TestDownloadUploadOptions(t *testing.T) {
+	_, _, downloadExpiresIn, _, cache := EffectiveUploadLimits(nil, nil)
+	if downloadExpiresIn != defaultDownloadExpiresIn || cache != defaultUseCachedURLs {
+		t.Fatalf("download defaults = %s, cache %v", downloadExpiresIn, cache)
+	}
+
+	_, _, downloadExpiresIn, _, cache = EffectiveUploadLimits(
+		[]UploadOption{WithDownloadExpiresIn(time.Hour), UseCachedURLs()},
+		nil,
+	)
+	if downloadExpiresIn != time.Hour || !cache {
+		t.Fatalf("defaults = %s, cache %v; want 1h and true", downloadExpiresIn, cache)
+	}
+
+	_, _, downloadExpiresIn, _, cache = EffectiveUploadLimits(
+		[]UploadOption{WithDownloadExpiresIn(time.Hour), UseCachedURLs()},
+		[]UploadOption{WithDownloadExpiresIn(30 * time.Minute), nil},
+	)
+	if downloadExpiresIn != 30*time.Minute || !cache {
+		t.Fatalf("call options = %s, cache %v; want 30m and true", downloadExpiresIn, cache)
+	}
+
+	_, _, downloadExpiresIn, _, cache = EffectiveUploadLimits(
+		[]UploadOption{WithDownloadExpiresIn(time.Hour), UseCachedURLs()},
+		[]UploadOption{WithDownloadExpiresIn(0)},
+	)
+	if downloadExpiresIn != defaultDownloadExpiresIn || !cache {
+		t.Fatalf("zero lifetime = %s, cache %v; want built-in default and cache still on", downloadExpiresIn, cache)
+	}
+
+	_, _, _, _, cache = EffectiveUploadLimits(nil, []UploadOption{UseCachedURLs()})
+	if !cache {
+		t.Fatal("UseCachedURLs() call option did not enable caching")
+	}
+}
+
 func TestPublicUploadOption(t *testing.T) {
 	_, _, _, public, _ := EffectiveUploadLimits(nil, []UploadOption{Public()})
 	if !public {

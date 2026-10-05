@@ -131,8 +131,9 @@ type Engine struct {
 	// ephemeralID identifies this engine instance. See [Engine.EphemeralID].
 	ephemeralID string
 	storage     storage.StorageAdapter
-	// storageDefaults are the upload options passed to [Engine.SetStorage].
-	// [StorageCtx.GetUploadURL] applies them before its own options.
+	// storageDefaults are the options passed to [Engine.SetStorage].
+	// [StorageCtx.GetUploadURL], [StorageCtx.PutFile], and
+	// [StorageCtx.GetDownloadURL] apply them before their own options.
 	storageDefaults []storage.UploadOption
 	// storageBasePath is the URL prefix for upload and download routes.
 	// Empty until [Engine.SetStorage] runs; that call stores "/storage" when
@@ -945,12 +946,13 @@ const defaultStorageBasePath = "/storage"
 // prefix, without http.StripPrefix, so clients can reach the URLs. The path
 // must start with "/" and must not contain "..". A trailing slash is removed.
 //
-// defaults apply to every upload. Options passed to
-// [StorageCtx.GetUploadURL] or [StorageCtx.PutFile] apply after them, in
-// order. Nil options are ignored. A zero size or lifetime selects the
-// built-in default of 20 MB or 15 minutes. [storage.Public] among the
-// defaults marks every upload public. PutFile honors that flag and ignores
-// size and lifetime defaults.
+// defaults apply to every later GetUploadURL, PutFile, and GetDownloadURL.
+// Options passed to those calls apply after them, in order. Nil options are
+// ignored. A zero size or lifetime selects the built-in default of 20 MB or
+// 15 minutes. [storage.Public] among the defaults marks every upload public.
+// [storage.WithDownloadExpiresIn] and [storage.UseCachedURLs] apply when a
+// download URL is issued. PutFile honors Public and ignores size, lifetime,
+// and download-URL defaults.
 //
 // It creates the storage tables and starts an hourly cleanup of expired
 // download links and abandoned uploads. Call it at most once. An invalid

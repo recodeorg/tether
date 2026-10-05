@@ -27,10 +27,13 @@ type uploadLimits struct {
 	useCachedURLs     bool
 }
 
-// UploadOption configures an upload created by StorageCtx.GetUploadURL or
-// StorageCtx.PutFile. The same options may be passed to Engine.SetStorage as
-// the defaults for every upload. PutFile honors Public and ignores
-// WithMaxBytes and WithExpiresIn.
+// UploadOption configures a file operation on StorageCtx. The same options
+// may be passed to Engine.SetStorage as the defaults for later calls.
+//
+// GetUploadURL honors WithMaxBytes, WithExpiresIn, and Public. PutFile
+// honors Public and ignores WithMaxBytes, WithExpiresIn,
+// WithDownloadExpiresIn, and UseCachedURLs. GetDownloadURL honors
+// WithDownloadExpiresIn and UseCachedURLs.
 type UploadOption func(*uploadLimits)
 
 // WithMaxBytes sets the largest file the upload accepts. Zero selects the
@@ -49,8 +52,9 @@ func WithExpiresIn(d time.Duration) UploadOption {
 	}
 }
 
-// WithDownloadExpiresIn sets how long the download URL stays valid. Zero selects the
-// built-in default of 15 minutes.
+// WithDownloadExpiresIn sets how long a download URL from
+// StorageCtx.GetDownloadURL stays valid. Zero selects the built-in default
+// of 15 minutes, including when it clears a longer lifetime set earlier.
 func WithDownloadExpiresIn(d time.Duration) UploadOption {
 	return func(cfg *uploadLimits) {
 		cfg.downloadExpiresIn = d
@@ -67,6 +71,12 @@ func Public() UploadOption {
 	}
 }
 
+// UseCachedURLs makes StorageCtx.GetDownloadURL reuse an existing download
+// URL for the same file when that URL expires more than five minutes from
+// now. A URL closer to expiry is left in place and a new one is issued, so
+// a caller is not handed a link that is about to stop working. Without this
+// option, every call issues a new URL. Like [Public], there is no option
+// that turns caching back off.
 func UseCachedURLs() UploadOption {
 	return func(cfg *uploadLimits) {
 		cfg.useCachedURLs = true
@@ -76,8 +86,9 @@ func UseCachedURLs() UploadOption {
 // EffectiveUploadLimits applies defaults and then opts, in order. Nil options
 // are ignored. A zero size or lifetime selects the built-in default of 20 MB
 // or 15 minutes, including when a later option clears an earlier one.
-// public is true when [Public] was among the options. defaults are the
-// options passed to Engine.SetStorage.
+// public is true when [Public] was among the options. cache is true when
+// [UseCachedURLs] was among the options. defaults are the options passed to
+// Engine.SetStorage.
 func EffectiveUploadLimits(defaults []UploadOption, opts []UploadOption) (maxBytes int64, expiresIn time.Duration, downloadExpiresIn time.Duration, public bool, cache bool) {
 	cfg := uploadLimits{}
 	for _, opt := range defaults {
