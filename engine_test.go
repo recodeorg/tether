@@ -4350,6 +4350,9 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
 			t.Fatalf("Allow-Origin = %q", got)
 		}
+		if got := rec.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("Vary = %q, want Origin", got)
+		}
 		if got := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(got, "PUT") {
 			t.Fatalf("Allow-Methods = %q", got)
 		}
@@ -4367,6 +4370,9 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 		}
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Fatalf("denied origin received Allow-Origin %q", got)
+		}
+		if got := rec.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("Vary = %q, want Origin", got)
 		}
 	})
 
@@ -4415,6 +4421,9 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
 			t.Fatalf("missing origin received Allow-Origin %q", got)
 		}
+		if got := rec.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("Vary = %q, want Origin", got)
+		}
 	})
 
 	downloadPath, err := e.getDownloadURL(fileID)
@@ -4432,6 +4441,31 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://app.example" {
 			t.Fatalf("Allow-Origin = %q", got)
 		}
+		if got := rec.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("Vary = %q, want Origin", got)
+		}
+		if rec.Body.String() != "hello" {
+			t.Fatalf("download body = %q", rec.Body.String())
+		}
+	})
+
+	t.Run("download without origin", func(t *testing.T) {
+		rec := serveStorage(e, http.MethodGet, downloadPath, nil, nil)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+		}
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+			t.Fatalf("missing origin received Allow-Origin %q", got)
+		}
+		if got := rec.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("Vary = %q, want Origin", got)
+		}
+		if rec.Header().Get("Last-Modified") == "" {
+			t.Fatal("download without origin has no Last-Modified")
+		}
+		if got := rec.Header().Get("Cache-Control"); got != "" {
+			t.Fatalf("Cache-Control = %q, want empty so the response stays cacheable", got)
+		}
 		if rec.Body.String() != "hello" {
 			t.Fatalf("download body = %q", rec.Body.String())
 		}
@@ -4443,6 +4477,9 @@ func TestStorageRoutesUseCheckOrigin(t *testing.T) {
 		})
 		if rec.Code != http.StatusForbidden {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+		}
+		if got := rec.Header().Get("Vary"); got != "Origin" {
+			t.Fatalf("Vary = %q, want Origin", got)
 		}
 	})
 }
