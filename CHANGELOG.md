@@ -1,4 +1,4 @@
-## [1.3.0]
+## [1.3.0] - 2026-10-05
 
 ### Added
 - `StorageCtx.GetDownloadURL` takes `...storage.UploadOption`. `storage.WithDownloadExpiresIn` sets how long the download URL stays valid (15 minutes by default). `storage.UseCachedURLs` reuses an existing URL for the same file when more than five minutes remain. Either option may be passed to `SetStorage` as a default
@@ -12,7 +12,7 @@
 ### Fixed
 - Initial subscriptions on the same connection no longer block each other
 
-## [1.2.0] - 2026-10-2
+## [1.2.0] - 2026-10-02
 
 ### Added
 - `StorageCtx.PutFile` stores a file from server code and returns its ID. The record is active immediately. `storage.WithMaxBytes` and `storage.WithExpiresIn` are ignored; `storage.Public` is honored. Not available in queries
