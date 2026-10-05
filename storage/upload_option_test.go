@@ -6,12 +6,12 @@ import (
 )
 
 func TestEffectiveUploadLimits(t *testing.T) {
-	maxBytes, expiresIn, _, public := EffectiveUploadLimits(nil, nil)
+	maxBytes, expiresIn, _, public, _ := EffectiveUploadLimits(nil, nil)
 	if maxBytes != defaultMaxBytes || expiresIn != defaultExpiresIn || public != defaultPublic {
 		t.Fatalf("built-in defaults = %d, %s", maxBytes, expiresIn)
 	}
 
-	maxBytes, expiresIn, _, public = EffectiveUploadLimits(
+	maxBytes, expiresIn, _, public, _ = EffectiveUploadLimits(
 		[]UploadOption{WithMaxBytes(1234), WithExpiresIn(time.Hour)},
 		nil,
 	)
@@ -19,7 +19,7 @@ func TestEffectiveUploadLimits(t *testing.T) {
 		t.Fatalf("defaults = %d, %s", maxBytes, expiresIn)
 	}
 
-	maxBytes, expiresIn, _, public = EffectiveUploadLimits(
+	maxBytes, expiresIn, _, public, _ = EffectiveUploadLimits(
 		[]UploadOption{WithMaxBytes(1234), WithExpiresIn(time.Hour)},
 		[]UploadOption{WithMaxBytes(99), nil},
 	)
@@ -27,7 +27,7 @@ func TestEffectiveUploadLimits(t *testing.T) {
 		t.Fatalf("call options = %d, %s; want 99 and 1h", maxBytes, expiresIn)
 	}
 
-	maxBytes, expiresIn, _, public = EffectiveUploadLimits(
+	maxBytes, expiresIn, _, public, _ = EffectiveUploadLimits(
 		[]UploadOption{WithMaxBytes(1234)},
 		[]UploadOption{WithMaxBytes(0)},
 	)
@@ -37,17 +37,17 @@ func TestEffectiveUploadLimits(t *testing.T) {
 }
 
 func TestPublicUploadOption(t *testing.T) {
-	_, _, _, public := EffectiveUploadLimits(nil, []UploadOption{Public()})
+	_, _, _, public, _ := EffectiveUploadLimits(nil, []UploadOption{Public()})
 	if !public {
 		t.Fatal("Public() call option was not public")
 	}
 
-	_, _, _, public = EffectiveUploadLimits([]UploadOption{Public()}, nil)
+	_, _, _, public, _ = EffectiveUploadLimits([]UploadOption{Public()}, nil)
 	if !public {
 		t.Fatal("Public() default was not public")
 	}
 
-	maxBytes, _, _, public := EffectiveUploadLimits(
+	maxBytes, _, _, public, _ := EffectiveUploadLimits(
 		[]UploadOption{Public(), WithMaxBytes(5)},
 		[]UploadOption{WithMaxBytes(9)},
 	)
