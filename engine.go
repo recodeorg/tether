@@ -1779,7 +1779,9 @@ func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
 // Served files include X-Content-Type-Options: nosniff. Types that are not
 // safe to display in the browser, including SVG, are sent as attachments.
 // Browser requests are subject to the same origin policy as [Engine.Handle],
-// and allowed origins receive the CORS headers they need. Responds with 501
+// and allowed origins receive the CORS headers they need. Responses vary on
+// Origin even when the request omits it, so a cached media load of the same
+// URL cannot satisfy a later cross-origin fetch. Responds with 501
 // Not Implemented if [Engine.SetStorage] has not been called.
 func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 	if e.storage == nil {
@@ -1989,7 +1991,17 @@ func (e *Engine) deleteFile(fileID string) error {
 // storage routes. Requests with no Origin header are allowed so non-browser
 // clients can still use an upload or download token. An allowed browser origin
 // receives the CORS headers a cross-origin upload or download needs.
+//
+// Vary: Origin is set on every response, including when Origin is absent.
+// img, video, and audio load a download URL without sending Origin. The local
+// adapter answers with Last-Modified and no Cache-Control, so the browser may
+// cache that response. Without Vary, the cache key ignores Origin and a later
+// cross-origin fetch of the same URL can reuse the media response, which has
+// no Access-Control-Allow-Origin.
 func (e *Engine) allowStorageOrigin(w http.ResponseWriter, r *http.Request) bool {
+	header := w.Header()
+	header.Add("Vary", "Origin")
+
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
@@ -1998,9 +2010,7 @@ func (e *Engine) allowStorageOrigin(w http.ResponseWriter, r *http.Request) bool
 		http.Error(w, "origin not allowed", http.StatusForbidden)
 		return false
 	}
-	header := w.Header()
 	header.Set("Access-Control-Allow-Origin", origin)
-	header.Add("Vary", "Origin")
 	header.Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
 	if requested := r.Header.Get("Access-Control-Request-Headers"); requested != "" {
 		header.Set("Access-Control-Allow-Headers", requested)
