@@ -10,23 +10,30 @@ import (
 )
 
 const (
-	defaultMaxBytes  int64 = 20 * 1024 * 1024
-	defaultExpiresIn       = 15 * time.Minute
-	defaultPublic          = false
+	defaultMaxBytes          int64 = 20 * 1024 * 1024
+	defaultExpiresIn               = 15 * time.Minute
+	defaultPublic                  = false
+	defaultDownloadExpiresIn       = 15 * time.Minute
+	defaultUseCachedURLs           = false
 )
 
 // uploadLimits is filled in by [UploadOption] values. A zero field selects
 // the built-in default when the limits are resolved.
 type uploadLimits struct {
-	maxBytes  int64
-	expiresIn time.Duration
-	public    bool
+	maxBytes          int64
+	expiresIn         time.Duration
+	downloadExpiresIn time.Duration
+	public            bool
+	useCachedURLs     bool
 }
 
-// UploadOption configures an upload created by StorageCtx.GetUploadURL or
-// StorageCtx.PutFile. The same options may be passed to Engine.SetStorage as
-// the defaults for every upload. PutFile honors Public and ignores
-// WithMaxBytes and WithExpiresIn.
+// UploadOption configures a file operation on StorageCtx. The same options
+// may be passed to Engine.SetStorage as the defaults for later calls.
+//
+// GetUploadURL honors WithMaxBytes, WithExpiresIn, and Public. PutFile
+// honors Public and ignores WithMaxBytes, WithExpiresIn,
+// WithDownloadExpiresIn, and UseCachedURLs. GetDownloadURL honors
+// WithDownloadExpiresIn and UseCachedURLs.
 type UploadOption func(*uploadLimits)
 
 // WithMaxBytes sets the largest file the upload accepts. Zero selects the
@@ -45,6 +52,15 @@ func WithExpiresIn(d time.Duration) UploadOption {
 	}
 }
 
+// WithDownloadExpiresIn sets how long a download URL from
+// StorageCtx.GetDownloadURL stays valid. Zero selects the built-in default
+// of 15 minutes, including when it clears a longer lifetime set earlier.
+func WithDownloadExpiresIn(d time.Duration) UploadOption {
+	return func(cfg *uploadLimits) {
+		cfg.downloadExpiresIn = d
+	}
+}
+
 // Public marks the file public. A public file can be read at
 // {basePath}/public/{fileID} without a download token. Files are private
 // unless Public is passed here or to Engine.SetStorage. There is no option
@@ -55,12 +71,25 @@ func Public() UploadOption {
 	}
 }
 
+// UseCachedURLs makes StorageCtx.GetDownloadURL reuse an existing download
+// URL for the same file when that URL expires more than five minutes from
+// now. A URL closer to expiry is left in place and a new one is issued, so
+// a caller is not handed a link that is about to stop working. Without this
+// option, every call issues a new URL. Like [Public], there is no option
+// that turns caching back off.
+func UseCachedURLs() UploadOption {
+	return func(cfg *uploadLimits) {
+		cfg.useCachedURLs = true
+	}
+}
+
 // EffectiveUploadLimits applies defaults and then opts, in order. Nil options
 // are ignored. A zero size or lifetime selects the built-in default of 20 MB
 // or 15 minutes, including when a later option clears an earlier one.
-// public is true when [Public] was among the options. defaults are the
-// options passed to Engine.SetStorage.
-func EffectiveUploadLimits(defaults []UploadOption, opts []UploadOption) (maxBytes int64, expiresIn time.Duration, public bool) {
+// public is true when [Public] was among the options. cache is true when
+// [UseCachedURLs] was among the options. defaults are the options passed to
+// Engine.SetStorage.
+func EffectiveUploadLimits(defaults []UploadOption, opts []UploadOption) (maxBytes int64, expiresIn time.Duration, downloadExpiresIn time.Duration, public bool, cache bool) {
 	cfg := uploadLimits{}
 	for _, opt := range defaults {
 		if opt != nil {
@@ -78,10 +107,16 @@ func EffectiveUploadLimits(defaults []UploadOption, opts []UploadOption) (maxByt
 	if cfg.expiresIn == 0 {
 		cfg.expiresIn = defaultExpiresIn
 	}
+	if cfg.downloadExpiresIn == 0 {
+		cfg.downloadExpiresIn = defaultDownloadExpiresIn
+	}
 	if cfg.public == false {
 		cfg.public = defaultPublic
 	}
-	return cfg.maxBytes, cfg.expiresIn, cfg.public
+	if cfg.useCachedURLs == false {
+		cfg.useCachedURLs = defaultUseCachedURLs
+	}
+	return cfg.maxBytes, cfg.expiresIn, cfg.downloadExpiresIn, cfg.public, cfg.useCachedURLs
 }
 
 // UploadInfo is returned by StorageCtx.GetUploadURL.

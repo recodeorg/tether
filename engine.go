@@ -131,8 +131,9 @@ type Engine struct {
 	// ephemeralID identifies this engine instance. See [Engine.EphemeralID].
 	ephemeralID string
 	storage     storage.StorageAdapter
-	// storageDefaults are the upload options passed to [Engine.SetStorage].
-	// [StorageCtx.GetUploadURL] applies them before its own options.
+	// storageDefaults are the options passed to [Engine.SetStorage].
+	// [StorageCtx.GetUploadURL], [StorageCtx.PutFile], and
+	// [StorageCtx.GetDownloadURL] apply them before their own options.
 	storageDefaults []storage.UploadOption
 	// storageBasePath is the URL prefix for upload and download routes.
 	// Empty until [Engine.SetStorage] runs; that call stores "/storage" when
@@ -945,12 +946,13 @@ const defaultStorageBasePath = "/storage"
 // prefix, without http.StripPrefix, so clients can reach the URLs. The path
 // must start with "/" and must not contain "..". A trailing slash is removed.
 //
-// defaults apply to every upload. Options passed to
-// [StorageCtx.GetUploadURL] or [StorageCtx.PutFile] apply after them, in
-// order. Nil options are ignored. A zero size or lifetime selects the
-// built-in default of 20 MB or 15 minutes. [storage.Public] among the
-// defaults marks every upload public. PutFile honors that flag and ignores
-// size and lifetime defaults.
+// defaults apply to every later GetUploadURL, PutFile, and GetDownloadURL.
+// Options passed to those calls apply after them, in order. Nil options are
+// ignored. A zero size or lifetime selects the built-in default of 20 MB or
+// 15 minutes. [storage.Public] among the defaults marks every upload public.
+// [storage.WithDownloadExpiresIn] and [storage.UseCachedURLs] apply when a
+// download URL is issued. PutFile honors Public and ignores size, lifetime,
+// and download-URL defaults.
 //
 // It creates the storage tables and starts an hourly cleanup of expired
 // download links and abandoned uploads. Call it at most once. An invalid
@@ -1028,7 +1030,21 @@ func storageKindPrefix(base, kind string) string {
 // ExpiresIn remains usable. Object bytes are deleted before that metadata.
 // A missing object is fine; any other delete error keeps the row for retry.
 func (e *Engine) cleanStorage(now time.Time) {
-	e.db.Where("expires_at < ?", now).Delete(&TetherDownloadToken{})
+	var expiredTokens []TetherDownloadToken
+	if err := e.db.Where("expires_at < ?", now).Find(&expiredTokens).Error; err != nil {
+		slog.Error("Failed to find expired download tokens", "error", err)
+		return
+	}
+	tokenIDs := make([]string, 0, len(expiredTokens))
+	for _, token := range expiredTokens {
+		tokenIDs = append(tokenIDs, fmt.Sprintf("~storage_token:%s", token.Token))
+	}
+	if err := e.db.Delete(&expiredTokens).Error; err != nil {
+		slog.Error("Failed to delete expired download tokens", "error", err)
+		return
+	}
+
+	e.invalidateTags(tokenIDs, e.ephemeralID, "storage_token_expired")
 
 	var abandonedFiles []TetherStorage
 	e.db.Where("status IN ? AND expires_at < ?", []string{"pending", "uploading"}, now).Find(&abandonedFiles)
@@ -1844,7 +1860,8 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setSafeFileHeaders(w, record)
-		err = e.storage.ServeFile(dlToken.FileID, w, r)
+		ctx := context.WithValue(r.Context(), "expires_at", dlToken.ExpiresAt)
+		err = e.storage.ServeFile(dlToken.FileID, w, r.WithContext(ctx))
 		if err != nil {
 			http.Error(w, "Failed to serve file", http.StatusInternalServerError)
 		}
@@ -1904,7 +1921,7 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 
 	fileID := uuid.NewString()
 	token := uuid.NewString()
-	maxBytes, expiresIn, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+	maxBytes, expiresIn, _, public, _ := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	err := e.db.Create(&TetherStorage{
 		ID:        fileID,
@@ -1923,18 +1940,29 @@ func (e *Engine) getUploadURL(opts ...storage.UploadOption) (storage.UploadInfo,
 	}, nil
 }
 
-func (e *Engine) getDownloadURL(fileID string) (string, error) {
+func (e *Engine) getDownloadURL(fileID string, opts ...storage.UploadOption) (string, error) {
 	if e.storage == nil {
 		return "", fmt.Errorf("storage not configured")
 	}
 
+	_, _, downloadExpiresIn, _, cache := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+
+	if cache {
+		var record TetherDownloadToken
+		err := e.db.Where("file_id = ?", fileID).First(&record).Error
+		if err == nil {
+			if record.ExpiresAt.After(time.Now().Add(5 * time.Minute)) {
+				return storageKindPrefix(e.storageBasePath, "file") + record.Token, nil
+			}
+		}
+	}
+
 	token := uuid.NewString()
-	expiresIn := time.Minute * 15 // 15 minutes
 
 	err := e.db.Create(&TetherDownloadToken{
 		Token:     token,
 		FileID:    fileID,
-		ExpiresAt: time.Now().Add(expiresIn),
+		ExpiresAt: time.Now().Add(downloadExpiresIn),
 	}).Error
 	if err != nil {
 		return "", err
@@ -2257,8 +2285,15 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		GetUploadURL: func(opts ...storage.UploadOption) (storage.UploadInfo, error) {
 			return storage.UploadInfo{}, e.denyCapability()
 		},
-		GetDownloadURL: e.getDownloadURL,
-		DeleteFile:     func(fileID string) error { return e.denyCapability() },
+		GetDownloadURL: func(fileID string, opts ...storage.UploadOption) (string, error) {
+			downloadURL, err := e.getDownloadURL(fileID, opts...)
+			if err != nil {
+				return "", err
+			}
+			queryCtx.dependencies = append(queryCtx.dependencies, fmt.Sprintf("~storage_token:%s", path.Base(downloadURL))) // store the token in the dependencies so the query can be re-run if the token expires
+			return downloadURL, nil
+		},
+		DeleteFile: func(fileID string) error { return e.denyCapability() },
 		PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
 			return "", e.denyCapability()
 		},
@@ -2435,7 +2470,7 @@ func (e *Engine) putFile(contentType string, data io.Reader, opts ...storage.Upl
 	}
 
 	fileID := uuid.NewString()
-	_, _, public := storage.EffectiveUploadLimits(e.storageDefaults, opts)
+	_, _, _, public, _ := storage.EffectiveUploadLimits(e.storageDefaults, opts)
 
 	record := &TetherStorage{
 		ID: fileID,

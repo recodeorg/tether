@@ -5411,6 +5411,248 @@ func TestCleanStorage(t *testing.T) {
 	}
 }
 
+func TestGetDownloadURLRequiresStorage(t *testing.T) {
+	e := newTestEngine(t)
+	if _, err := e.getDownloadURL("missing"); err == nil {
+		t.Fatal("getDownloadURL without storage returned nil")
+	}
+}
+
+func TestGetDownloadURLOptionsAndCaching(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, "/api/files", storage.WithDownloadExpiresIn(2*time.Hour), storage.UseCachedURLs()); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	started := time.Now()
+	cached, err := e.getDownloadURL("stable")
+	if err != nil {
+		t.Fatalf("getDownloadURL: %v", err)
+	}
+	if !strings.HasPrefix(cached, "/api/files/file/") {
+		t.Fatalf("download URL = %q, want /api/files/file/ prefix", cached)
+	}
+	first := loadDownloadToken(t, e, "stable")
+	if cached != "/api/files/file/"+first.Token {
+		t.Fatalf("download URL = %q, want token %s", cached, first.Token)
+	}
+	assertExpiryAround(t, first.ExpiresAt, started, 2*time.Hour)
+
+	again, err := e.getDownloadURL("stable", storage.WithDownloadExpiresIn(30*time.Minute))
+	if err != nil {
+		t.Fatalf("cached getDownloadURL: %v", err)
+	}
+	if again != cached {
+		t.Fatalf("cached URL = %q, want %q", again, cached)
+	}
+	if n := countDownloadTokens(t, e, "stable"); n != 1 {
+		t.Fatalf("cached download tokens = %d, want 1", n)
+	}
+
+	if err := e.db.Model(&TetherDownloadToken{}).Where("token = ?", first.Token).Update("expires_at", time.Now().Add(4*time.Minute)).Error; err != nil {
+		t.Fatalf("shorten token lifetime: %v", err)
+	}
+	refreshedAt := time.Now()
+	refreshed, err := e.getDownloadURL("stable", storage.WithDownloadExpiresIn(30*time.Minute))
+	if err != nil {
+		t.Fatalf("refresh getDownloadURL: %v", err)
+	}
+	if refreshed == cached {
+		t.Fatal("URL expiring within 5 minutes was reused")
+	}
+	if n := countDownloadTokens(t, e, "stable"); n != 2 {
+		t.Fatalf("download tokens after refresh = %d, want 2", n)
+	}
+	var refreshedToken TetherDownloadToken
+	if err := e.db.Where("token = ?", strings.TrimPrefix(refreshed, "/api/files/file/")).First(&refreshedToken).Error; err != nil {
+		t.Fatalf("load refreshed token: %v", err)
+	}
+	assertExpiryAround(t, refreshedToken.ExpiresAt, refreshedAt, 30*time.Minute)
+
+	zeroAt := time.Now()
+	zero, err := e.getDownloadURL("zero", storage.WithDownloadExpiresIn(0))
+	if err != nil {
+		t.Fatalf("zero lifetime getDownloadURL: %v", err)
+	}
+	if !strings.HasPrefix(zero, "/api/files/file/") {
+		t.Fatalf("zero lifetime URL = %q", zero)
+	}
+	assertExpiryAround(t, loadDownloadToken(t, e, "zero").ExpiresAt, zeroAt, 15*time.Minute)
+}
+
+func TestGetDownloadURLWithoutCacheIssuesANewToken(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, ""); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	started := time.Now()
+	first, err := e.getDownloadURL("file")
+	if err != nil {
+		t.Fatalf("getDownloadURL: %v", err)
+	}
+	second, err := e.getDownloadURL("file", storage.WithDownloadExpiresIn(time.Hour))
+	if err != nil {
+		t.Fatalf("second getDownloadURL: %v", err)
+	}
+	if first == second {
+		t.Fatal("uncached getDownloadURL returned the same URL twice")
+	}
+	if !strings.HasPrefix(first, "/storage/file/") || !strings.HasPrefix(second, "/storage/file/") {
+		t.Fatalf("URLs = %q, %q; want /storage/file/ prefix", first, second)
+	}
+	if n := countDownloadTokens(t, e, "file"); n != 2 {
+		t.Fatalf("download tokens = %d, want 2", n)
+	}
+	var shorter, longer TetherDownloadToken
+	if err := e.db.Where("token = ?", strings.TrimPrefix(first, "/storage/file/")).First(&shorter).Error; err != nil {
+		t.Fatalf("load first token: %v", err)
+	}
+	if err := e.db.Where("token = ?", strings.TrimPrefix(second, "/storage/file/")).First(&longer).Error; err != nil {
+		t.Fatalf("load second token: %v", err)
+	}
+	assertExpiryAround(t, shorter.ExpiresAt, started, 15*time.Minute)
+	assertExpiryAround(t, longer.ExpiresAt, started, time.Hour)
+}
+
+func TestDownloadURLExpiryRerunsSubscribedQuery(t *testing.T) {
+	e := newTestEngine(t)
+	store, err := local.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("create local storage: %v", err)
+	}
+	if err := e.SetStorage(store, "/api/files", storage.WithDownloadExpiresIn(time.Hour)); err != nil {
+		t.Fatalf("set storage: %v", err)
+	}
+
+	var expiringRuns, liveRuns atomic.Int64
+	e.RegisterQuery("expiringFile", func(ctx *QueryCtx) (any, error) {
+		expiringRuns.Add(1)
+		return ctx.Storage.GetDownloadURL("expiring", storage.UseCachedURLs())
+	})
+	e.RegisterQuery("liveFile", func(ctx *QueryCtx) (any, error) {
+		liveRuns.Add(1)
+		return ctx.Storage.GetDownloadURL("live")
+	})
+
+	client := trackClient(t, e)
+	expiringSub := subscribe(t, e, client, "expiringFile", "expiring", nil)
+	liveSub := subscribe(t, e, client, "liveFile", "live", nil)
+	pushed := queryData(t, drain(client))
+	if len(pushed) != 2 {
+		t.Fatalf("initial query pushes = %d, want 2", len(pushed))
+	}
+
+	expiringToken := loadDownloadToken(t, e, "expiring")
+	liveToken := loadDownloadToken(t, e, "live")
+	expiringTag := "~storage_token:" + expiringToken.Token
+	liveTag := "~storage_token:" + liveToken.Token
+	if !e.tracker.SubscriptionHasTag(expiringSub.SubID, expiringTag) {
+		t.Fatalf("expiring subscription missing %s", expiringTag)
+	}
+	if !e.tracker.SubscriptionHasTag(liveSub.SubID, liveTag) {
+		t.Fatalf("live subscription missing %s", liveTag)
+	}
+	if pushed["expiringFile"] != "/api/files/file/"+expiringToken.Token {
+		t.Fatalf("expiring URL = %v", pushed["expiringFile"])
+	}
+
+	e.cleanStorage(time.Now())
+	if expiringRuns.Load() != 1 || liveRuns.Load() != 1 {
+		t.Fatalf("runs before expiry = %d and %d, want 1 and 1", expiringRuns.Load(), liveRuns.Load())
+	}
+
+	if err := e.db.Model(&TetherDownloadToken{}).Where("token = ?", expiringToken.Token).Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+		t.Fatalf("expire token: %v", err)
+	}
+	refreshedAt := time.Now()
+	e.cleanStorage(time.Now())
+
+	if expiringRuns.Load() != 2 {
+		t.Fatalf("expiring query runs = %d, want 2", expiringRuns.Load())
+	}
+	if liveRuns.Load() != 1 {
+		t.Fatalf("live query runs = %d, want 1", liveRuns.Load())
+	}
+	if e.tracker.SubscriptionHasTag(expiringSub.SubID, expiringTag) {
+		t.Fatal("subscription still tracks the expired token")
+	}
+	if !e.tracker.SubscriptionHasTag(liveSub.SubID, liveTag) {
+		t.Fatal("live subscription lost its token tag")
+	}
+
+	var gone int64
+	if err := e.db.Model(&TetherDownloadToken{}).Where("token = ?", expiringToken.Token).Count(&gone).Error; err != nil {
+		t.Fatalf("count expired token: %v", err)
+	}
+	if gone != 0 {
+		t.Fatalf("expired tokens = %d, want 0", gone)
+	}
+	replacement := loadDownloadToken(t, e, "expiring")
+	if replacement.Token == expiringToken.Token {
+		t.Fatal("expired token was reused")
+	}
+	replacementTag := "~storage_token:" + replacement.Token
+	if !e.tracker.SubscriptionHasTag(expiringSub.SubID, replacementTag) {
+		t.Fatalf("subscription missing %s", replacementTag)
+	}
+	assertExpiryAround(t, replacement.ExpiresAt, refreshedAt, time.Hour)
+
+	got := queryData(t, drain(client))
+	if got["expiringFile"] != "/api/files/file/"+replacement.Token {
+		t.Fatalf("refreshed URL = %v, want %s", got["expiringFile"], replacement.Token)
+	}
+	if _, ok := got["liveFile"]; ok {
+		t.Fatal("live query was pushed after another file's URL expired")
+	}
+}
+
+func loadDownloadToken(t *testing.T, e *Engine, fileID string) TetherDownloadToken {
+	t.Helper()
+	var tokens []TetherDownloadToken
+	if err := e.db.Where("file_id = ?", fileID).Order("expires_at desc").Find(&tokens).Error; err != nil {
+		t.Fatalf("load download tokens for %s: %v", fileID, err)
+	}
+	if len(tokens) == 0 {
+		t.Fatalf("no download token for %s", fileID)
+	}
+	return tokens[0]
+}
+
+func countDownloadTokens(t *testing.T, e *Engine, fileID string) int64 {
+	t.Helper()
+	var n int64
+	if err := e.db.Model(&TetherDownloadToken{}).Where("file_id = ?", fileID).Count(&n).Error; err != nil {
+		t.Fatalf("count download tokens for %s: %v", fileID, err)
+	}
+	return n
+}
+
+func assertExpiryAround(t *testing.T, got, start time.Time, d time.Duration) {
+	t.Helper()
+	if got.Before(start.Add(d-time.Second)) || got.After(time.Now().Add(d+time.Second)) {
+		t.Fatalf("expires at %s, want about %s after %s", got, d, start)
+	}
+}
+
+func queryData(t *testing.T, msgs []map[string]interface{}) map[string]interface{} {
+	t.Helper()
+	out := map[string]interface{}{}
+	for _, msg := range queryMessages(t, msgs) {
+		location, _ := msg["location"].(string)
+		out[location] = msg["data"]
+	}
+	return out
+}
+
 func serveStorage(e *Engine, method, path string, body io.Reader, headers map[string]string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(method, path, body)
 	for key, value := range headers {

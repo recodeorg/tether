@@ -67,12 +67,21 @@ type StorageCtx struct {
 	// is empty.
 	// Not available in queries.
 	GetUploadURL func(opts ...storage.UploadOption) (storage.UploadInfo, error)
-	// GetDownloadURL returns a URL that serves the file to anyone who has it
-	// for the next 15 minutes. It does not check that the file exists or that
-	// the caller may read it, so authorize the caller first. The URL uses the
-	// base path passed to [Engine.SetStorage], or /storage when that path is
-	// empty.
-	GetDownloadURL func(fileID string) (string, error)
+	// GetDownloadURL returns a URL that serves the file to anyone who has it.
+	// It does not check that the file exists or that the caller may read it,
+	// so authorize the caller first. The URL stays valid for 15 minutes
+	// unless [storage.WithDownloadExpiresIn] says otherwise. Options passed
+	// to [Engine.SetStorage] are applied first; opts are applied after them.
+	// [storage.UseCachedURLs] returns an existing URL for fileID when that
+	// URL has more than five minutes left, instead of issuing a new one.
+	// While a cached URL is returned, a different WithDownloadExpiresIn on
+	// that call is ignored.
+	//
+	// A subscribed query that calls GetDownloadURL depends on the URL's
+	// token. Storage cleanup deletes the token once it expires and re-runs
+	// the query, which can return a fresh URL. The URL uses the base path
+	// passed to [Engine.SetStorage], or /storage when that path is empty.
+	GetDownloadURL func(fileID string, opts ...storage.UploadOption) (string, error)
 	// DeleteFile deletes the file's contents and record, and invalidates its
 	// download URLs. Not available in queries.
 	DeleteFile func(fileID string) error
@@ -82,8 +91,9 @@ type StorageCtx struct {
 	//
 	// contentType is saved as the file's MIME type and sent when the file is
 	// served. data is read to completion. The upload has no size or lifetime
-	// limit: [storage.WithMaxBytes] and [storage.WithExpiresIn] are ignored.
-	// [storage.Public] is honored, including when it was passed to
+	// limit: [storage.WithMaxBytes], [storage.WithExpiresIn],
+	// [storage.WithDownloadExpiresIn], and [storage.UseCachedURLs] are
+	// ignored. [storage.Public] is honored, including when it was passed to
 	// [Engine.SetStorage], and a public file can be fetched at
 	// {basePath}/public/{fileID} with no download token.
 	//

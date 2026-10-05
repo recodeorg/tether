@@ -78,14 +78,17 @@ func (s *Storage) UploadStream(ctx context.Context, fileID string, contentType s
 	return err
 }
 
-// ServeFile redirects to a presigned URL for the object fileID that is valid
-// for 15 minutes.
+// ServeFile redirects to a presigned URL for the object fileID. The engine
+// stores the download token's expiry in the request context under
+// "expires_at". The presigned URL lasts until one minute after that time,
+// so it covers the token without outliving it for long. When the expiry is
+// missing, that same one-minute buffer is applied to a 15-minute lifetime.
 func (s *Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Request) error {
-	// Generate a short-lived AWS URL
+	ttl, ok := r.Context().Value("expires_at").(time.Time)
 	presignedReq, err := s.presignClient.PresignGetObject(r.Context(), &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(fileID),
-	}, s3.WithPresignExpires(15*time.Minute))
+	}, s3.WithPresignExpires(downloadPresignTTL(ttl, ok, time.Now())))
 
 	if err != nil {
 		return err
@@ -93,6 +96,17 @@ func (s *Storage) ServeFile(fileID string, w http.ResponseWriter, r *http.Reques
 
 	http.Redirect(w, r, presignedReq.URL, http.StatusFound)
 	return nil
+}
+
+// downloadPresignTTL is how long an S3 redirect stays valid. expiresAt is the
+// download token's expiry when ok is true. The extra minute lets the client
+// finish the redirect as the token reaches its limit. A missing expiry uses
+// 15 minutes from now, plus that same minute.
+func downloadPresignTTL(expiresAt time.Time, ok bool, now time.Time) time.Duration {
+	if !ok {
+		expiresAt = now.Add(15 * time.Minute)
+	}
+	return expiresAt.Add(time.Minute).Sub(now)
 }
 
 // Delete removes the object fileID.
