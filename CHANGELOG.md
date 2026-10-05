@@ -1,3 +1,8 @@
+## [1.2.1] - 2026-10-04
+
+### Fixed
+- Initial subscriptions on the same connection no longer block each other
+
 ## [1.2.0] - 2026-10-2
 
 ### Added

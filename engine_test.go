@@ -3201,8 +3201,11 @@ func TestOutboundFramesIncludeProtocolVersion(t *testing.T) {
 
 	check := func(label string) {
 		t.Helper()
-		msgs := drain(client)
-		if len(msgs) == 0 {
+		var msgs []map[string]interface{}
+		if !waitUntil(t, time.Second, func() bool {
+			msgs = append(msgs, drain(client)...)
+			return len(msgs) > 0
+		}) {
 			t.Fatalf("%s: no frames", label)
 		}
 		for _, msg := range msgs {
@@ -3415,6 +3418,18 @@ func TestParamsAndResultsDoNotLeakToLogs(t *testing.T) {
 	if _, err := e.executeMutationInternal("internalLogin", params()); err != nil {
 		t.Fatalf("executeMutationInternal: %v", err)
 	}
+	wantLogs := []string{"Executed mutation", "Executing query", "Failed to execute mutation", "Failed to execute query", "Invalid message"}
+	if !waitUntil(t, time.Second, func() bool {
+		logged := logs.String()
+		for _, want := range wantLogs {
+			if !strings.Contains(logged, want) {
+				return false
+			}
+		}
+		return true
+	}) {
+		t.Fatalf("debug logs missing expected lines:\n%s", logs.String())
+	}
 	drain(client)
 
 	logged := logs.String()
@@ -3423,7 +3438,7 @@ func TestParamsAndResultsDoNotLeakToLogs(t *testing.T) {
 			t.Fatalf("debug logs contain %q:\n%s", secret, logged)
 		}
 	}
-	for _, want := range []string{"Executed mutation", "Executing query", "Failed to execute mutation", "Failed to execute query", "Invalid message"} {
+	for _, want := range wantLogs {
 		if !strings.Contains(logged, want) {
 			t.Fatalf("debug logs missing %q:\n%s", want, logged)
 		}
@@ -4063,10 +4078,14 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 			t.Errorf("subscribe: %v", err)
 		}
 	})
+	if !waitUntil(t, time.Second, func() bool {
+		return len(drain(client)) > 0
+	}) {
+		t.Fatal("initial query result was not sent")
+	}
 	if queryRuns.Load() != 1 {
 		t.Fatalf("query runs after subscribe = %d, want 1", queryRuns.Load())
 	}
-	drain(client)
 
 	mustNoPanic(t, "mutation", func() {
 		if err := e.onReceiveMessage(client.ID, map[string]interface{}{
@@ -4102,6 +4121,122 @@ func TestOnReceiveMessageSubscribeAndMutation(t *testing.T) {
 	}
 }
 
+func TestInitialSubscriptionsDoNotBlockEachOther(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSlow := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseSlow()
+
+	e.RegisterQuery("slow", func(ctx *QueryCtx) (any, error) {
+		close(started)
+		<-release
+		return "slow", nil
+	})
+	e.RegisterQuery("fast", func(ctx *QueryCtx) (any, error) {
+		return "fast", nil
+	})
+
+	subscribed := make(chan error, 1)
+	go func() {
+		subscribed <- e.onReceiveMessage(client.ID, map[string]interface{}{
+			"type":      "subscribe",
+			"location":  "slow",
+			"params":    map[string]interface{}{},
+			"query_key": "slow",
+		})
+	}()
+	select {
+	case err := <-subscribed:
+		if err != nil {
+			t.Fatalf("slow subscribe: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow subscribe blocked the connection")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("slow query did not start")
+	}
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type":      "subscribe",
+		"location":  "fast",
+		"params":    map[string]interface{}{},
+		"query_key": "fast",
+	}); err != nil {
+		t.Fatalf("fast subscribe: %v", err)
+	}
+	if !waitUntil(t, time.Second, func() bool {
+		for _, msg := range queryMessages(t, drain(client)) {
+			if msg["query_key"] == "fast" && msg["data"] == "fast" {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("fast query did not complete while the slow query was still running")
+	}
+	releaseSlow()
+}
+
+func TestUnsubscribeDropsInFlightInitialResult(t *testing.T) {
+	e := newTestEngine(t)
+	client := trackClient(t, e)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseQuery := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseQuery()
+
+	e.RegisterQuery("slow", func(ctx *QueryCtx) (any, error) {
+		close(started)
+		<-release
+		return "late", nil
+	})
+	params := map[string]interface{}{}
+	subscribed := make(chan error, 1)
+	go func() {
+		subscribed <- e.onReceiveMessage(client.ID, map[string]interface{}{
+			"type":      "subscribe",
+			"location":  "slow",
+			"params":    params,
+			"query_key": "slow",
+		})
+	}()
+	select {
+	case err := <-subscribed:
+		if err != nil {
+			t.Fatalf("subscribe: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("subscribe blocked the connection")
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("query did not start")
+	}
+
+	if err := e.onReceiveMessage(client.ID, map[string]interface{}{
+		"type":     "unsubscribe",
+		"location": "slow",
+		"params":   params,
+	}); err != nil {
+		t.Fatalf("unsubscribe: %v", err)
+	}
+	releaseQuery()
+	e.Close()
+	if got := queryMessages(t, drain(client)); len(got) != 0 {
+		t.Fatalf("in-flight subscribe delivered after unsubscribe: %v", got)
+	}
+}
+
 func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 	e := newTestEngine(t)
 	client := trackClient(t, e)
@@ -4123,7 +4258,13 @@ func TestUnsubscribeMessageStopsQueryPushes(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
-	initial := queryMessages(t, drain(client))
+	var initial []map[string]interface{}
+	if !waitUntil(t, time.Second, func() bool {
+		initial = append(initial, queryMessages(t, drain(client))...)
+		return len(initial) >= 1
+	}) {
+		t.Fatalf("initial query pushes = %d, want 1", len(initial))
+	}
 	if len(initial) != 1 {
 		t.Fatalf("initial query pushes = %d, want 1", len(initial))
 	}
