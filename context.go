@@ -101,6 +101,15 @@ type StorageCtx struct {
 	PutFile func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error)
 }
 
+type ActionCtx struct {
+	Auth            *AuthCtx
+	Scheduler       *SchedulerCtx
+	Storage         *StorageCtx
+	Profiler        *Profiler
+	ExecuteMutation func(name string, params map[string]any) (any, error)
+	ExecuteQuery    func(name string, params map[string]any) (any, error)
+}
+
 // QueryCtx is passed to query functions registered with
 // [Engine.RegisterQuery].
 type QueryCtx struct {

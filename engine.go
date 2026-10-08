@@ -1735,6 +1735,85 @@ func (e *Engine) RegisterGuard(name string, fn func(ctx *GuardCtx) (any, error),
 	slog.Debug("Registered guard", "name", name)
 }
 
+func (e *Engine) getActionIdentity(r *http.Request) (string, error) {
+	token := r.Header.Get("Authorization")
+	if token == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(token, "Bearer ") {
+		return "", fmt.Errorf("invalid authorization token")
+	}
+	token = strings.TrimPrefix(token, "Bearer ")
+	userID, _, err := e.auth.VerifyToken(r.Context(), e.db, token)
+	if err != nil {
+		return "", err
+	}
+	return userID, nil
+}
+
+func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, authErr := e.getActionIdentity(r)
+		execID := uuid.NewString()
+		traceCtx := context.WithValue(r.Context(), ContextKeyExecutionID, execID)
+		traceCtx = context.WithValue(traceCtx, ContextKeyActionName, "http")
+		authCtx := &AuthCtx{
+			GetIdentity: func() (string, error) {
+				return userID, authErr
+			},
+		}
+		authCtx.ExecuteGuard = func(guardName string, params map[string]interface{}) (interface{}, error) {
+			guardAuth := &AuthCtx{
+				GetIdentity: func() (string, error) {
+					return userID, authErr
+				},
+				ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
+					return nil, fmt.Errorf("guards cannot execute other guards")
+				},
+			}
+			guardCtx := &GuardCtx{
+				DB:     e.readOnlyDB(traceCtx),
+				Auth:   guardAuth,
+				Params: params,
+			}
+			result, err := executeGuard(e, guardCtx, guardName)
+			if err != nil {
+				return nil, err
+			}
+			decoded, _, err := canonicalGuardResult(result)
+			if err != nil {
+				return nil, err
+			}
+			return decoded, nil
+		}
+		actionCtx := &ActionCtx{
+			Auth: authCtx,
+			Scheduler: &SchedulerCtx{
+				RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
+					return e.scheduleTask(time.Now().Add(duration), functionName, params)
+				},
+				Cancel: func(taskID string) bool {
+					return e.cancelTask(taskID)
+				},
+			},
+			Storage: &StorageCtx{
+				GetUploadURL:   e.getUploadURL,
+				GetDownloadURL: e.getDownloadURL,
+				DeleteFile:     e.deleteFile,
+				PutFile:        e.putFile,
+			},
+			Profiler: e.Profiler(),
+			ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
+				return e.ExecuteMutation(mutationName, params)
+			},
+			ExecuteQuery: func(queryName string, params map[string]interface{}) (any, error) {
+				return e.ExecuteQuery(queryName, params)
+			},
+		}
+		fn(actionCtx, w, r)
+	}
+}
+
 // CreateTable creates or migrates the table for schema, a pointer to a GORM
 // model, using GORM's AutoMigrate, and returns any migration error.
 //
