@@ -31,8 +31,9 @@ Swap SQLite for PostgreSQL and you can run as many Tether instances as you like 
 
 ### Batteries included
 
-- **Authentication**: bring your own tokens (JWTs, session tokens, and so on) by implementing a single `VerifyToken` method.
-- **File storage**: signed upload and download URLs, server-side uploads, and optional public file URLs, with local disk and S3-compatible adapters.
+- **Authentication**: bring your own tokens (JWTs, session tokens, and so on) by implementing a single `VerifyToken` method, or use the included Clerk and OpenID Connect adapters.
+- **HTTP actions**: handle webhooks and other HTTP endpoints with the same auth, guards, storage, and scheduler as a mutation.
+- **File storage**: signed upload and download URLs, server-side uploads, optional public file URLs, and server-side commit hooks, with included local disk and S3-compatible adapters.
 - **Scheduling**: run mutations after a delay or on a cron schedule. Tasks persist across restarts.
 - **Transactions**: writes inside a database transaction only notify clients once the transaction commits. Rolled-back writes never reach clients.
 - **Profiling**: built-in performance profiling for queries, mutations, guards, and database calls.

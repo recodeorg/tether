@@ -101,9 +101,12 @@ type TetherDownloadToken struct {
 	ExpiresAt time.Time `gorm:"index"` // time when the download token expires
 }
 
+// TetherUploadHook is the database row for a mutation registered with
+// [StorageCtx.RunAfterUpload]. One file has one hook. The row is removed
+// after that upload completes, and when an abandoned upload is cleaned up.
 type TetherUploadHook struct {
-	FileID       string `gorm:"primaryKey"`
-	MutationName string `gorm:"not null"`
+	FileID       string `gorm:"primaryKey"` // file the hook waits on
+	MutationName string `gorm:"not null"`   // mutation run after the upload
 	ParamsJSON   string `gorm:"type:text;not null"`
 	CreatedAt    time.Time
 }
@@ -1037,8 +1040,9 @@ func storageKindPrefix(base, kind string) string {
 }
 
 // cleanStorage removes expired download tokens and upload rows that expired
-// before they became active. Those rows stay until ExpiresAt, so a longer
-// ExpiresIn remains usable. Object bytes are deleted before that metadata.
+// before they became active, including any [TetherUploadHook] waiting on
+// those uploads. Those rows stay until ExpiresAt, so a longer ExpiresIn
+// remains usable. Object bytes are deleted before that metadata.
 // A missing object is fine; any other delete error keeps the row for retry.
 func (e *Engine) cleanStorage(now time.Time) {
 	var expiredTokens []TetherDownloadToken
@@ -1073,7 +1077,7 @@ func (e *Engine) cleanStorage(now time.Time) {
 		return
 	}
 	e.db.Where("id IN ?", ids).Delete(&TetherStorage{})
-	e.db.Where("id IN ?", ids).Delete(&TetherUploadHook{})
+	e.db.Where("file_id IN ?", ids).Delete(&TetherUploadHook{})
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -1763,6 +1767,32 @@ func (e *Engine) getActionIdentity(r *http.Request) (string, error) {
 	return userID, nil
 }
 
+// HTTPAction returns an HTTP handler that can call guards, queries,
+// mutations, storage, and the scheduler.
+//
+// The request's Authorization header, when present, must be a Bearer token.
+// [Auth.VerifyToken] checks the token, and ctx.Auth.GetIdentity returns that
+// user ID. A request with no Authorization header is anonymous: GetIdentity
+// returns "" and a nil error. A header that is not a Bearer token, or a token
+// VerifyToken rejects, makes GetIdentity return an error and an empty user
+// ID. The handler still runs, so check that error before doing work for the
+// caller.
+//
+// ctx.Auth.ExecuteGuard uses that same identity and a read-only database.
+// ctx.ExecuteMutation and ctx.ExecuteQuery do not. They are
+// [Engine.ExecuteMutation] and [Engine.ExecuteQuery], so the nested run has
+// no caller even when the request does. Without [Engine.SetAuth], every
+// bearer token is accepted and the caller stays anonymous.
+//
+// Mount the returned function like any other HTTP handler:
+//
+//	http.HandleFunc("POST /hooks/stripe", engine.HTTPAction(func(ctx *tether.ActionCtx, w http.ResponseWriter, r *http.Request) {
+//	    userID, err := ctx.Auth.GetIdentity()
+//	    if err != nil || userID == "" {
+//	        http.Error(w, "unauthorized", http.StatusUnauthorized)
+//	        return
+//	    }
+//	}))
 func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, authErr := e.getActionIdentity(r)
@@ -1885,6 +1915,11 @@ func extractMetadataHeaders(r *http.Request) map[string]string {
 //
 // Served files include X-Content-Type-Options: nosniff. Types that are not
 // safe to display in the browser, including SVG, are sent as attachments.
+// An upload request may include headers named X-Tether-Meta-*. A mutation
+// registered with [StorageCtx.RunAfterUpload] receives them, along with the
+// stored file's id, size, type, and visibility. That mutation runs in the
+// background after the file is stored. Its error is logged and is not
+// returned to the client. The upload still succeeds when the mutation fails.
 // Browser requests are subject to the same origin policy as [Engine.Handle],
 // and allowed origins receive the CORS headers they need. Responses vary on
 // Origin even when the request omits it, so a cached media load of the same
@@ -1947,16 +1982,22 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed to update upload status", http.StatusInternalServerError)
 			return
 		}
-		commitData := make([]TetherUploadHook, 0)
-		err = e.db.Where("file_id = ?", record.ID).Find(&commitData).Error
-		if err == nil { // if there are any upload hooks, execute them, if not, continue with the upload
-			for _, hook := range commitData {
-				params := make(map[string]interface{})
-				err = json.Unmarshal([]byte(hook.ParamsJSON), &params)
-				if err != nil {
+		// Updates writes these columns but does not copy them back onto record.
+		record.Status = "active"
+		record.MimeType = contentType
+		record.FileSize = r.ContentLength
+		record.Adapter = e.storage.Name()
+		var hooks []TetherUploadHook
+		if err := e.db.Where("file_id = ?", record.ID).Find(&hooks).Error; err == nil {
+			for _, hook := range hooks {
+				params := map[string]interface{}{}
+				if err := json.Unmarshal([]byte(hook.ParamsJSON), &params); err != nil {
 					slog.Error("Failed to unmarshal params", "error", err)
 					http.Error(w, "Failed to unmarshal params", http.StatusInternalServerError)
 					return
+				}
+				if params == nil {
+					params = map[string]interface{}{}
 				}
 				params["storage.fileID"] = record.ID
 				params["storage.fileSize"] = record.FileSize
@@ -1964,19 +2005,17 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 				params["storage.public"] = record.Public
 				params["storage.expiresAt"] = record.ExpiresAt
 				params["storage.createdAt"] = record.CreatedAt
-				meta := extractMetadataHeaders(r)
-				for k, v := range meta {
+				for k, v := range extractMetadataHeaders(r) {
 					params["metadata."+k] = v
 				}
+				mutationName := hook.MutationName
 				go func() {
-					_, err = e.ExecuteMutation(hook.MutationName, params)
-					if err != nil {
-						slog.Error("[tether/storage] post-upload mutation failed", "mutation", hook.MutationName, "error", err)
+					if _, err := e.ExecuteMutation(mutationName, params); err != nil {
+						slog.Error("[tether/storage] post-upload mutation failed", "mutation", mutationName, "error", err)
 					}
 				}()
 			}
-			err = e.db.Delete(&commitData).Error
-			if err != nil {
+			if err := e.db.Delete(&hooks).Error; err != nil {
 				slog.Error("Failed to delete upload hooks", "error", err)
 			}
 		}

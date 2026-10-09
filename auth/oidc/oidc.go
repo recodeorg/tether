@@ -1,3 +1,9 @@
+// Package oidc verifies OpenID Connect ID tokens for Tether.
+//
+// Pass the adapter from [New] to Engine.SetAuth. Discovery runs on the first
+// token and is cached; a failed discovery is retried on the next token. The
+// user ID defaults to the "sub" claim. The returned expiry includes the
+// configured leeway.
 package oidc
 
 import (
@@ -22,14 +28,21 @@ type oidcOptions struct {
 	SkipAudienceCheck bool
 }
 
+// OIDCOption configures an adapter created with [New].
 type OIDCOption func(*oidcOptions)
 
+// AllowAnonymous, when true, treats an empty token as an anonymous caller.
+// VerifyToken then returns an empty user ID, a zero expiry, and a nil error,
+// without contacting the issuer. A token that is present is still verified.
 func AllowAnonymous(allowAnonymous bool) OIDCOption {
 	return func(opts *oidcOptions) {
 		opts.AllowAnonymous = allowAnonymous
 	}
 }
 
+// WithLeeway sets how much clock skew to allow when checking expiry. The
+// default is five seconds. The expiry VerifyToken returns is the token's
+// expiry plus this leeway.
 func WithLeeway(leeway time.Duration) OIDCOption {
 	return func(opts *oidcOptions) {
 		opts.Leeway = leeway
@@ -52,6 +65,7 @@ func SkipAudienceCheck(skip bool) OIDCOption {
 	}
 }
 
+// Config identifies the provider whose ID tokens the adapter accepts.
 type Config struct {
 	// IssuerURL identifies the provider, e.g. "https://accounts.google.com".
 	// The discovery document is fetched from
@@ -63,6 +77,8 @@ type Config struct {
 	Audience string
 }
 
+// OIDCAdapter checks OpenID Connect ID tokens. It implements Tether's auth
+// interface.
 type OIDCAdapter struct {
 	issuerURL      string
 	verifierConfig *gooidc.Config
@@ -74,6 +90,13 @@ type OIDCAdapter struct {
 	verifier *gooidc.IDTokenVerifier
 }
 
+// New returns an adapter that verifies ID tokens from cfg.IssuerURL. It
+// panics if IssuerURL is empty, and if Audience is empty unless
+// [SkipAudienceCheck] is set.
+//
+// An empty token is rejected unless [AllowAnonymous] is set. The user ID is
+// the "sub" claim unless [WithUserIDClaim] selects another claim. Expiry
+// checks allow five seconds of clock skew unless [WithLeeway] says otherwise.
 func New(cfg Config, options ...OIDCOption) *OIDCAdapter {
 	if cfg.IssuerURL == "" {
 		panic("issuer URL is required")
@@ -129,6 +152,10 @@ func (a *OIDCAdapter) getVerifier(ctx context.Context) (*gooidc.IDTokenVerifier,
 	return a.verifier, nil
 }
 
+// VerifyToken checks an ID token and returns the configured user-ID claim
+// and the token's expiry. A "Bearer " prefix is stripped. The expiry includes
+// the adapter's leeway. An empty token is an error unless the adapter was
+// created with [AllowAnonymous].
 func (a *OIDCAdapter) VerifyToken(ctx context.Context, db *gorm.DB, token string) (string, time.Time, error) {
 	if strings.HasPrefix(token, "Bearer ") {
 		token = strings.TrimPrefix(token, "Bearer ")
