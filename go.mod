@@ -4,11 +4,20 @@ go 1.26.8
 
 require (
 	github.com/cespare/xxhash v1.1.0
+	github.com/clerk/clerk-sdk-go/v2 v2.7.0
+	github.com/coreos/go-oidc/v3 v3.21.0
 	github.com/glebarez/sqlite v1.11.0
+	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/google/uuid v1.3.0
 	github.com/gorilla/websocket v1.5.3
 	gorm.io/driver/postgres v1.6.3
 	gorm.io/gorm v1.31.2
+)
+
+require (
+	github.com/go-jose/go-jose/v3 v3.0.4 // indirect
+	golang.org/x/crypto v0.43.0 // indirect
+	golang.org/x/oauth2 v0.36.0 // indirect
 )
 
 require (
@@ -45,7 +54,7 @@ require (
 	github.com/mattn/go-isatty v0.0.17 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/robfig/cron/v3 v3.0.0
-	golang.org/x/sys v0.7.0 // indirect
+	golang.org/x/sys v0.37.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	modernc.org/libc v1.22.5 // indirect
 	modernc.org/mathutil v1.5.0 // indirect
