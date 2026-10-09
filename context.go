@@ -99,6 +99,8 @@ type StorageCtx struct {
 	//
 	// Returns an error if storage is not configured. Not available in queries.
 	PutFile func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error)
+
+	RunAfterUpload func(fileID string, mutationName string, params map[string]interface{}) error
 }
 
 type ActionCtx struct {

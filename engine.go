@@ -101,6 +101,13 @@ type TetherDownloadToken struct {
 	ExpiresAt time.Time `gorm:"index"` // time when the download token expires
 }
 
+type TetherUploadHook struct {
+	FileID       string `gorm:"primaryKey"`
+	MutationName string `gorm:"not null"`
+	ParamsJSON   string `gorm:"type:text;not null"`
+	CreatedAt    time.Time
+}
+
 // Engine is a Tether server. Create one with [NewEngine], register tables,
 // guards, queries and mutations, then mount [Engine.Handle] (and
 // [Engine.StorageHandler] if file storage is used) on an HTTP server.
@@ -973,6 +980,10 @@ func (e *Engine) SetStorage(adapter storage.StorageAdapter, basePath string, def
 		slog.Error("Failed to create table", "error", err)
 		return err
 	}
+	if err := e.CreateTable([]TetherUploadHook{}); err != nil {
+		slog.Error("Failed to create table", "error", err)
+		return err
+	}
 	if !e.beginWork() {
 		return ErrEngineClosed
 	}
@@ -1062,6 +1073,7 @@ func (e *Engine) cleanStorage(now time.Time) {
 		return
 	}
 	e.db.Where("id IN ?", ids).Delete(&TetherStorage{})
+	e.db.Where("id IN ?", ids).Delete(&TetherUploadHook{})
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -1801,6 +1813,7 @@ func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *ht
 				GetDownloadURL: e.getDownloadURL,
 				DeleteFile:     e.deleteFile,
 				PutFile:        e.putFile,
+				RunAfterUpload: e.runAfterUpload,
 			},
 			Profiler: e.Profiler(),
 			ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
@@ -1841,6 +1854,21 @@ func (e *Engine) CreateTable(schema interface{}) error {
 // A client frame larger than 8 KB closes the connection.
 func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
 	reactivity.Handle(w, r, e.onReceiveMessage, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
+}
+
+func extractMetadataHeaders(r *http.Request) map[string]string {
+	const metaHeaderPrefix = "x-tether-meta-"
+	meta := make(map[string]string)
+	for key, values := range r.Header {
+		lowerKey := strings.ToLower(key)
+		if strings.HasPrefix(lowerKey, metaHeaderPrefix) {
+			fieldName := strings.TrimPrefix(lowerKey, metaHeaderPrefix)
+			if len(values) > 0 {
+				meta[fieldName] = values[0]
+			}
+		}
+	}
+	return meta
 }
 
 // StorageHandler serves upload, download, and public file URLs. By default
@@ -1918,6 +1946,39 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			slog.Error("Failed to update upload status", "error", result.Error)
 			http.Error(w, "Failed to update upload status", http.StatusInternalServerError)
 			return
+		}
+		commitData := make([]TetherUploadHook, 0)
+		err = e.db.Where("file_id = ?", record.ID).Find(&commitData).Error
+		if err == nil { // if there are any upload hooks, execute them, if not, continue with the upload
+			for _, hook := range commitData {
+				params := make(map[string]interface{})
+				err = json.Unmarshal([]byte(hook.ParamsJSON), &params)
+				if err != nil {
+					slog.Error("Failed to unmarshal params", "error", err)
+					http.Error(w, "Failed to unmarshal params", http.StatusInternalServerError)
+					return
+				}
+				params["storage.fileID"] = record.ID
+				params["storage.fileSize"] = record.FileSize
+				params["storage.mimeType"] = record.MimeType
+				params["storage.public"] = record.Public
+				params["storage.expiresAt"] = record.ExpiresAt
+				params["storage.createdAt"] = record.CreatedAt
+				meta := extractMetadataHeaders(r)
+				for k, v := range meta {
+					params["metadata."+k] = v
+				}
+				go func() {
+					_, err = e.ExecuteMutation(hook.MutationName, params)
+					if err != nil {
+						slog.Error("[tether/storage] post-upload mutation failed", "mutation", hook.MutationName, "error", err)
+					}
+				}()
+			}
+			err = e.db.Delete(&commitData).Error
+			if err != nil {
+				slog.Error("Failed to delete upload hooks", "error", err)
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		return
@@ -2064,6 +2125,23 @@ func (e *Engine) deleteFile(fileID string) error {
 	}
 	e.db.Where("file_id = ?", fileID).Delete(&TetherDownloadToken{})
 	return e.db.Where("id = ?", record.ID).Delete(&TetherStorage{}).Error
+}
+
+func (e *Engine) runAfterUpload(fileID string, mutationName string, params map[string]interface{}) error {
+	jsonParams, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	err = e.db.Create(&TetherUploadHook{
+		FileID:       fileID,
+		MutationName: mutationName,
+		ParamsJSON:   string(jsonParams),
+		CreatedAt:    time.Now(),
+	}).Error
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // allowStorageOrigin applies the WebSocket origin policy to browser calls against
@@ -2386,6 +2464,9 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
 			return "", e.denyCapability()
 		},
+		RunAfterUpload: func(fileID string, mutationName string, params map[string]interface{}) error {
+			return e.denyCapability()
+		},
 	}
 	queryCtx.Auth = &AuthCtx{
 		GetIdentity: func() (string, error) {
@@ -2528,6 +2609,9 @@ func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, 
 			PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
 				return "", e.denyCapability()
 			},
+			RunAfterUpload: func(fileID string, mutationName string, params map[string]interface{}) error {
+				return e.denyCapability()
+			},
 		},
 	}
 	execID := uuid.NewString()
@@ -2620,6 +2704,7 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
 		PutFile:        e.putFile,
+		RunAfterUpload: e.runAfterUpload,
 	}, Auth: authCtx, Params: params, Profiler: e.Profiler(), Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
@@ -2704,6 +2789,7 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
 		PutFile:        e.putFile,
+		RunAfterUpload: e.runAfterUpload,
 	}, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
