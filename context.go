@@ -16,18 +16,22 @@ type AuthCtx struct {
 	// GetIdentity returns the caller's user ID, or "" for an anonymous
 	// client. In a query or guard, calling it makes the result depend on the
 	// caller's identity: it re-runs when the client's identity changes, and
-	// is shared only with clients of the same identity. When there is no
-	// caller — a mutation run by the scheduler or a cron, or a query or
-	// mutation run with [Engine.ExecuteQuery] or [Engine.ExecuteMutation] —
+	// is shared only with clients of the same identity. An HTTP handler
+	// wrapped with [Engine.HTTPAction] has a caller: the user ID from the
+	// request's bearer token, or "" when that request has no Authorization
+	// header. When there is no caller — a mutation run by the scheduler or a
+	// cron, or a query or mutation run with [Engine.ExecuteQuery] or
+	// [Engine.ExecuteMutation], including one started from an HTTP action —
 	// GetIdentity returns [ErrNoCaller].
 	GetIdentity func() (string, error)
 	// ExecuteGuard runs the guard registered as guardName with params and
 	// returns its value. In a query the value is cached and passed through
 	// JSON, so numbers come back as float64 and structs as
-	// map[string]interface{}; compare simple values such as bools. It returns
-	// an error if the guard is not registered, if the guard returns an error,
-	// when called from a guard, and when there is no caller (a mutation run
-	// by the scheduler or a cron, or a query or mutation run with
+	// map[string]interface{}; compare simple values such as bools. An HTTP
+	// action can call it for the request's identity. It returns an error if
+	// the guard is not registered, if the guard returns an error, when called
+	// from a guard, and when there is no caller (a mutation run by the
+	// scheduler or a cron, or a query or mutation run with
 	// [Engine.ExecuteQuery] or [Engine.ExecuteMutation]).
 	ExecuteGuard func(guardName string, params map[string]interface{}) (interface{}, error)
 }
@@ -99,6 +103,60 @@ type StorageCtx struct {
 	//
 	// Returns an error if storage is not configured. Not available in queries.
 	PutFile func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error)
+
+	// RunAfterUpload runs mutationName once the client finishes uploading
+	// fileID. fileID comes from [StorageCtx.GetUploadURL]. The mutation runs
+	// in the background after the file is stored and marked active, so the
+	// upload response does not wait for it and does not report its error. A
+	// failed mutation is logged and is not retried. The hook is removed when
+	// the upload succeeds, and also when an abandoned upload is cleaned up.
+	//
+	// params are stored as JSON, so the mutation receives numbers as float64.
+	// A nil params map is accepted. These keys are set when the
+	// mutation runs, replacing any value params already had:
+	//
+	//	storage.fileID     the file's ID
+	//	storage.fileSize   the upload's Content-Length, or -1 when it was omitted
+	//	storage.mimeType   the upload's Content-Type, or application/octet-stream
+	//	storage.public     whether the file is public
+	//	storage.expiresAt  when the upload URL would have expired (time.Time)
+	//	storage.createdAt  when the upload URL was created (time.Time)
+	//
+	// Headers on the upload request named X-Tether-Meta-* are copied in as
+	// metadata.<name>, with <name> lowercased. X-Tether-Meta-Room: general
+	// arrives as metadata.room = "general".
+	//
+	// One file has one hook. A second call for the same fileID returns an
+	// error. The mutation may be registered with [Internal]. It runs without
+	// a caller, the same way as [Engine.ExecuteMutation].
+	//
+	// Returns an error if the hook cannot be saved, including when
+	// [Engine.SetStorage] has not been called. Not available in queries.
+	RunAfterUpload func(fileID string, mutationName string, params map[string]interface{}) error
+}
+
+// ActionCtx is passed to an HTTP handler wrapped with [Engine.HTTPAction].
+// The handler reads the request and writes the response itself.
+type ActionCtx struct {
+	// Auth identifies the caller from the request's Authorization header.
+	// See [Engine.HTTPAction].
+	Auth *AuthCtx
+	// Scheduler schedules mutations the same way [MutationCtx.Scheduler] does.
+	Scheduler *SchedulerCtx
+	// Storage manages files the same way [MutationCtx.Storage] does, including
+	// [StorageCtx.RunAfterUpload].
+	Storage *StorageCtx
+	// Profiler is the engine's profiler, the same value [Engine.Profiler] returns.
+	Profiler *Profiler
+	// ExecuteMutation runs a mutation and returns its result. It is
+	// [Engine.ExecuteMutation]: the nested run has no caller, even when this
+	// request does, and name may be registered with [Internal].
+	ExecuteMutation func(name string, params map[string]any) (any, error)
+	// ExecuteQuery runs a query once and returns its result. It is
+	// [Engine.ExecuteQuery]: the query is not subscribed, its result is not
+	// sent to clients, its ctx.DB is read-only, and there is no caller. name
+	// may be registered with [Internal].
+	ExecuteQuery func(name string, params map[string]any) (any, error)
 }
 
 // QueryCtx is passed to query functions registered with

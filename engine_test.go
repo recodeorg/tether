@@ -5397,6 +5397,13 @@ func TestCleanStorage(t *testing.T) {
 	if err := e.db.Create(&TetherDownloadToken{Token: "live-download", FileID: "active-file", ExpiresAt: now.Add(time.Hour)}).Error; err != nil {
 		t.Fatalf("create live download token: %v", err)
 	}
+	for _, id := range []string{"expired-pending", "active-file", "valid-pending"} {
+		if err := e.db.Create(&TetherUploadHook{
+			FileID: id, MutationName: "onUpload", ParamsJSON: "{}", CreatedAt: now,
+		}).Error; err != nil {
+			t.Fatalf("create hook %s: %v", id, err)
+		}
+	}
 
 	e.cleanStorage(now)
 
@@ -5445,6 +5452,18 @@ func TestCleanStorage(t *testing.T) {
 	}
 	if liveTokens != 1 {
 		t.Errorf("live download tokens = %d, want 1", liveTokens)
+	}
+	for id, want := range map[string]bool{"expired-pending": false, "active-file": true, "valid-pending": true} {
+		var n int64
+		if err := e.db.Model(&TetherUploadHook{}).Where("file_id = ?", id).Count(&n).Error; err != nil {
+			t.Fatalf("count hook %s: %v", id, err)
+		}
+		if want && n != 1 {
+			t.Errorf("hook %s rows = %d, want 1", id, n)
+		}
+		if !want && n != 0 {
+			t.Errorf("hook %s rows = %d, want 0", id, n)
+		}
 	}
 }
 

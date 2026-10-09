@@ -1,3 +1,10 @@
+## [1.4.0] - 2026-10-09
+
+### Added
+- `Engine.HTTPAction` wraps an HTTP handler with the request's identity, guards, storage, the scheduler, and one-shot queries and mutations. `ExecuteQuery` and `ExecuteMutation` from that handler still have no caller
+- `StorageCtx.RunAfterUpload` runs a mutation after a client finishes an upload started with `GetUploadURL`. The mutation receives `storage.fileID`, `storage.fileSize`, `storage.mimeType`, `storage.public`, `storage.expiresAt`, and `storage.createdAt`, plus any `X-Tether-Meta-*` upload headers as `metadata.*`. One file has one hook. The upload response does not wait for the mutation
+- `auth/clerk` verifies Clerk session tokens, and `auth/oidc` verifies OpenID Connect ID tokens. Both implement `Auth` for `Engine.SetAuth`
+
 ## [1.3.1] - 2026-10-05
 
 ### Fixed

@@ -101,6 +101,16 @@ type TetherDownloadToken struct {
 	ExpiresAt time.Time `gorm:"index"` // time when the download token expires
 }
 
+// TetherUploadHook is the database row for a mutation registered with
+// [StorageCtx.RunAfterUpload]. One file has one hook. The row is removed
+// after that upload completes, and when an abandoned upload is cleaned up.
+type TetherUploadHook struct {
+	FileID       string `gorm:"primaryKey"` // file the hook waits on
+	MutationName string `gorm:"not null"`   // mutation run after the upload
+	ParamsJSON   string `gorm:"type:text;not null"`
+	CreatedAt    time.Time
+}
+
 // Engine is a Tether server. Create one with [NewEngine], register tables,
 // guards, queries and mutations, then mount [Engine.Handle] (and
 // [Engine.StorageHandler] if file storage is used) on an HTTP server.
@@ -973,6 +983,10 @@ func (e *Engine) SetStorage(adapter storage.StorageAdapter, basePath string, def
 		slog.Error("Failed to create table", "error", err)
 		return err
 	}
+	if err := e.CreateTable([]TetherUploadHook{}); err != nil {
+		slog.Error("Failed to create table", "error", err)
+		return err
+	}
 	if !e.beginWork() {
 		return ErrEngineClosed
 	}
@@ -1026,8 +1040,9 @@ func storageKindPrefix(base, kind string) string {
 }
 
 // cleanStorage removes expired download tokens and upload rows that expired
-// before they became active. Those rows stay until ExpiresAt, so a longer
-// ExpiresIn remains usable. Object bytes are deleted before that metadata.
+// before they became active, including any [TetherUploadHook] waiting on
+// those uploads. Those rows stay until ExpiresAt, so a longer ExpiresIn
+// remains usable. Object bytes are deleted before that metadata.
 // A missing object is fine; any other delete error keeps the row for retry.
 func (e *Engine) cleanStorage(now time.Time) {
 	var expiredTokens []TetherDownloadToken
@@ -1062,6 +1077,7 @@ func (e *Engine) cleanStorage(now time.Time) {
 		return
 	}
 	e.db.Where("id IN ?", ids).Delete(&TetherStorage{})
+	e.db.Where("file_id IN ?", ids).Delete(&TetherUploadHook{})
 }
 
 func (e *Engine) pollScheduledTasks() {
@@ -1735,6 +1751,112 @@ func (e *Engine) RegisterGuard(name string, fn func(ctx *GuardCtx) (any, error),
 	slog.Debug("Registered guard", "name", name)
 }
 
+func (e *Engine) getActionIdentity(r *http.Request) (string, error) {
+	token := r.Header.Get("Authorization")
+	if token == "" {
+		return "", nil
+	}
+	if !strings.HasPrefix(token, "Bearer ") {
+		return "", fmt.Errorf("invalid authorization token")
+	}
+	token = strings.TrimPrefix(token, "Bearer ")
+	userID, _, err := e.auth.VerifyToken(r.Context(), e.db, token)
+	if err != nil {
+		return "", err
+	}
+	return userID, nil
+}
+
+// HTTPAction returns an HTTP handler that can call guards, queries,
+// mutations, storage, and the scheduler.
+//
+// The request's Authorization header, when present, must be a Bearer token.
+// [Auth.VerifyToken] checks the token, and ctx.Auth.GetIdentity returns that
+// user ID. A request with no Authorization header is anonymous: GetIdentity
+// returns "" and a nil error. A header that is not a Bearer token, or a token
+// VerifyToken rejects, makes GetIdentity return an error and an empty user
+// ID. The handler still runs, so check that error before doing work for the
+// caller.
+//
+// ctx.Auth.ExecuteGuard uses that same identity and a read-only database.
+// ctx.ExecuteMutation and ctx.ExecuteQuery do not. They are
+// [Engine.ExecuteMutation] and [Engine.ExecuteQuery], so the nested run has
+// no caller even when the request does. Without [Engine.SetAuth], every
+// bearer token is accepted and the caller stays anonymous.
+//
+// Mount the returned function like any other HTTP handler:
+//
+//	http.HandleFunc("POST /hooks/stripe", engine.HTTPAction(func(ctx *tether.ActionCtx, w http.ResponseWriter, r *http.Request) {
+//	    userID, err := ctx.Auth.GetIdentity()
+//	    if err != nil || userID == "" {
+//	        http.Error(w, "unauthorized", http.StatusUnauthorized)
+//	        return
+//	    }
+//	}))
+func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		userID, authErr := e.getActionIdentity(r)
+		execID := uuid.NewString()
+		traceCtx := context.WithValue(r.Context(), ContextKeyExecutionID, execID)
+		traceCtx = context.WithValue(traceCtx, ContextKeyActionName, "http")
+		authCtx := &AuthCtx{
+			GetIdentity: func() (string, error) {
+				return userID, authErr
+			},
+		}
+		authCtx.ExecuteGuard = func(guardName string, params map[string]interface{}) (interface{}, error) {
+			guardAuth := &AuthCtx{
+				GetIdentity: func() (string, error) {
+					return userID, authErr
+				},
+				ExecuteGuard: func(guardName string, params map[string]interface{}) (interface{}, error) {
+					return nil, fmt.Errorf("guards cannot execute other guards")
+				},
+			}
+			guardCtx := &GuardCtx{
+				DB:     e.readOnlyDB(traceCtx),
+				Auth:   guardAuth,
+				Params: params,
+			}
+			result, err := executeGuard(e, guardCtx, guardName)
+			if err != nil {
+				return nil, err
+			}
+			decoded, _, err := canonicalGuardResult(result)
+			if err != nil {
+				return nil, err
+			}
+			return decoded, nil
+		}
+		actionCtx := &ActionCtx{
+			Auth: authCtx,
+			Scheduler: &SchedulerCtx{
+				RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
+					return e.scheduleTask(time.Now().Add(duration), functionName, params)
+				},
+				Cancel: func(taskID string) bool {
+					return e.cancelTask(taskID)
+				},
+			},
+			Storage: &StorageCtx{
+				GetUploadURL:   e.getUploadURL,
+				GetDownloadURL: e.getDownloadURL,
+				DeleteFile:     e.deleteFile,
+				PutFile:        e.putFile,
+				RunAfterUpload: e.runAfterUpload,
+			},
+			Profiler: e.Profiler(),
+			ExecuteMutation: func(mutationName string, params map[string]interface{}) (any, error) {
+				return e.ExecuteMutation(mutationName, params)
+			},
+			ExecuteQuery: func(queryName string, params map[string]interface{}) (any, error) {
+				return e.ExecuteQuery(queryName, params)
+			},
+		}
+		fn(actionCtx, w, r)
+	}
+}
+
 // CreateTable creates or migrates the table for schema, a pointer to a GORM
 // model, using GORM's AutoMigrate, and returns any migration error.
 //
@@ -1764,6 +1886,21 @@ func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
 	reactivity.Handle(w, r, e.onReceiveMessage, e.tracker, e.websocketHelper) // wraps the raw websocket connection with the engine handler
 }
 
+func extractMetadataHeaders(r *http.Request) map[string]string {
+	const metaHeaderPrefix = "x-tether-meta-"
+	meta := make(map[string]string)
+	for key, values := range r.Header {
+		lowerKey := strings.ToLower(key)
+		if strings.HasPrefix(lowerKey, metaHeaderPrefix) {
+			fieldName := strings.TrimPrefix(lowerKey, metaHeaderPrefix)
+			if len(values) > 0 {
+				meta[fieldName] = values[0]
+			}
+		}
+	}
+	return meta
+}
+
 // StorageHandler serves upload, download, and public file URLs. By default
 // those are PUT /storage/upload/{token}, which stores the request body as
 // the file, GET /storage/file/{token}, which serves a file to anyone holding
@@ -1778,6 +1915,11 @@ func (e *Engine) Handle(w http.ResponseWriter, r *http.Request) {
 //
 // Served files include X-Content-Type-Options: nosniff. Types that are not
 // safe to display in the browser, including SVG, are sent as attachments.
+// An upload request may include headers named X-Tether-Meta-*. A mutation
+// registered with [StorageCtx.RunAfterUpload] receives them, along with the
+// stored file's id, size, type, and visibility. That mutation runs in the
+// background after the file is stored. Its error is logged and is not
+// returned to the client. The upload still succeeds when the mutation fails.
 // Browser requests are subject to the same origin policy as [Engine.Handle],
 // and allowed origins receive the CORS headers they need. Responses vary on
 // Origin even when the request omits it, so a cached media load of the same
@@ -1839,6 +1981,43 @@ func (e *Engine) StorageHandler(w http.ResponseWriter, r *http.Request) {
 			slog.Error("Failed to update upload status", "error", result.Error)
 			http.Error(w, "Failed to update upload status", http.StatusInternalServerError)
 			return
+		}
+		// Updates writes these columns but does not copy them back onto record.
+		record.Status = "active"
+		record.MimeType = contentType
+		record.FileSize = r.ContentLength
+		record.Adapter = e.storage.Name()
+		var hooks []TetherUploadHook
+		if err := e.db.Where("file_id = ?", record.ID).Find(&hooks).Error; err == nil {
+			for _, hook := range hooks {
+				params := map[string]interface{}{}
+				if err := json.Unmarshal([]byte(hook.ParamsJSON), &params); err != nil {
+					slog.Error("Failed to unmarshal params", "error", err)
+					http.Error(w, "Failed to unmarshal params", http.StatusInternalServerError)
+					return
+				}
+				if params == nil {
+					params = map[string]interface{}{}
+				}
+				params["storage.fileID"] = record.ID
+				params["storage.fileSize"] = record.FileSize
+				params["storage.mimeType"] = record.MimeType
+				params["storage.public"] = record.Public
+				params["storage.expiresAt"] = record.ExpiresAt
+				params["storage.createdAt"] = record.CreatedAt
+				for k, v := range extractMetadataHeaders(r) {
+					params["metadata."+k] = v
+				}
+				mutationName := hook.MutationName
+				go func() {
+					if _, err := e.ExecuteMutation(mutationName, params); err != nil {
+						slog.Error("[tether/storage] post-upload mutation failed", "mutation", mutationName, "error", err)
+					}
+				}()
+			}
+			if err := e.db.Delete(&hooks).Error; err != nil {
+				slog.Error("Failed to delete upload hooks", "error", err)
+			}
 		}
 		w.WriteHeader(http.StatusOK)
 		return
@@ -1985,6 +2164,23 @@ func (e *Engine) deleteFile(fileID string) error {
 	}
 	e.db.Where("file_id = ?", fileID).Delete(&TetherDownloadToken{})
 	return e.db.Where("id = ?", record.ID).Delete(&TetherStorage{}).Error
+}
+
+func (e *Engine) runAfterUpload(fileID string, mutationName string, params map[string]interface{}) error {
+	jsonParams, err := json.Marshal(params)
+	if err != nil {
+		return err
+	}
+	err = e.db.Create(&TetherUploadHook{
+		FileID:       fileID,
+		MutationName: mutationName,
+		ParamsJSON:   string(jsonParams),
+		CreatedAt:    time.Now(),
+	}).Error
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 // allowStorageOrigin applies the WebSocket origin policy to browser calls against
@@ -2307,6 +2503,9 @@ func (e *Engine) runQuery(query string, params map[string]interface{}, subscript
 		PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
 			return "", e.denyCapability()
 		},
+		RunAfterUpload: func(fileID string, mutationName string, params map[string]interface{}) error {
+			return e.denyCapability()
+		},
 	}
 	queryCtx.Auth = &AuthCtx{
 		GetIdentity: func() (string, error) {
@@ -2449,6 +2648,9 @@ func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, 
 			PutFile: func(contentType string, data io.Reader, opts ...storage.UploadOption) (string, error) {
 				return "", e.denyCapability()
 			},
+			RunAfterUpload: func(fileID string, mutationName string, params map[string]interface{}) error {
+				return e.denyCapability()
+			},
 		},
 	}
 	execID := uuid.NewString()
@@ -2541,6 +2743,7 @@ func (e *Engine) executeMutationInternal(mutation string, params map[string]inte
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
 		PutFile:        e.putFile,
+		RunAfterUpload: e.runAfterUpload,
 	}, Auth: authCtx, Params: params, Profiler: e.Profiler(), Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
@@ -2625,6 +2828,7 @@ func (e *Engine) executeMutation(mutation string, params map[string]interface{},
 		GetDownloadURL: e.getDownloadURL,
 		DeleteFile:     e.deleteFile,
 		PutFile:        e.putFile,
+		RunAfterUpload: e.runAfterUpload,
 	}, Auth: authCtx, Params: params, Scheduler: &SchedulerCtx{
 		RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 			return e.scheduleTask(time.Now().Add(duration), functionName, params)
