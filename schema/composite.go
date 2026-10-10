@@ -81,26 +81,27 @@ func (s *ArraySchema) Refine(fn func([]any) error) *ArraySchema {
 	return &c
 }
 
-func (s *ArraySchema) check(ok func(int) bool, code Code, msg string) *ArraySchema {
+func (s *ArraySchema) check(ok func(int) bool, code Code, msg, kw string, arg any) *ArraySchema {
 	c := *s
-	c.checks = append(slices.Clip(s.checks), check[int]{ok: ok, code: code, msg: msg})
+	c.checks = append(slices.Clip(s.checks), check[int]{ok: ok, code: code, msg: msg, kw: kw, arg: arg})
 	return &c
 }
 
 // Min requires at least n elements.
 func (s *ArraySchema) Min(n int, msg ...string) *ArraySchema {
-	return s.check(func(l int) bool { return l >= n }, CodeTooSmall, message("must have at least "+plural(n, "item"), msg))
+	return s.check(func(l int) bool { return l >= n }, CodeTooSmall, message("must have at least "+plural(n, "item"), msg), "minItems", n)
 }
 
 // Max requires at most n elements.
 func (s *ArraySchema) Max(n int, msg ...string) *ArraySchema {
-	return s.check(func(l int) bool { return l <= n }, CodeTooBig, message("must have at most "+plural(n, "item"), msg))
+	return s.check(func(l int) bool { return l <= n }, CodeTooBig, message("must have at most "+plural(n, "item"), msg), "maxItems", n)
 }
 
 // Length requires exactly n elements.
 func (s *ArraySchema) Length(n int, msg ...string) *ArraySchema {
 	m := message("must have exactly "+plural(n, "item"), msg)
-	return s.check(func(l int) bool { return l >= n }, CodeTooSmall, m).check(func(l int) bool { return l <= n }, CodeTooBig, m)
+	return s.check(func(l int) bool { return l >= n }, CodeTooSmall, m, "minItems", n).
+		check(func(l int) bool { return l <= n }, CodeTooBig, m, "maxItems", n)
 }
 
 // NonEmpty requires at least one element.

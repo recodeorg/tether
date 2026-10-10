@@ -1,6 +1,7 @@
 package schema_test
 
 import (
+	"encoding/json"
 	"fmt"
 
 	"github.com/recodeorg/tether/schema"
@@ -26,6 +27,38 @@ func Example() {
 	// Output:
 	// map[body:hello pinned:false roomID:123e4567-e89b-12d3-a456-426614174000] <nil>
 	// body: must be at least 1 character; roomID: required; tags[1]: must be one of "urgent", "fyi"
+}
+
+func ExampleJSONSchema() {
+	search := schema.Object(schema.Shape{
+		"query": schema.String().Min(1).Describe("text to search for"),
+		"limit": schema.Int().Min(1).Max(50).Default(10),
+	}).Strict()
+
+	b, _ := json.MarshalIndent(schema.JSONSchema(search), "", "  ")
+	fmt.Println(string(b))
+	// Output:
+	// {
+	//   "$schema": "https://json-schema.org/draft/2020-12/schema",
+	//   "additionalProperties": false,
+	//   "properties": {
+	//     "limit": {
+	//       "default": 10,
+	//       "maximum": 50,
+	//       "minimum": 1,
+	//       "type": "integer"
+	//     },
+	//     "query": {
+	//       "description": "text to search for",
+	//       "minLength": 1,
+	//       "type": "string"
+	//     }
+	//   },
+	//   "required": [
+	//     "query"
+	//   ],
+	//   "type": "object"
+	// }
 }
 
 func ExampleParse() {

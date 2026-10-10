@@ -36,6 +36,9 @@
 //	name.Description() // "display name"
 //
 // [Parse] validates a value and decodes the result into a Go type.
+//
+// [JSONSchema] exports a schema as a JSON Schema document, for clients,
+// documentation and code generators.
 package schema
 
 import (
@@ -69,6 +72,9 @@ type Schema interface {
 	// returns the output value. Problems are appended to iss with paths
 	// under path.
 	parse(v any, path []any, iss *[]Issue) any
+	// jsonSchema returns the JSON Schema for the schema, without its
+	// modifiers. See [JSONSchema].
+	jsonSchema() map[string]any
 }
 
 // modifiers holds the settings every schema shares.
@@ -305,6 +311,10 @@ type check[T any] struct {
 	ok   func(T) bool
 	code Code
 	msg  string
+	// kw and arg are the JSON Schema keyword and value that express the
+	// check, such as "minLength" and 3. See [JSONSchema].
+	kw  string
+	arg any
 }
 
 // runChecks appends an issue for every check v fails, then runs the refine

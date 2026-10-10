@@ -81,9 +81,9 @@ func (s *StringSchema) transform(fn func(string) string) *StringSchema {
 	return &c
 }
 
-func (s *StringSchema) check(ok func(string) bool, code Code, msg string) *StringSchema {
+func (s *StringSchema) check(ok func(string) bool, code Code, msg, kw string, arg any) *StringSchema {
 	c := *s
-	c.checks = append(slices.Clip(s.checks), check[string]{ok: ok, code: code, msg: msg})
+	c.checks = append(slices.Clip(s.checks), check[string]{ok: ok, code: code, msg: msg, kw: kw, arg: arg})
 	return &c
 }
 
@@ -101,49 +101,52 @@ func (s *StringSchema) ToUpper() *StringSchema { return s.transform(strings.ToUp
 // message, here and in every other check.
 func (s *StringSchema) Min(n int, msg ...string) *StringSchema {
 	return s.check(func(v string) bool { return utf8.RuneCountInString(v) >= n },
-		CodeTooSmall, message("must be at least "+plural(n, "character"), msg))
+		CodeTooSmall, message("must be at least "+plural(n, "character"), msg), "minLength", n)
 }
 
 // Max requires at most n characters.
 func (s *StringSchema) Max(n int, msg ...string) *StringSchema {
 	return s.check(func(v string) bool { return utf8.RuneCountInString(v) <= n },
-		CodeTooBig, message("must be at most "+plural(n, "character"), msg))
+		CodeTooBig, message("must be at most "+plural(n, "character"), msg), "maxLength", n)
 }
 
 // Length requires exactly n characters.
 func (s *StringSchema) Length(n int, msg ...string) *StringSchema {
 	m := message("must be exactly "+plural(n, "character"), msg)
-	return s.check(func(v string) bool { return utf8.RuneCountInString(v) >= n }, CodeTooSmall, m).
-		check(func(v string) bool { return utf8.RuneCountInString(v) <= n }, CodeTooBig, m)
+	return s.check(func(v string) bool { return utf8.RuneCountInString(v) >= n }, CodeTooSmall, m, "minLength", n).
+		check(func(v string) bool { return utf8.RuneCountInString(v) <= n }, CodeTooBig, m, "maxLength", n)
 }
 
 // NonEmpty rejects the empty string. Combine it with Trim to also reject
 // strings of only white space.
 func (s *StringSchema) NonEmpty(msg ...string) *StringSchema {
-	return s.check(func(v string) bool { return v != "" }, CodeTooSmall, message("must not be empty", msg))
+	return s.check(func(v string) bool { return v != "" }, CodeTooSmall, message("must not be empty", msg), "minLength", 1)
 }
 
 // Regex requires the string to match re.
 func (s *StringSchema) Regex(re *regexp.Regexp, msg ...string) *StringSchema {
-	return s.check(re.MatchString, CodeInvalidString, message("must match "+re.String(), msg))
+	return s.check(re.MatchString, CodeInvalidString, message("must match "+re.String(), msg), "pattern", re.String())
 }
 
 // StartsWith requires the string to start with prefix.
 func (s *StringSchema) StartsWith(prefix string, msg ...string) *StringSchema {
 	return s.check(func(v string) bool { return strings.HasPrefix(v, prefix) },
-		CodeInvalidString, message("must start with "+strconv.Quote(prefix), msg))
+		CodeInvalidString, message("must start with "+strconv.Quote(prefix), msg),
+		"pattern", "^"+regexp.QuoteMeta(prefix))
 }
 
 // EndsWith requires the string to end with suffix.
 func (s *StringSchema) EndsWith(suffix string, msg ...string) *StringSchema {
 	return s.check(func(v string) bool { return strings.HasSuffix(v, suffix) },
-		CodeInvalidString, message("must end with "+strconv.Quote(suffix), msg))
+		CodeInvalidString, message("must end with "+strconv.Quote(suffix), msg),
+		"pattern", regexp.QuoteMeta(suffix)+"$")
 }
 
 // Includes requires the string to contain substr.
 func (s *StringSchema) Includes(substr string, msg ...string) *StringSchema {
 	return s.check(func(v string) bool { return strings.Contains(v, substr) },
-		CodeInvalidString, message("must include "+strconv.Quote(substr), msg))
+		CodeInvalidString, message("must include "+strconv.Quote(substr), msg),
+		"pattern", regexp.QuoteMeta(substr))
 }
 
 var (
@@ -154,7 +157,7 @@ var (
 // Email requires something shaped like an email address: no white space,
 // one @, and a dot in the domain. It does not check that the address exists.
 func (s *StringSchema) Email(msg ...string) *StringSchema {
-	return s.check(emailRE.MatchString, CodeInvalidString, message("must be a valid email address", msg))
+	return s.check(emailRE.MatchString, CodeInvalidString, message("must be a valid email address", msg), "format", "email")
 }
 
 // URL requires an absolute URL with a scheme and host, such as
@@ -164,12 +167,12 @@ func (s *StringSchema) URL(msg ...string) *StringSchema {
 	return s.check(func(v string) bool {
 		u, err := url.Parse(v)
 		return err == nil && u.Scheme != "" && u.Host != ""
-	}, CodeInvalidString, message("must be a valid URL", msg))
+	}, CodeInvalidString, message("must be a valid URL", msg), "format", "uri")
 }
 
 // UUID requires a UUID in its canonical hyphenated form, in either case.
 func (s *StringSchema) UUID(msg ...string) *StringSchema {
-	return s.check(uuidRE.MatchString, CodeInvalidString, message("must be a valid UUID", msg))
+	return s.check(uuidRE.MatchString, CodeInvalidString, message("must be a valid UUID", msg), "format", "uuid")
 }
 
 // Datetime requires an RFC 3339 timestamp, such as
@@ -178,7 +181,7 @@ func (s *StringSchema) Datetime(msg ...string) *StringSchema {
 	return s.check(func(v string) bool {
 		_, err := time.Parse(time.RFC3339Nano, v)
 		return err == nil
-	}, CodeInvalidString, message("must be an RFC 3339 date-time", msg))
+	}, CodeInvalidString, message("must be an RFC 3339 date-time", msg), "format", "date-time")
 }
 
 // asString returns v as a string if v's kind is string. json.Number is a
@@ -260,9 +263,9 @@ func (s *NumberSchema) Refine(fn func(float64) error) *NumberSchema {
 	return &c
 }
 
-func (s *NumberSchema) check(ok func(float64) bool, code Code, msg string) *NumberSchema {
+func (s *NumberSchema) check(ok func(float64) bool, code Code, msg, kw string, arg any) *NumberSchema {
 	c := *s
-	c.checks = append(slices.Clip(s.checks), check[float64]{ok: ok, code: code, msg: msg})
+	c.checks = append(slices.Clip(s.checks), check[float64]{ok: ok, code: code, msg: msg, kw: kw, arg: arg})
 	return &c
 }
 
@@ -270,22 +273,22 @@ func formatFloat(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) 
 
 // Min requires the number to be at least n.
 func (s *NumberSchema) Min(n float64, msg ...string) *NumberSchema {
-	return s.check(func(v float64) bool { return v >= n }, CodeTooSmall, message("must be at least "+formatFloat(n), msg))
+	return s.check(func(v float64) bool { return v >= n }, CodeTooSmall, message("must be at least "+formatFloat(n), msg), "minimum", n)
 }
 
 // Max requires the number to be at most n.
 func (s *NumberSchema) Max(n float64, msg ...string) *NumberSchema {
-	return s.check(func(v float64) bool { return v <= n }, CodeTooBig, message("must be at most "+formatFloat(n), msg))
+	return s.check(func(v float64) bool { return v <= n }, CodeTooBig, message("must be at most "+formatFloat(n), msg), "maximum", n)
 }
 
 // Gt requires the number to be greater than n.
 func (s *NumberSchema) Gt(n float64, msg ...string) *NumberSchema {
-	return s.check(func(v float64) bool { return v > n }, CodeTooSmall, message("must be greater than "+formatFloat(n), msg))
+	return s.check(func(v float64) bool { return v > n }, CodeTooSmall, message("must be greater than "+formatFloat(n), msg), "exclusiveMinimum", n)
 }
 
 // Lt requires the number to be less than n.
 func (s *NumberSchema) Lt(n float64, msg ...string) *NumberSchema {
-	return s.check(func(v float64) bool { return v < n }, CodeTooBig, message("must be less than "+formatFloat(n), msg))
+	return s.check(func(v float64) bool { return v < n }, CodeTooBig, message("must be less than "+formatFloat(n), msg), "exclusiveMaximum", n)
 }
 
 // Positive requires the number to be greater than 0.
@@ -314,7 +317,7 @@ func (s *NumberSchema) MultipleOf(step float64, msg ...string) *NumberSchema {
 	return s.check(func(v float64) bool {
 		q := v / step
 		return math.Abs(q-math.Round(q)) < 1e-9
-	}, CodeNotMultipleOf, message("must be a multiple of "+formatFloat(step), msg))
+	}, CodeNotMultipleOf, message("must be a multiple of "+formatFloat(step), msg), "multipleOf", step)
 }
 
 // asFloat returns v as a float64 if it is a Go number or a json.Number.
@@ -402,40 +405,40 @@ func (s *IntSchema) Refine(fn func(int64) error) *IntSchema {
 	return &c
 }
 
-func (s *IntSchema) check(ok func(int64) bool, code Code, msg string) *IntSchema {
+func (s *IntSchema) check(ok func(int64) bool, code Code, msg, kw string, arg any) *IntSchema {
 	c := *s
-	c.checks = append(slices.Clip(s.checks), check[int64]{ok: ok, code: code, msg: msg})
+	c.checks = append(slices.Clip(s.checks), check[int64]{ok: ok, code: code, msg: msg, kw: kw, arg: arg})
 	return &c
 }
 
 // Min requires the number to be at least n.
 func (s *IntSchema) Min(n int64, msg ...string) *IntSchema {
-	return s.check(func(v int64) bool { return v >= n }, CodeTooSmall, message(fmt.Sprintf("must be at least %d", n), msg))
+	return s.check(func(v int64) bool { return v >= n }, CodeTooSmall, message(fmt.Sprintf("must be at least %d", n), msg), "minimum", n)
 }
 
 // Max requires the number to be at most n.
 func (s *IntSchema) Max(n int64, msg ...string) *IntSchema {
-	return s.check(func(v int64) bool { return v <= n }, CodeTooBig, message(fmt.Sprintf("must be at most %d", n), msg))
+	return s.check(func(v int64) bool { return v <= n }, CodeTooBig, message(fmt.Sprintf("must be at most %d", n), msg), "maximum", n)
 }
 
 // Positive requires the number to be greater than 0.
 func (s *IntSchema) Positive(msg ...string) *IntSchema {
-	return s.check(func(v int64) bool { return v > 0 }, CodeTooSmall, message("must be positive", msg))
+	return s.check(func(v int64) bool { return v > 0 }, CodeTooSmall, message("must be positive", msg), "exclusiveMinimum", 0)
 }
 
 // NonNegative requires the number to be at least 0.
 func (s *IntSchema) NonNegative(msg ...string) *IntSchema {
-	return s.check(func(v int64) bool { return v >= 0 }, CodeTooSmall, message("must not be negative", msg))
+	return s.check(func(v int64) bool { return v >= 0 }, CodeTooSmall, message("must not be negative", msg), "minimum", 0)
 }
 
 // Negative requires the number to be less than 0.
 func (s *IntSchema) Negative(msg ...string) *IntSchema {
-	return s.check(func(v int64) bool { return v < 0 }, CodeTooBig, message("must be negative", msg))
+	return s.check(func(v int64) bool { return v < 0 }, CodeTooBig, message("must be negative", msg), "exclusiveMaximum", 0)
 }
 
 // NonPositive requires the number to be at most 0.
 func (s *IntSchema) NonPositive(msg ...string) *IntSchema {
-	return s.check(func(v int64) bool { return v <= 0 }, CodeTooBig, message("must not be positive", msg))
+	return s.check(func(v int64) bool { return v <= 0 }, CodeTooBig, message("must not be positive", msg), "maximum", 0)
 }
 
 // MultipleOf requires the number to be a multiple of step. step must not be
@@ -445,7 +448,7 @@ func (s *IntSchema) MultipleOf(step int64, msg ...string) *IntSchema {
 		panic("schema: Int().MultipleOf(0)")
 	}
 	return s.check(func(v int64) bool { return v%step == 0 }, CodeNotMultipleOf,
-		message(fmt.Sprintf("must be a multiple of %d", step), msg))
+		message(fmt.Sprintf("must be a multiple of %d", step), msg), "multipleOf", step)
 }
 
 // asInt returns v as an int64. isNum reports whether v is a number at all,
