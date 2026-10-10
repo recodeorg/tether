@@ -276,6 +276,14 @@ type GuardOption func(*guardConfig)
 // guardConfig is filled in by [GuardOption] values.
 type guardConfig struct{}
 
+// ActionOption configures an HTTP handler returned by [Engine.HTTPAction].
+// None are defined yet. The parameter is reserved so options can be added
+// without changing HTTPAction's signature.
+type ActionOption func(*actionConfig)
+
+// actionConfig is filled in by [ActionOption] values.
+type actionConfig struct{}
+
 // Internal hides a query or mutation from clients. They receive the same
 // error as for an unknown name. [Engine.ExecuteQuery],
 // [Engine.ExecuteMutation], [MutationCtx.ExecuteQuery], and
