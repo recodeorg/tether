@@ -1,3 +1,11 @@
+## [Unreleased]
+
+### Added
+- `schema` package validates untrusted values such as query and mutation params. Schemas are built by chaining methods on `schema.String`, `schema.Number`, `schema.Int`, `schema.Bool`, `schema.Literal`, `schema.Enum`, `schema.Any`, `schema.Array`, `schema.Object`, `schema.Record`, and `schema.Union`. `Validate` returns a normalized value—unknown object keys are stripped by default, defaults are filled in, and string transforms such as `Trim` apply—and on failure an `*schema.Error` listing every problem with paths, not only the first
+- `schema.Parse` validates a value and decodes the result into a Go type, including structs with `json` tags. `schema.JSONSchema` exports a schema as a JSON Schema (draft 2020-12) document for clients, documentation, and code generators; `Refine` checks are omitted from the export
+- Object schemas support `Strict`, `Passthrough`, `Strip`, `Extend`, `Pick`, `Omit`, `Partial`, and `Required`. String schemas support format checks (`Email`, `URL`, `UUID`, `Datetime`), bounds, and `Regex`. Every schema supports `Optional`, `Nullable`, `Default`, `Describe`, and `Refine`
+- `Engine.HTTPAction` accepts optional `ActionOption` values. None are defined yet; the parameter is reserved so options can be added without changing the signature
+
 ## [1.4.0] - 2026-10-09
 
 ### Added
