@@ -1793,7 +1793,16 @@ func (e *Engine) getActionIdentity(r *http.Request) (string, error) {
 //	        return
 //	    }
 //	}))
-func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *http.Request)) func(w http.ResponseWriter, r *http.Request) {
+//
+// opts accepts [ActionOption] values. None are defined yet; the parameter is
+// reserved so options can be added without changing this signature.
+func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *http.Request), opts ...ActionOption) func(w http.ResponseWriter, r *http.Request) {
+	var cfg actionConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		userID, authErr := e.getActionIdentity(r)
 		execID := uuid.NewString()
