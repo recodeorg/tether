@@ -6,6 +6,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/recodeorg/tether/schema"
 	"github.com/recodeorg/tether/storage"
 	"gorm.io/gorm"
 )
@@ -44,7 +45,8 @@ type SchedulerCtx struct {
 	// passed, and returns the task's ID. The mutation may be registered with
 	// [Internal]. It runs without a caller, so its ctx.Auth.GetIdentity
 	// returns [ErrNoCaller], and params are stored as JSON, so it receives
-	// numbers as float64. The task is saved outside any transaction ctx.DB is in and
+	// numbers as float64 unless an input schema normalizes them.
+	// The task is saved outside any transaction ctx.DB is in and
 	// stays scheduled even if that transaction rolls back. RunAfter returns
 	// [ErrEngineClosed] once the engine is closed.
 	RunAfter func(duration time.Duration, functionName string, params map[string]interface{}) (string, error)
@@ -111,7 +113,8 @@ type StorageCtx struct {
 	// failed mutation is logged and is not retried. The hook is removed when
 	// the upload succeeds, and also when an abandoned upload is cleaned up.
 	//
-	// params are stored as JSON, so the mutation receives numbers as float64.
+	// params are stored as JSON, so the mutation receives numbers as float64
+	// unless an input schema normalizes them.
 	// A nil params map is accepted. These keys are set when the
 	// mutation runs, replacing any value params already had:
 	//
@@ -138,6 +141,9 @@ type StorageCtx struct {
 // ActionCtx is passed to an HTTP handler wrapped with [Engine.HTTPAction].
 // The handler reads the request and writes the response itself.
 type ActionCtx struct {
+	// Params contains the validated JSON request body when WithInputSchema is
+	// set. Without an input schema it is nil and the body is left unread.
+	Params map[string]any
 	// Auth identifies the caller from the request's Authorization header.
 	// See [Engine.HTTPAction].
 	Auth *AuthCtx
@@ -167,7 +173,8 @@ type QueryCtx struct {
 	DB   *gorm.DB
 	Auth *AuthCtx
 	// Params holds the parameters sent by the client, decoded from JSON.
-	// They are untrusted input, and numbers arrive as float64.
+	// Without WithInputSchema they are untrusted and numbers arrive as float64.
+	// With an input schema they hold its validated, normalized values.
 	Params map[string]interface{}
 	// dependencies holds the tags this execution depends on so far. Add to
 	// it with TrackCollection and TrackTable rather than directly.
@@ -202,7 +209,8 @@ type MutationCtx struct {
 	Auth      *AuthCtx
 	Scheduler *SchedulerCtx
 	// Params holds the parameters sent by the client, decoded from JSON.
-	// They are untrusted input, and numbers arrive as float64.
+	// Without WithInputSchema they are untrusted and numbers arrive as float64.
+	// With an input schema they hold its validated, normalized values.
 	Params map[string]interface{}
 	// Profiler is the engine's profiler, the same value [Engine.Profiler] returns.
 	Profiler *Profiler
@@ -210,13 +218,14 @@ type MutationCtx struct {
 	// ExecuteMutation runs another mutation and returns its result. It is
 	// [Engine.ExecuteMutation]: the nested run has no caller, even when this
 	// mutation does, writes through its ctx.DB re-run subscribed queries, and
-	// name may be registered with [Internal]. params are passed through
-	// unchanged.
+	// name may be registered with [Internal]. Params are validated when the
+	// called function has an input schema; otherwise they pass through unchanged.
 	ExecuteMutation func(mutationName string, params map[string]interface{}) (any, error)
 	// ExecuteQuery runs a query once and returns its result. It is
 	// [Engine.ExecuteQuery]: the query is not subscribed, its result is not
 	// sent to clients, its ctx.DB is read-only, and there is no caller. name
-	// may be registered with [Internal]. params are passed through unchanged.
+	// may be registered with [Internal]. Params are validated when the called
+	// function has an input schema; otherwise they pass through unchanged.
 	ExecuteQuery func(queryName string, params map[string]interface{}) (any, error)
 }
 
@@ -227,7 +236,8 @@ type GuardCtx struct {
 	// it are tracked by primary key automatically.
 	DB   *gorm.DB
 	Auth *AuthCtx
-	// Params holds the parameters passed to ExecuteGuard.
+	// Params holds the parameters passed to ExecuteGuard, validated and
+	// normalized when WithInputSchema is set.
 	Params map[string]interface{}
 	// dependencies holds the tags this execution depends on so far. Add to
 	// it with TrackCollection and TrackTable rather than directly.
@@ -260,29 +270,38 @@ type Auth interface {
 }
 
 // Option configures a query or mutation registered with [Engine.RegisterQuery]
-// or [Engine.RegisterMutation].
+// or [Engine.RegisterMutation], a guard, or an HTTP action.
 type Option func(*optionConfig)
 
 // optionConfig is filled in by [Option] values.
 type optionConfig struct {
-	internal bool
+	internal     bool
+	inputSchema  schema.Schema
+	outputSchema schema.Schema
 }
 
 // GuardOption configures a guard registered with [Engine.RegisterGuard].
-// None are defined yet. The parameter is reserved so options can be added
-// without changing RegisterGuard's signature.
-type GuardOption func(*guardConfig)
-
-// guardConfig is filled in by [GuardOption] values.
-type guardConfig struct{}
+// [WithInputSchema] and [WithOutputSchema] apply to guards.
+type GuardOption = Option
 
 // ActionOption configures an HTTP handler returned by [Engine.HTTPAction].
-// None are defined yet. The parameter is reserved so options can be added
-// without changing HTTPAction's signature.
-type ActionOption func(*actionConfig)
+// [WithInputSchema] and [WithOutputSchema] apply to HTTP actions.
+type ActionOption = Option
 
-// actionConfig is filled in by [ActionOption] values.
-type actionConfig struct{}
+// WithInputSchema validates params before the handler runs and passes the
+// validated values (including defaults and normalization) in ctx.Params.
+// The schema must produce an object. A nil schema disables validation.
+// For HTTP actions, params are decoded from the JSON request body; invalid
+// JSON or params produce HTTP 400 without calling the handler.
+func WithInputSchema(s schema.Schema) Option {
+	return func(cfg *optionConfig) { cfg.inputSchema = s }
+}
+
+// WithOutputSchema stores the handler's output schema for future client type
+// generation. It does not validate or transform the handler's response.
+func WithOutputSchema(s schema.Schema) Option {
+	return func(cfg *optionConfig) { cfg.outputSchema = s }
+}
 
 // Internal hides a query or mutation from clients. They receive the same
 // error as for an unknown name. [Engine.ExecuteQuery],

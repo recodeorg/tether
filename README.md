@@ -127,6 +127,24 @@ func main() {
 }
 ```
 
+Queries, mutations, guards, and HTTP actions accept optional input and output schemas:
+
+```go
+import "github.com/recodeorg/tether/schema"
+
+engine.RegisterMutation("sendMessage", sendMessage,
+    tether.WithInputSchema(schema.Object(schema.Shape{
+        "room": schema.String().Min(1),
+        "body": schema.String().Trim().Min(1),
+    })),
+    tether.WithOutputSchema(schema.Object(schema.Shape{
+        "id": schema.Int(),
+    })),
+)
+```
+
+An input schema validates params before the function runs. Invalid params, such as a missing required field, fail without calling the function. The function receives the validated values in `ctx.Params`, including defaults and normalization. This also applies to server-side and scheduled calls. HTTP actions validate their JSON request body, expose it as `ctx.Params`, and return HTTP 400 on invalid input; the original body remains available to the handler.
+
 On the frontend, `useQuery` stays in sync with the backend automatically:
 
 ```tsx

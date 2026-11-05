@@ -52,6 +52,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/recodeorg/tether/internal/reactivity"
+	"github.com/recodeorg/tether/schema"
 	"github.com/recodeorg/tether/storage"
 	"github.com/robfig/cron/v3"
 	"gorm.io/driver/postgres"
@@ -132,6 +133,8 @@ type Engine struct {
 	tracker         *reactivity.Tracker
 	auth            Auth
 	guards          map[string]guard
+	httpActions     []httpAction
+	httpActionsMu   sync.Mutex
 	timerMutex      sync.RWMutex
 	taskToTimer     map[string]*time.Timer
 	websocketHelper *reactivity.WebsocketHelper
@@ -158,19 +161,31 @@ type Engine struct {
 
 // mutation is a mutation as stored by [Engine.RegisterMutation].
 type mutation struct {
-	Func     func(ctx *MutationCtx) (any, error)
-	Internal bool
+	InputSchema  schema.Schema
+	OutputSchema schema.Schema
+	Func         func(ctx *MutationCtx) (any, error)
+	Internal     bool
 }
 
 // query is a query as stored by [Engine.RegisterQuery].
 type query struct {
-	Func     func(ctx *QueryCtx) (any, error)
-	Internal bool
+	InputSchema  schema.Schema
+	OutputSchema schema.Schema
+	Func         func(ctx *QueryCtx) (any, error)
+	Internal     bool
 }
 
 // guard is a guard as stored by [Engine.RegisterGuard].
 type guard struct {
-	Func func(ctx *GuardCtx) (any, error)
+	InputSchema  schema.Schema
+	OutputSchema schema.Schema
+	Func         func(ctx *GuardCtx) (any, error)
+}
+
+// httpAction retains schema metadata for handlers returned by HTTPAction.
+type httpAction struct {
+	InputSchema  schema.Schema
+	OutputSchema schema.Schema
 }
 
 // scheduleLoopInterval is how often each engine polls the database for
@@ -1655,6 +1670,8 @@ func (e *Engine) SetAuth(auth Auth) {
 // inside a transaction do so only once it commits. Raw SQL run with Exec is
 // not detected.
 //
+// [WithInputSchema] validates params before fn runs; [WithOutputSchema]
+// stores output metadata without validating the result.
 // Options are applied in order. [Internal] hides the mutation from clients,
 // who receive the same error as for an unknown name, but it can still be run
 // with [Engine.ExecuteMutation], [SchedulerCtx.RunAfter], or [Engine.RegisterCron].
@@ -1664,7 +1681,18 @@ func (e *Engine) RegisterMutation(name string, fn func(ctx *MutationCtx) (any, e
 	if _, ok := e.mutations[name]; ok {
 		panic(fmt.Sprintf("mutation %s already registered", name))
 	}
-	e.mutations[name] = mutation{Func: fn, Internal: cfg.internal} // stores the mutation in the list of valid mutations
+	handler := fn
+	if cfg.inputSchema != nil {
+		handler = func(ctx *MutationCtx) (any, error) {
+			params, err := validateParams(cfg.inputSchema, ctx.Params)
+			if err != nil {
+				return nil, err
+			}
+			ctx.Params = params
+			return fn(ctx)
+		}
+	}
+	e.mutations[name] = mutation{Func: handler, Internal: cfg.internal, InputSchema: cfg.inputSchema, OutputSchema: cfg.outputSchema}
 	slog.Debug("Registered mutation", "name", name)
 }
 
@@ -1693,6 +1721,8 @@ func (e *Engine) RegisterMutation(name string, fn func(ctx *MutationCtx) (any, e
 // frame containing err.Error(). A value that implements error is treated the
 // same way.
 //
+// [WithInputSchema] validates params before fn runs; [WithOutputSchema]
+// stores output metadata without validating the result.
 // Options are applied in order. Clients cannot subscribe to a query
 // registered with [Internal] and receive the same error as for an unknown name.
 // [Engine.ExecuteQuery] can still run it.
@@ -1702,7 +1732,18 @@ func (e *Engine) RegisterQuery(name string, fn func(ctx *QueryCtx) (any, error),
 	if _, ok := e.queries[name]; ok {
 		panic(fmt.Sprintf("query %s already registered", name))
 	}
-	e.queries[name] = query{Func: fn, Internal: cfg.internal} // stores the query in the list of valid queries
+	handler := fn
+	if cfg.inputSchema != nil {
+		handler = func(ctx *QueryCtx) (any, error) {
+			params, err := validateParams(cfg.inputSchema, ctx.Params)
+			if err != nil {
+				return nil, err
+			}
+			ctx.Params = params
+			return fn(ctx)
+		}
+	}
+	e.queries[name] = query{Func: handler, Internal: cfg.internal, InputSchema: cfg.inputSchema, OutputSchema: cfg.outputSchema}
 	slog.Debug("Registered query", "name", name)
 }
 
@@ -1734,20 +1775,26 @@ func applyOptions(opts []Option) optionConfig {
 //
 // ctx.DB is read-only: any write fails.
 //
-// opts accepts [GuardOption] values. None are defined yet; the parameter is
-// reserved so options can be added without changing this signature.
+// [WithInputSchema] validates params before fn runs. [WithOutputSchema]
+// stores output metadata without validating the result. Options apply in order.
 func (e *Engine) RegisterGuard(name string, fn func(ctx *GuardCtx) (any, error), opts ...GuardOption) {
-	var cfg guardConfig
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
-	}
+	cfg := applyOptions(opts)
 	// check if the guard is already registered
 	if _, ok := e.guards[name]; ok {
 		panic(fmt.Sprintf("guard %s already registered", name))
 	}
-	e.guards[name] = guard{Func: fn}
+	handler := fn
+	if cfg.inputSchema != nil {
+		handler = func(ctx *GuardCtx) (any, error) {
+			params, err := validateParams(cfg.inputSchema, ctx.Params)
+			if err != nil {
+				return nil, err
+			}
+			ctx.Params = params
+			return fn(ctx)
+		}
+	}
+	e.guards[name] = guard{Func: handler, InputSchema: cfg.inputSchema, OutputSchema: cfg.outputSchema}
 	slog.Debug("Registered guard", "name", name)
 }
 
@@ -1794,16 +1841,28 @@ func (e *Engine) getActionIdentity(r *http.Request) (string, error) {
 //	    }
 //	}))
 //
-// opts accepts [ActionOption] values. None are defined yet; the parameter is
-// reserved so options can be added without changing this signature.
+// With [WithInputSchema], the request body must be a JSON object. It is
+// validated before fn runs and the validated values are available in ctx.Params.
+// Invalid JSON or params produce HTTP 400. The body is restored for fn to read.
+// Without an input schema the body is left unread and ctx.Params is nil.
+// [WithOutputSchema] stores metadata without validating the response.
+// Options apply in order.
 func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *http.Request), opts ...ActionOption) func(w http.ResponseWriter, r *http.Request) {
-	var cfg actionConfig
-	for _, opt := range opts {
-		if opt != nil {
-			opt(&cfg)
-		}
-	}
+	cfg := applyOptions(opts)
+	action := httpAction{InputSchema: cfg.inputSchema, OutputSchema: cfg.outputSchema}
+	e.httpActionsMu.Lock()
+	e.httpActions = append(e.httpActions, action)
+	e.httpActionsMu.Unlock()
 	return func(w http.ResponseWriter, r *http.Request) {
+		var params map[string]any
+		if action.InputSchema != nil {
+			var err error
+			params, err = validateActionParams(action.InputSchema, r)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+		}
 		userID, authErr := e.getActionIdentity(r)
 		execID := uuid.NewString()
 		traceCtx := context.WithValue(r.Context(), ContextKeyExecutionID, execID)
@@ -1838,7 +1897,8 @@ func (e *Engine) HTTPAction(fn func(ctx *ActionCtx, w http.ResponseWriter, r *ht
 			return decoded, nil
 		}
 		actionCtx := &ActionCtx{
-			Auth: authCtx,
+			Params: params,
+			Auth:   authCtx,
 			Scheduler: &SchedulerCtx{
 				RunAfter: func(duration time.Duration, functionName string, params map[string]interface{}) (string, error) {
 					return e.scheduleTask(time.Now().Add(duration), functionName, params)
@@ -2625,8 +2685,8 @@ func noCallerAuth() *AuthCtx {
 // name may be registered with [Internal]. There is no caller:
 // ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard returns
 // an error. A non-nil error from the mutation, including a returned value that
-// implements error, is returned to the caller. params are passed through
-// unchanged.
+// implements error, is returned to the caller. Params are validated when
+// [WithInputSchema] is set; otherwise they are passed through unchanged.
 func (e *Engine) ExecuteMutation(name string, params map[string]interface{}) (any, error) {
 	return e.executeMutationInternal(name, params)
 }
@@ -2639,7 +2699,8 @@ func (e *Engine) ExecuteMutation(name string, params map[string]interface{}) (an
 // caller: ctx.Auth.GetIdentity returns [ErrNoCaller] and ctx.Auth.ExecuteGuard
 // returns an error. ctx.DB is read-only. A non-nil error from the query,
 // including a returned value that implements error, is returned to the caller.
-// params are passed through unchanged.
+// Params are validated when [WithInputSchema] is set; otherwise they are
+// passed through unchanged.
 func (e *Engine) ExecuteQuery(name string, params map[string]interface{}) (any, error) {
 	if _, exists := e.queries[name]; !exists {
 		return nil, fmt.Errorf("query not found")
